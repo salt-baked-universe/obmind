@@ -7,16 +7,16 @@
  * 铁律：不动缩进、不动列表符号、不动引用前缀，只换正文那一段。
  */
 
-import type { SrcRef } from "../parser";
+import type { SrcRef } from "../types";
 
 /** 该行引用前缀（`> ` 可能多层） */
-function quoteOf(src: SrcRef): string {
+export function quoteOf(src: SrcRef): string {
   const m = /^(?:\s*>\s?)+/.exec(src.full);
   return m ? m[0] : "";
 }
 
 /** bodyStart 之前的「标记段」：列表符号 / 标题井号 / 任务勾选框 */
-function markOf(src: SrcRef): string {
+export function markOf(src: SrcRef): string {
   return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
 }
 

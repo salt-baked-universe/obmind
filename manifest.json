@@ -1,7 +1,7 @@
 {
   "id": "obmind",
   "name": "obmind",
-  "version": "1.2.3",
+  "version": "1.7.0",
   "minAppVersion": "1.4.0",
   "description": "Convert the current note's outline (filename as root, indentation as hierarchy) into an interactive SVG mindmap.",
   "author": "",

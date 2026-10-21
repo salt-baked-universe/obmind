@@ -14,7 +14,7 @@
  * 3. **拖拽结束不能触发 click / dblclick**，否则松手就顺带进了编辑态。
  */
 
-import type { SrcRef } from "../parser";
+import type { SrcRef } from "../types";
 import type { DropMode } from "./move";
 
 /** 超过这个位移才算拖拽，否则当成普通点击 */
@@ -56,6 +56,7 @@ export class DragController {
 
     svg.addEventListener("mousedown", this.blockOnNode, true);
     svg.addEventListener("pointerdown", this.onPointerDown, true);
+    svg.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("pointermove", this.onPointerMove, true);
     window.addEventListener("pointerup", this.onPointerUp, true);
     window.addEventListener("keydown", this.onKeyDown, true);
@@ -64,6 +65,7 @@ export class DragController {
   destroy(): void {
     this.svg.removeEventListener("mousedown", this.blockOnNode, true);
     this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
+    this.svg.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("pointermove", this.onPointerMove, true);
     window.removeEventListener("pointerup", this.onPointerUp, true);
     window.removeEventListener("keydown", this.onKeyDown, true);
@@ -80,8 +82,21 @@ export class DragController {
     if (g) e.stopPropagation();
   };
 
+  /**
+   * 右键在导图里是「拖动改层级」，不是菜单。
+   *
+   * 必须显式拦掉 contextmenu：pointerdown 拦不住它。不拦的话，
+   * 每次右键松手（哪怕只是右键点了一下）都会弹出系统菜单压住画布。
+   * 空白处仍然保留菜单 —— 那是画布自己的。
+   */
+  private onContextMenu = (e: MouseEvent): void => {
+    if (this.nodeAt(e.target as Element)) e.preventDefault();
+  };
+
   private onPointerDown = (e: PointerEvent): void => {
-    if (e.button !== 0) return;
+    // 2 = 右键。左键留给「选中 / 双击编辑 / 点链接」，
+    // 左右分工之后，框选与拖拽不会再互相误触。
+    if (e.button !== 2) return;
     const el = e.target as Element;
     // 链接、折叠圆点各有自己的用途
     if (el.closest("a") || el.closest("circle")) return;

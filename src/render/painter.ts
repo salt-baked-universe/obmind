@@ -33,21 +33,28 @@ const CLS_SHADOW = "obmind-node-shadow";
 const CLS_LINK = "obmind-node-link";
 const CLS_CARD = "obmind-node-card";
 
-/** 每个节点的绘制缓存：元素引用 + 各维度上次写入的签名 */
+/** 每个节点的绘制缓存：元素引用 + 各维度上次写入的值 */
 interface Entry {
   g: SVGGElement;
   shadow: SVGRectElement | null;
   link: SVGPathElement | null;
   card: SVGRectElement | null;
   circle: SVGCircleElement | null;
-  /** 尺寸签名（只认内容宽高） */
-  sizeSig: string;
-  /** 样式签名（主题 / 层级 / 分支） */
-  styleSig: string;
-  /** 连线签名（路径 / 颜色 / 粗细） */
-  linkSig: string;
-  /** 折叠圆点位移签名 */
-  circleSig: string;
+  /**
+   * 上次写入的值。刻意存**原始数值**而不是拼接后的签名字符串：
+   * 折叠动画期间每帧都要过一遍全部节点，若每次都拼字符串，
+   * 上千节点就是每秒几万次临时字符串分配，GC 抖动会直接反映成掉帧。
+   */
+  w: number;
+  h: number;
+  themeKey: string;
+  depth: number;
+  branch: number;
+  linkD: string;
+  linkBranch: string;
+  linkWidth: number;
+  circleX: number;
+  circleY: number;
 }
 
 export class NodePainter {
@@ -66,11 +73,14 @@ export class NodePainter {
     const { boxes, byPath } = this.collect(svg);
     if (boxes.length === 0) return;
 
+    // 主题键提到循环外：折叠动画每帧都会走到这里，按节点拼一次字符串
+    // 在两千节点的笔记上就是每秒几万次临时分配
+    const themeKey = `${spec.id}|${spec.dark ? 1 : 0}`;
     for (const box of boxes) {
       const entry = this.entryOf(box);
       this.ensureLayers(box.g, entry);
 
-      this.applyStyle(box, entry, spec);
+      this.applyStyle(box, entry, spec, themeKey);
       this.applySize(box, entry);
       this.applyCircle(box, entry);
 
@@ -94,7 +104,33 @@ export class NodePainter {
     spec: ThemeSpec,
     only: Set<string> | null = null,
   ): void {
-    const { boxes, byPath } = this.collect(svg);
+    // 先按节点数据里的 path（纯 JS 对象，不读 DOM 属性）筛出这一帧真正要碰的节点。
+    // 折叠动画每帧都会进来一次，若每次都给全部节点做 readNodeBox，
+    // 上千节点时每帧要读上万个 SVG 属性 —— 这正是「折叠/展开时发涩」的来源。
+    const needed = new Set<string>();
+    if (only) {
+      for (const path of only) {
+        needed.add(path);
+        // 父节点也要量：连线的起点在父卡片右沿
+        needed.add(parentPathOf(path));
+      }
+    }
+
+    const boxes: NodeBox[] = [];
+    const byPath = new Map<string, NodeBox>();
+    for (const el of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+      if (only) {
+        const data = (el as SVGGElement & {
+          __data__?: { state?: { path?: string } };
+        }).__data__;
+        const path: string | undefined = data?.state?.path;
+        if (!path || !needed.has(path)) continue;
+      }
+      const box = readNodeBox(el);
+      if (!box) continue;
+      boxes.push(box);
+      byPath.set(box.path, box);
+    }
     if (boxes.length === 0) return;
 
     for (const box of boxes) {
@@ -139,10 +175,16 @@ export class NodePainter {
       link: g.querySelector<SVGPathElement>(`:scope > path.${CLS_LINK}`),
       card: g.querySelector<SVGRectElement>(`:scope > rect.${CLS_CARD}`),
       circle: g.querySelector<SVGCircleElement>(":scope > circle"),
-      sizeSig: "",
-      styleSig: "",
-      linkSig: "",
-      circleSig: "",
+      w: -1,
+      h: -1,
+      themeKey: "",
+      depth: -1,
+      branch: -1,
+      linkD: "",
+      linkBranch: "",
+      linkWidth: -1,
+      circleX: Number.NaN,
+      circleY: Number.NaN,
     };
     this.entries.set(box.path, entry);
     return entry;
@@ -203,17 +245,24 @@ export class NodePainter {
   }
 
   /** 配色：只在主题 / 层级 / 分支变化时写 */
-  private applyStyle(box: NodeBox, entry: Entry, spec: ThemeSpec): void {
+  private applyStyle(box: NodeBox, entry: Entry, spec: ThemeSpec, themeKey: string): void {
     const card = entry.card;
     const shadow = entry.shadow;
     if (!card || !shadow) return;
 
-    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
-    const style = nodeStyleAt(spec, box.depth, branch);
-    const sig = `${spec.id}|${spec.dark ? 1 : 0}|${box.depth}|${branchIndex(box.path)}`;
-    if (entry.styleSig === sig) return;
-    entry.styleSig = sig;
+    const branch: number = branchIndex(box.path);
+    if (
+      entry.themeKey === themeKey &&
+      entry.depth === box.depth &&
+      entry.branch === branch
+    ) {
+      return;
+    }
+    entry.themeKey = themeKey;
+    entry.depth = box.depth;
+    entry.branch = branch;
 
+    const style = nodeStyleAt(spec, box.depth, spec.colors[branch % spec.colors.length]);
     const isRoot = box.depth === 0;
     const radius = Math.max(0, Number.parseFloat(spec.radius) || 0);
     const rx = String(isRoot ? radius + 2 : radius);
@@ -234,10 +283,9 @@ export class NodePainter {
   private applySize(box: NodeBox, entry: Entry): void {
     const card = entry.card;
     if (!card) return;
-
-    const sig = `${box.w}|${box.h}`;
-    if (entry.sizeSig === sig) return;
-    entry.sizeSig = sig;
+    if (entry.w === box.w && entry.h === box.h) return;
+    entry.w = box.w;
+    entry.h = box.h;
 
     const r = cardRect(box);
     card.setAttribute("x", String(r.x));
@@ -266,7 +314,8 @@ export class NodePainter {
     if (!circle || !circle.isConnected) {
       circle = box.g.querySelector<SVGCircleElement>(":scope > circle");
       entry.circle = circle;
-      entry.circleSig = "";
+      entry.circleX = Number.NaN;
+      entry.circleY = Number.NaN;
     }
     if (!circle) return;
 
@@ -275,9 +324,9 @@ export class NodePainter {
     if (!Number.isFinite(nativeCx) || !Number.isFinite(nativeCy)) return;
 
     const offset = circleOffset(box, nativeCx, nativeCy);
-    const sig = `${offset.x}|${offset.y}`;
-    if (entry.circleSig === sig) return;
-    entry.circleSig = sig;
+    if (offset.x === entry.circleX && offset.y === entry.circleY) return;
+    entry.circleX = offset.x;
+    entry.circleY = offset.y;
 
     circle.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
   }
@@ -292,11 +341,14 @@ export class NodePainter {
     const link = entry.link;
     if (!link) return;
 
-    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
+    const branch: string = spec.colors[branchIndex(box.path) % spec.colors.length];
     const d = linkPath(box, parent);
-    const sig = `${d}|${branch}|${spec.linkWidth}`;
-    if (entry.linkSig === sig) return;
-    entry.linkSig = sig;
+    if (entry.linkD === d && entry.linkBranch === branch && entry.linkWidth === spec.linkWidth) {
+      return;
+    }
+    entry.linkD = d;
+    entry.linkBranch = branch;
+    entry.linkWidth = spec.linkWidth;
 
     link.setAttribute("d", d);
     link.setAttribute("fill", "none");

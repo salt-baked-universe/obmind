@@ -4505,64 +4505,53 @@ var it = class _it {
   }
 };
 
-// src/parser.ts
-function escapeHtml(text) {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// src/domain/syntax.ts
+function parseFence(line) {
+  const single = /^([ \t]*)\$\$(.+?)\$\$\s*$/.exec(line);
+  if (single && single[2].trim() !== "") {
+    return { kind: "math", lang: "", marker: "$$", indent: single[1], single: true };
+  }
+  const math = /^([ \t]*)\$\$\s*$/.exec(line);
+  if (math) {
+    return { kind: "math", lang: "", marker: "$$", indent: math[1], single: false };
+  }
+  const code = /^([ \t]*)(`{3,}|~{3,})\s*([A-Za-z0-9#+._-]*)/.exec(line);
+  if (code) {
+    return { kind: "code", lang: code[3], marker: code[2], indent: code[1], single: false };
+  }
+  return null;
 }
-function escapeAttr(text) {
-  return text.replace(/"/g, "&quot;");
+function isFenceEnd(line, info) {
+  if (info.kind === "math")
+    return /^[ \t]*\$\$\s*$/.test(line);
+  const m = /^[ \t]*(`{3,}|~{3,})\s*$/.exec(line);
+  return !!m && m[1][0] === info.marker[0] && m[1].length >= info.marker.length;
 }
-var INLINE_CODE_TOKEN = "";
-function renderInline(raw) {
-  let s = escapeHtml(raw.trim());
-  const codes = [];
-  s = s.replace(/`([^`]+)`/g, (_m, code) => {
-    codes.push(code);
-    return `${INLINE_CODE_TOKEN}${codes.length - 1}${INLINE_CODE_TOKEN}`;
-  });
-  s = s.replace(
-    /!?\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]/g,
-    (_m, targetRaw, aliasRaw) => {
-      const target = targetRaw.trim();
-      const path2 = target.split("#")[0] || target;
-      const alias = (aliasRaw != null ? aliasRaw : target).trim();
-      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${alias}</a>`;
-    }
-  );
-  s = s.replace(
-    /!?\[([^\]]+)\]\(((?:[^()\s]|\([^()]*\))+)\)/g,
-    (_m, text, url) => {
-      const raw2 = url.trim();
-      if (/^(https?:|mailto:|obsidian:|#)/i.test(raw2)) {
-        return `<a href="${escapeAttr(raw2)}">${text}</a>`;
-      }
-      let path2 = raw2;
-      try {
-        path2 = decodeURIComponent(raw2);
-      } catch (e) {
-      }
-      path2 = path2.replace(/\.md$/i, "");
-      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${text}</a>`;
-    }
-  );
-  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
-  s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-  s = s.replace(/==([^=]+)==/g, "<mark>$1</mark>");
-  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  s = s.replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
-  const tokenRe = new RegExp(`${INLINE_CODE_TOKEN}(\\d+)${INLINE_CODE_TOKEN}`, "g");
-  s = s.replace(tokenRe, (_m, idx) => {
-    var _a;
-    return `<code>${(_a = codes[Number(idx)]) != null ? _a : ""}</code>`;
-  });
-  return s;
+function dedentBlock(text, prefix) {
+  const width = prefix.length;
+  if (width === 0)
+    return text;
+  return text.split("\n").map((line) => {
+    let k = 0;
+    while (k < width && (line[k] === " " || line[k] === "	"))
+      k++;
+    return line.slice(k);
+  }).join("\n");
 }
 var TAB_COLS = 4;
 function colsOfIndent(ws) {
   var _a;
   const tabs = ((_a = ws.match(/\t/g)) != null ? _a : []).length;
   return tabs * TAB_COLS + (ws.length - tabs);
+}
+function indentOfCols(cols, unit) {
+  if (cols <= 0)
+    return "";
+  const width = colsOfIndent(unit);
+  if (width <= 0)
+    return " ".repeat(cols);
+  const times = Math.floor(cols / width);
+  return unit.repeat(times) + " ".repeat(cols - times * width);
 }
 function gcd(a, b) {
   return b === 0 ? a : gcd(b, a % b);
@@ -4618,7 +4607,11 @@ function measure(text, base) {
   const start2 = base + lead;
   return { text: trimmed, start: start2, end: start2 + trimmed.length };
 }
-function buildTree(content, fileName, options = {}) {
+function escapeText(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function buildTree(content, fileName, options) {
+  const { render } = options;
   const filterFrontmatter = options.filterFrontmatter !== false;
   const rootName = fileName.endsWith(".md") ? fileName.slice(0, -3) : fileName;
   const allLines = content.split("\n");
@@ -4636,17 +4629,53 @@ function buildTree(content, fileName, options = {}) {
     }
   }
   const raws = [];
-  let inCodeBlock = false;
   for (let idx = lineOffset; idx < allLines.length; idx++) {
     const line = allLines[idx];
     if (line.trim() === "")
       continue;
-    if (/^\s*```/.test(line)) {
-      inCodeBlock = !inCodeBlock;
+    const fence = parseFence(line);
+    if (fence) {
+      let end = idx;
+      let bodyLines = 0;
+      if (!fence.single) {
+        let j2 = idx + 1;
+        for (; j2 < allLines.length; j2++) {
+          if (isFenceEnd(allLines[j2], fence))
+            break;
+          bodyLines++;
+        }
+        end = Math.min(j2, allLines.length - 1);
+      }
+      const rawBlock = allLines.slice(idx, end + 1).join("\n");
+      const label = fence.kind === "code" ? `\u4EE3\u7801\u5757${fence.lang ? ` \xB7 ${fence.lang}` : ""}${bodyLines ? ` \xB7 ${bodyLines} \u884C` : ""}` : "\u516C\u5F0F";
+      raws.push({
+        text: label,
+        headingLevel: null,
+        block: {
+          kind: fence.kind,
+          lang: fence.lang,
+          raw: dedentBlock(rawBlock, fence.indent),
+          startLine: idx,
+          endLine: end,
+          lines: fence.single ? 1 : bodyLines
+        },
+        src: {
+          line: idx,
+          bodyStart: 0,
+          bodyEnd: line.length,
+          full: line,
+          marker: "",
+          indent: fence.indent,
+          checked: null,
+          text: label,
+          heading: false,
+          level: null,
+          depth: 0
+        }
+      });
+      idx = end;
       continue;
     }
-    if (inCodeBlock)
-      continue;
     let body = line;
     while (/^\s*>/.test(body))
       body = body.replace(/^\s*>\s?/, "");
@@ -4736,10 +4765,10 @@ function buildTree(content, fileName, options = {}) {
     nodes.push({ depth, raw: r });
   }
   const root2 = {
-    content: escapeHtml(rootName),
+    content: escapeText(rootName),
     children: [],
     // step / unit 供双向编辑与拖动复用，与解析规则保持一致
-    payload: { step, indentUnit: unit }
+    payload: { step, indentUnit: unit, hasHeadings }
   };
   const stack = [root2];
   for (const n of nodes) {
@@ -4748,8 +4777,16 @@ function buildTree(content, fileName, options = {}) {
       parent = stack[d];
     const r = n.raw;
     const shown = r.src.checked === null ? r.src.text : (r.src.checked ? "\u2611 " : "\u2610 ") + r.src.text;
-    const node = {
-      content: renderInline(shown),
+    const node = r.block ? {
+      // 先放一个占位：真正的 HTML 由视图层交给 MarkdownRenderer 渲染后替换。
+      // 必须先定好尺寸再 setData —— markmap 是按 content 里的 DOM 量节点宽高的，
+      // 灌完图再替换内容会和 foreignObject 脱节。
+      content: `<span class="obmind-block">${escapeText(r.text)}</span>`,
+      children: [],
+      // 块节点不给 src：跨多行，改一行就会把块拆坏，故意做成只读
+      payload: { block: r.block }
+    } : {
+      content: render(shown),
       children: [],
       payload: { src: r.src }
     };
@@ -4758,6 +4795,182 @@ function buildTree(content, fileName, options = {}) {
     stack.length = n.depth + 1;
   }
   return root2;
+}
+function collectBlocks(root2) {
+  const out = [];
+  const walk = (n) => {
+    var _a, _b;
+    const block = (_a = n.payload) == null ? void 0 : _a.block;
+    if (block && typeof block.raw === "string")
+      out.push({ node: n, block });
+    for (const c of (_b = n.children) != null ? _b : [])
+      walk(c);
+  };
+  walk(root2);
+  return out;
+}
+
+// src/render/inlineHtml.ts
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escapeAttr(text) {
+  return text.replace(/"/g, "&quot;");
+}
+function escapeAttrFull(value) {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+var INLINE_TAGS = /* @__PURE__ */ new Set([
+  "span",
+  "font",
+  "mark",
+  "b",
+  "strong",
+  "i",
+  "em",
+  "u",
+  "s",
+  "del",
+  "sup",
+  "sub",
+  "br",
+  "small",
+  "big",
+  "kbd",
+  "abbr",
+  "q",
+  "cite",
+  "center"
+]);
+var STYLE_PROPS = /* @__PURE__ */ new Set([
+  "color",
+  "background",
+  "background-color",
+  "font-size",
+  "font-weight",
+  "font-style",
+  "font-family",
+  "text-decoration",
+  "line-height",
+  "letter-spacing",
+  "vertical-align",
+  "text-align",
+  "opacity"
+]);
+var HTML_TOKEN = "";
+var TAG_RE = /<\/?([a-zA-Z][a-zA-Z0-9]*)((?:"[^"]*"|'[^']*'|[^>])*)>/g;
+function sanitizeStyle(raw) {
+  const out = [];
+  for (const decl of raw.split(";")) {
+    const i = decl.indexOf(":");
+    if (i < 0)
+      continue;
+    const prop = decl.slice(0, i).trim().toLowerCase();
+    const value = decl.slice(i + 1).trim();
+    if (!STYLE_PROPS.has(prop) || value === "")
+      continue;
+    if (/url\s*\(|expression\s*\(|javascript:|@import|\\/i.test(value))
+      continue;
+    if (value.length > 160)
+      continue;
+    out.push(`${prop}:${value}`);
+  }
+  return out.join(";");
+}
+function splitInlineHtml(raw) {
+  const tags = [];
+  const text = raw.replace(
+    TAG_RE,
+    (whole, nameRaw, attrs) => {
+      const tag = nameRaw.toLowerCase();
+      if (!INLINE_TAGS.has(tag))
+        return whole;
+      const token = (payload) => {
+        tags.push(payload);
+        return `${HTML_TOKEN}${tags.length - 1}${HTML_TOKEN}`;
+      };
+      if (whole.startsWith("</"))
+        return token(`</${tag}>`);
+      let open = `<${tag}`;
+      const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g;
+      let m;
+      while ((m = attrRe.exec(attrs)) !== null) {
+        const key = m[1].toLowerCase();
+        const quoted = m[2];
+        const value = quoted ? quoted.replace(/^["']|["']$/g, "") : "";
+        if (key === "style") {
+          const style = sanitizeStyle(value);
+          if (style !== "")
+            open += ` style="${escapeAttrFull(style)}"`;
+        } else if (key === "color" || key === "face" || key === "size" || key === "align") {
+          open += ` ${key}="${escapeAttrFull(value)}"`;
+        } else if (key === "class") {
+          const cls = value.replace(/[^\w\s-]/g, "").trim();
+          if (cls !== "")
+            open += ` class="${escapeAttrFull(cls)}"`;
+        }
+      }
+      return token(`${open}>`);
+    }
+  );
+  return { text, tags };
+}
+var INLINE_CODE_TOKEN = "";
+function renderInline(raw) {
+  const { text: source, tags } = splitInlineHtml(raw.trim());
+  let s = escapeHtml(source);
+  const codes = [];
+  s = s.replace(/`([^`]+)`/g, (_m, code) => {
+    codes.push(code);
+    return `${INLINE_CODE_TOKEN}${codes.length - 1}${INLINE_CODE_TOKEN}`;
+  });
+  s = s.replace(
+    /!?\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]/g,
+    (_m, targetRaw, aliasRaw) => {
+      const target = targetRaw.trim();
+      const path2 = target.split("#")[0] || target;
+      const alias = (aliasRaw != null ? aliasRaw : target).trim();
+      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${alias}</a>`;
+    }
+  );
+  s = s.replace(
+    /!?\[([^\]]+)\]\(((?:[^()\s]|\([^()]*\))+)\)/g,
+    (_m, text, url) => {
+      const raw2 = url.trim();
+      if (/^(https?:|mailto:|obsidian:|#)/i.test(raw2)) {
+        return `<a href="${escapeAttr(raw2)}">${text}</a>`;
+      }
+      let path2 = raw2;
+      try {
+        path2 = decodeURIComponent(raw2);
+      } catch (e) {
+      }
+      path2 = path2.replace(/\.md$/i, "");
+      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${text}</a>`;
+    }
+  );
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  s = s.replace(/==([^=]+)==/g, "<mark>$1</mark>");
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  s = s.replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+  const tokenRe = new RegExp(`${INLINE_CODE_TOKEN}(\\d+)${INLINE_CODE_TOKEN}`, "g");
+  s = s.replace(tokenRe, (_m, idx) => {
+    var _a;
+    return `<code>${(_a = codes[Number(idx)]) != null ? _a : ""}</code>`;
+  });
+  const htmlRe = new RegExp(`${HTML_TOKEN}(\\d+)${HTML_TOKEN}`, "g");
+  s = s.replace(htmlRe, (_m, idx) => {
+    var _a;
+    return (_a = tags[Number(idx)]) != null ? _a : "";
+  });
+  return s;
+}
+
+// src/parser.ts
+function buildTree2(content, fileName, options = {}) {
+  return buildTree(content, fileName, { ...options, render: renderInline });
 }
 
 // src/theme.ts
@@ -5036,10 +5249,11 @@ var NodePainter = class {
     const { boxes, byPath } = this.collect(svg);
     if (boxes.length === 0)
       return;
+    const themeKey = `${spec.id}|${spec.dark ? 1 : 0}`;
     for (const box of boxes) {
       const entry = this.entryOf(box);
       this.ensureLayers(box.g, entry);
-      this.applyStyle(box, entry, spec);
+      this.applyStyle(box, entry, spec, themeKey);
       this.applySize(box, entry);
       this.applyCircle(box, entry);
       if (box.depth === 0)
@@ -5058,7 +5272,29 @@ var NodePainter = class {
    *             节点越多收益越明显。
    */
   paintLinks(svg, spec, only = null) {
-    const { boxes, byPath } = this.collect(svg);
+    var _a;
+    const needed = /* @__PURE__ */ new Set();
+    if (only) {
+      for (const path2 of only) {
+        needed.add(path2);
+        needed.add(parentPathOf(path2));
+      }
+    }
+    const boxes = [];
+    const byPath = /* @__PURE__ */ new Map();
+    for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      if (only) {
+        const data = el.__data__;
+        const path2 = (_a = data == null ? void 0 : data.state) == null ? void 0 : _a.path;
+        if (!path2 || !needed.has(path2))
+          continue;
+      }
+      const box = readNodeBox(el);
+      if (!box)
+        continue;
+      boxes.push(box);
+      byPath.set(box.path, box);
+    }
     if (boxes.length === 0)
       return;
     for (const box of boxes) {
@@ -5102,10 +5338,16 @@ var NodePainter = class {
       link: g.querySelector(`:scope > path.${CLS_LINK}`),
       card: g.querySelector(`:scope > rect.${CLS_CARD}`),
       circle: g.querySelector(":scope > circle"),
-      sizeSig: "",
-      styleSig: "",
-      linkSig: "",
-      circleSig: ""
+      w: -1,
+      h: -1,
+      themeKey: "",
+      depth: -1,
+      branch: -1,
+      linkD: "",
+      linkBranch: "",
+      linkWidth: -1,
+      circleX: Number.NaN,
+      circleY: Number.NaN
     };
     this.entries.set(box.path, entry);
     return entry;
@@ -5159,17 +5401,19 @@ var NodePainter = class {
     return el;
   }
   /** 配色：只在主题 / 层级 / 分支变化时写 */
-  applyStyle(box, entry, spec) {
+  applyStyle(box, entry, spec, themeKey) {
     const card = entry.card;
     const shadow = entry.shadow;
     if (!card || !shadow)
       return;
-    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
-    const style = nodeStyleAt(spec, box.depth, branch);
-    const sig = `${spec.id}|${spec.dark ? 1 : 0}|${box.depth}|${branchIndex(box.path)}`;
-    if (entry.styleSig === sig)
+    const branch = branchIndex(box.path);
+    if (entry.themeKey === themeKey && entry.depth === box.depth && entry.branch === branch) {
       return;
-    entry.styleSig = sig;
+    }
+    entry.themeKey = themeKey;
+    entry.depth = box.depth;
+    entry.branch = branch;
+    const style = nodeStyleAt(spec, box.depth, spec.colors[branch % spec.colors.length]);
     const isRoot = box.depth === 0;
     const radius = Math.max(0, Number.parseFloat(spec.radius) || 0);
     const rx = String(isRoot ? radius + 2 : radius);
@@ -5186,10 +5430,10 @@ var NodePainter = class {
     const card = entry.card;
     if (!card)
       return;
-    const sig = `${box.w}|${box.h}`;
-    if (entry.sizeSig === sig)
+    if (entry.w === box.w && entry.h === box.h)
       return;
-    entry.sizeSig = sig;
+    entry.w = box.w;
+    entry.h = box.h;
     const r = cardRect(box);
     card.setAttribute("x", String(r.x));
     card.setAttribute("y", String(r.y));
@@ -5216,7 +5460,8 @@ var NodePainter = class {
     if (!circle || !circle.isConnected) {
       circle = box.g.querySelector(":scope > circle");
       entry.circle = circle;
-      entry.circleSig = "";
+      entry.circleX = Number.NaN;
+      entry.circleY = Number.NaN;
     }
     if (!circle)
       return;
@@ -5225,10 +5470,10 @@ var NodePainter = class {
     if (!Number.isFinite(nativeCx) || !Number.isFinite(nativeCy))
       return;
     const offset = circleOffset(box, nativeCx, nativeCy);
-    const sig = `${offset.x}|${offset.y}`;
-    if (entry.circleSig === sig)
+    if (offset.x === entry.circleX && offset.y === entry.circleY)
       return;
-    entry.circleSig = sig;
+    entry.circleX = offset.x;
+    entry.circleY = offset.y;
     circle.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
   }
   /** 自绘连线：父卡片右边缘中点 → 子卡片左边缘中点 */
@@ -5238,15 +5483,89 @@ var NodePainter = class {
       return;
     const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
     const d = linkPath(box, parent);
-    const sig = `${d}|${branch}|${spec.linkWidth}`;
-    if (entry.linkSig === sig)
+    if (entry.linkD === d && entry.linkBranch === branch && entry.linkWidth === spec.linkWidth) {
       return;
-    entry.linkSig = sig;
+    }
+    entry.linkD = d;
+    entry.linkBranch = branch;
+    entry.linkWidth = spec.linkWidth;
     link2.setAttribute("d", d);
     link2.setAttribute("fill", "none");
     link2.setAttribute("stroke", branch);
     link2.setAttribute("stroke-width", String(spec.linkWidth));
     link2.setAttribute("stroke-linecap", "round");
+  }
+};
+
+// src/render/frame.ts
+var FrameScheduler = class {
+  constructor(painter, source) {
+    this.painter = painter;
+    this.source = source;
+    this.frame = 0;
+    this.mode = "links";
+    this.paths = /* @__PURE__ */ new Set();
+  }
+  /**
+   * 请求一次绘制。
+   * @param paths 本帧发生位移的节点 path；只有 links 模式且非空时才做定向更新
+   */
+  request(mode, paths) {
+    if (this.source.blocked())
+      return;
+    if (mode === "all") {
+      this.mode = "all";
+      this.paths.clear();
+    } else if (this.mode !== "all" && paths !== void 0) {
+      for (const path2 of paths)
+        this.paths.add(path2);
+    }
+    if (this.frame !== 0)
+      return;
+    this.frame = window.requestAnimationFrame(() => {
+      this.frame = 0;
+      this.flush();
+    });
+  }
+  /**
+   * 立刻同步画一遍全量，不等 rAF。
+   *
+   * 重建之后必须抢在浏览器绘制这一帧之前把卡片和连线摆正，
+   * 否则会先播出一帧「新位置的节点 + 旧父节点的连线」，看起来就是线闪一下。
+   */
+  paintNow() {
+    this.cancel();
+    const svg = this.source.svg();
+    const spec = this.source.spec();
+    if (!svg || !spec)
+      return;
+    this.painter.paintAll(svg, spec);
+  }
+  cancel() {
+    if (this.frame !== 0) {
+      window.cancelAnimationFrame(this.frame);
+      this.frame = 0;
+    }
+    this.mode = "links";
+    this.paths.clear();
+  }
+  /** 缓存全清（重建后元素引用全部作废） */
+  reset() {
+    this.cancel();
+    this.painter.reset();
+  }
+  flush() {
+    const svg = this.source.svg();
+    const spec = this.source.spec();
+    if (!svg || !spec)
+      return;
+    if (this.mode === "all") {
+      this.painter.paintAll(svg, spec);
+    } else {
+      this.painter.paintLinks(svg, spec, this.paths.size > 0 ? this.paths : null);
+    }
+    this.mode = "links";
+    this.paths.clear();
   }
 };
 
@@ -5362,10 +5681,25 @@ function openInlineEditor(options) {
         place();
     });
   };
+  let follow = 0;
+  const followUntil = performance.now() + 420;
+  const followLoop = () => {
+    if (done) {
+      follow = 0;
+      return;
+    }
+    place();
+    follow = performance.now() < followUntil ? window.requestAnimationFrame(followLoop) : 0;
+  };
+  follow = window.requestAnimationFrame(followLoop);
   const cleanup = () => {
     if (frame2) {
       window.cancelAnimationFrame(frame2);
       frame2 = 0;
+    }
+    if (follow) {
+      window.cancelAnimationFrame(follow);
+      follow = 0;
     }
     ta.removeEventListener("keydown", onKeyDown);
     ta.removeEventListener("blur", onBlur);
@@ -5519,22 +5853,39 @@ async function applySpan(app, file, span) {
   const editor = findEditor(app, file);
   if (editor) {
     if (span.checkLine >= editor.lineCount())
-      return false;
+      return { ok: false };
     if (editor.getLine(span.checkLine) !== span.checkText)
-      return false;
+      return { ok: false };
+    if (span.checkEnd) {
+      const end = span.checkEnd;
+      if (end.line >= editor.lineCount())
+        return { ok: false };
+      if (editor.getLine(end.line) !== end.text)
+        return { ok: false };
+    }
     editor.transaction({ changes: [buildChange(editor, span)] });
-    return true;
+    return { ok: true, next: editor.getValue() };
   }
-  let ok = false;
+  let next;
   await app.vault.process(file, (data) => {
     const lines = data.split("\n");
     if (lines[span.checkLine] !== span.checkText)
       return data;
-    ok = true;
+    if (span.checkEnd && lines[span.checkEnd.line] !== span.checkEnd.text)
+      return data;
     lines.splice(span.start, span.end - span.start, ...span.lines);
-    return lines.join("\n");
+    next = lines.join("\n");
+    return next;
   });
-  return ok;
+  return next === void 0 ? { ok: false } : { ok: true, next };
+}
+async function applyOp(app, file, op) {
+  if (op.kind === "whole") {
+    const ok = await replaceAll(app, file, op.content, op.expect);
+    return ok ? { ok: true, next: op.content } : { ok: false, reason: "\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u4FEE\u6539\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002" };
+  }
+  const res = await applySpan(app, file, op.span);
+  return res.ok ? { ok: true, next: res.next } : { ok: false, reason: "\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u4FEE\u6539\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002" };
 }
 
 // src/edit/drag.ts
@@ -5559,8 +5910,19 @@ var DragController = class {
       if (g)
         e.stopPropagation();
     };
+    /**
+     * 右键在导图里是「拖动改层级」，不是菜单。
+     *
+     * 必须显式拦掉 contextmenu：pointerdown 拦不住它。不拦的话，
+     * 每次右键松手（哪怕只是右键点了一下）都会弹出系统菜单压住画布。
+     * 空白处仍然保留菜单 —— 那是画布自己的。
+     */
+    this.onContextMenu = (e) => {
+      if (this.nodeAt(e.target))
+        e.preventDefault();
+    };
     this.onPointerDown = (e) => {
-      if (e.button !== 0)
+      if (e.button !== 2)
         return;
       const el = e.target;
       if (el.closest("a") || el.closest("circle"))
@@ -5628,6 +5990,7 @@ var DragController = class {
     this.cb = cb;
     svg.addEventListener("mousedown", this.blockOnNode, true);
     svg.addEventListener("pointerdown", this.onPointerDown, true);
+    svg.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("pointermove", this.onPointerMove, true);
     window.addEventListener("pointerup", this.onPointerUp, true);
     window.addEventListener("keydown", this.onKeyDown, true);
@@ -5636,6 +5999,7 @@ var DragController = class {
     var _a;
     this.svg.removeEventListener("mousedown", this.blockOnNode, true);
     this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
+    this.svg.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("pointermove", this.onPointerMove, true);
     window.removeEventListener("pointerup", this.onPointerUp, true);
     window.removeEventListener("keydown", this.onKeyDown, true);
@@ -5754,20 +6118,115 @@ function pathOf(g) {
   return typeof path2 === "string" ? path2 : "";
 }
 
-// src/edit/move.ts
-function collectSrc(root2) {
-  const out = [];
-  const walk = (n) => {
-    var _a, _b;
-    const src = (_a = n.payload) == null ? void 0 : _a.src;
-    if (src)
-      out.push(src);
-    for (const c of (_b = n.children) != null ? _b : [])
-      walk(c);
-  };
-  walk(root2);
-  return out.sort((a, b) => a.line - b.line);
+// src/edit/text.ts
+function quoteOf(src) {
+  const m = /^(?:\s*>\s?)+/.exec(src.full);
+  return m ? m[0] : "";
 }
+function markOf(src) {
+  return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
+}
+function rewriteNode(src, text, checked, indent) {
+  const quote = quoteOf(src);
+  let mark = markOf(src);
+  const want = checked === void 0 ? src.checked : checked;
+  if (src.checked !== null && want !== src.checked) {
+    mark = mark.replace(/\[[ xX]\](?=\s*$)/, want ? "[x]" : "[ ]");
+  }
+  const nextIndent = indent === void 0 ? src.indent : indent;
+  return quote + nextIndent + mark + text + src.full.slice(src.bodyEnd);
+}
+function indentBy(src, delta, step) {
+  const unit = src.indent.includes("	") ? "	" : " ".repeat(Math.max(1, step));
+  if (delta > 0)
+    return src.indent + unit;
+  if (delta < 0) {
+    if (src.indent.length === 0)
+      return null;
+    return src.indent.slice(0, Math.max(0, src.indent.length - unit.length));
+  }
+  return src.indent;
+}
+function parseEditorValue(src, raw) {
+  let text = raw.trim();
+  let checked = src.checked;
+  if (src.checked !== null) {
+    const m = /^([☐☑])\s*/u.exec(text);
+    if (m) {
+      checked = m[1] === "\u2611";
+      text = text.slice(m[0].length).trim();
+    }
+  }
+  return { text, checked };
+}
+
+// src/edit/create.ts
+var MAX_HEADING = 6;
+var NEW_NODE_TEXT = "\u65B0\u8282\u70B9";
+function subtreeEndOf(src, nodes) {
+  let end = src.line;
+  for (const n of nodes) {
+    if (n.line <= src.line)
+      continue;
+    if (n.depth > src.depth) {
+      end = n.line;
+      continue;
+    }
+    break;
+  }
+  return end;
+}
+function resetOrdered(mark) {
+  return mark.replace(/^(\s*)\d{1,9}([.)]\s+)/, "$11$2");
+}
+function planCreate(input) {
+  var _a, _b;
+  const { src, nodes, step, unit, mode } = input;
+  const text = (_a = input.placeholder) != null ? _a : NEW_NODE_TEXT;
+  const insertAfterLine = subtreeEndOf(src, nodes);
+  const focusLine = insertAfterLine + 1;
+  if (mode === "sibling") {
+    const quote = quoteOf(src);
+    let mark2 = markOf(src);
+    if (!src.heading)
+      mark2 = resetOrdered(mark2);
+    return {
+      ok: true,
+      plan: { insertAfterLine, focusLine, line: quote + src.indent + mark2 + text }
+    };
+  }
+  if (src.heading) {
+    const level = ((_b = src.level) != null ? _b : 1) + 1;
+    if (level > MAX_HEADING) {
+      return { ok: false, reason: `\u6807\u9898\u6700\u591A ${MAX_HEADING} \u7EA7\uFF0C\u6CA1\u6CD5\u518D\u52A0\u5B50\u7EA7` };
+    }
+    const quote = quoteOf(src);
+    return {
+      ok: true,
+      plan: {
+        insertAfterLine,
+        focusLine,
+        line: `${quote}${"#".repeat(level)} ${text}`
+      }
+    };
+  }
+  const cols = colsOfIndent(src.indent) + Math.max(1, step);
+  const indent = indentOfCols(cols, unit);
+  let mark = markOf(src);
+  if (src.checked !== null)
+    mark = mark.replace(/\[[ xX]\]\s*$/, "[ ] ");
+  mark = resetOrdered(mark);
+  return {
+    ok: true,
+    plan: {
+      insertAfterLine,
+      focusLine,
+      line: quoteOf(src) + indent + mark + text
+    }
+  };
+}
+
+// src/edit/move.ts
 var HEADING_RE = /^(#{1,6})(\s+)/;
 var QUOTE_PREFIX = /^(?:\s*>\s?)+/;
 function splitLine(line) {
@@ -5903,56 +6362,481 @@ function moveNode(input) {
   return { ok: true, lines: rest };
 }
 
-// src/edit/text.ts
-function quoteOf(src) {
-  const m = /^(?:\s*>\s?)+/.exec(src.full);
-  return m ? m[0] : "";
+// src/app/EditService.ts
+var none2 = (reason) => ({ kind: "none", reason });
+var error = (reason) => ({ kind: "error", reason });
+function lineOp(src, lines, opts = {}) {
+  var _a;
+  return {
+    kind: "span",
+    span: {
+      start: src.line,
+      end: (_a = opts.end) != null ? _a : src.line + 1,
+      lines,
+      checkLine: src.line,
+      checkText: src.full,
+      checkEnd: opts.checkEnd
+    }
+  };
 }
-function markOf(src) {
-  return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
-}
-function rewriteNode(src, text, checked, indent) {
-  const quote = quoteOf(src);
-  let mark = markOf(src);
-  const want = checked === void 0 ? src.checked : checked;
-  if (src.checked !== null && want !== src.checked) {
-    mark = mark.replace(/\[[ xX]\](?=\s*$)/, want ? "[x]" : "[ ]");
+var EditService = class {
+  /** 找一个节点的源坐标（新节点插入位置要用全部节点才能算子树范围） */
+  nodeAt(snap, line) {
+    var _a;
+    return (_a = snap.nodes.find((n) => n.line === line)) != null ? _a : null;
   }
-  const nextIndent = indent === void 0 ? src.indent : indent;
-  return quote + nextIndent + mark + text + src.full.slice(src.bodyEnd);
-}
-function indentBy(src, delta, step) {
-  const unit = src.indent.includes("	") ? "	" : " ".repeat(Math.max(1, step));
-  if (delta > 0)
-    return src.indent + unit;
-  if (delta < 0) {
-    if (src.indent.length === 0)
-      return null;
-    return src.indent.slice(0, Math.max(0, src.indent.length - unit.length));
+  /**
+   * 编辑框结束：改字 / 缩进 / 新建同级 / 删除。
+   *
+   * 其中「新建同级」是最容易写错的一条：新行不能插在下一行，而要插在
+   * **整棵子树之后**。父节点有孩子时，下一行是它的第一个孩子 ——
+   * 插在那里会被缩进规则判成孩子，越加越深。
+   */
+  commit(input) {
+    var _a;
+    const { snap, src, action, value } = input;
+    if (action === "cancel")
+      return none2("\u5DF2\u53D6\u6D88");
+    const parsed = parseEditorValue(src, value);
+    if (parsed.text === "" && action !== "delete")
+      return none2("\u7A7A\u6587\u672C\u4E0D\u5199\u5165");
+    if (action === "delete") {
+      return { kind: "write", op: this.removeOp(snap, src) };
+    }
+    if (action === "sibling") {
+      const plan = planCreate({
+        src,
+        nodes: snap.nodes,
+        step: snap.step,
+        unit: snap.unit,
+        mode: "sibling"
+      });
+      if (!plan.ok)
+        return error(plan.reason);
+      const at = plan.plan.insertAfterLine;
+      const newLine = plan.plan.line;
+      const rewritten = rewriteNode(src, parsed.text, parsed.checked);
+      if (at === src.line) {
+        return {
+          kind: "write",
+          op: lineOp(src, [rewritten, newLine]),
+          focusLine: src.line + 1
+        };
+      }
+      const lines = snap.content.split("\n");
+      const middle = lines.slice(src.line + 1, at + 1);
+      return {
+        kind: "write",
+        op: lineOp(src, [rewritten, ...middle, newLine], {
+          end: at + 1,
+          checkEnd: { line: at, text: (_a = lines[at]) != null ? _a : "" }
+        }),
+        focusLine: at + 1
+      };
+    }
+    if (action === "indent" || action === "outdent") {
+      const nextIndent = indentBy(
+        src,
+        action === "indent" ? 1 : -1,
+        snap.step
+      );
+      if (nextIndent === null)
+        return none2("\u5DF2\u7ECF\u5728\u6700\u5916\u5C42\uFF0C\u65E0\u6CD5\u518D\u51CF\u5C11\u7F29\u8FDB");
+      return {
+        kind: "write",
+        op: lineOp(src, [rewriteNode(src, parsed.text, parsed.checked, nextIndent)])
+      };
+    }
+    if (parsed.text === src.text && parsed.checked === src.checked) {
+      return none2("\u5185\u5BB9\u6CA1\u6709\u53D8\u5316");
+    }
+    return {
+      kind: "write",
+      op: lineOp(src, [rewriteNode(src, parsed.text, parsed.checked)])
+    };
   }
-  return src.indent;
-}
-function siblingLine(src, placeholder = "\u65B0\u8282\u70B9") {
-  const quote = quoteOf(src);
-  let mark = markOf(src);
-  const ordered = /(\d+)([.)])(\s+)$/.exec(mark);
-  if (ordered) {
-    const next = Number.parseInt(ordered[1], 10) + 1;
-    mark = mark.slice(0, ordered.index) + next + ordered[2] + ordered[3];
+  /**
+   * 新建节点（Tab 建子级 / Enter 建同级）。
+   *
+   * 层级规则交给 create.ts：标题体系降一级标题，正文体系多缩进一个步长。
+   */
+  create(input) {
+    var _a;
+    const src = this.nodeAt(input.snap, input.line);
+    if (!src)
+      return error("\u627E\u4E0D\u5230\u8981\u65B0\u5EFA\u7684\u8282\u70B9");
+    const plan = planCreate({
+      src,
+      nodes: input.snap.nodes,
+      step: input.snap.step,
+      unit: input.snap.unit,
+      mode: input.mode
+    });
+    if (!plan.ok)
+      return error(plan.reason);
+    const at = plan.plan.insertAfterLine;
+    const lines = input.snap.content.split("\n");
+    const span = {
+      // start === end 表示「插在这一行之前」，所以 at + 1 才是「at 之后」
+      start: at + 1,
+      end: at + 1,
+      lines: [plan.plan.line],
+      checkLine: at,
+      checkText: (_a = lines[at]) != null ? _a : ""
+    };
+    return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
   }
-  return quote + src.indent + mark + placeholder;
+  /**
+   * 拖动改层级。
+   *
+   * 必须整篇重写：一行会被搬到很远的位置，中间所有行号都会变，
+   * 用行区间替换表达不了。拆成「先删后插」两次写入也不行 ——
+   * 中间那一瞬间笔记是坏的（节点丢一半）。
+   */
+  move(input) {
+    const res = moveNode({
+      lines: input.snap.content.split("\n"),
+      nodes: [...input.snap.nodes],
+      step: input.snap.step,
+      unit: input.snap.unit,
+      srcLine: input.srcLine,
+      targetLine: input.targetLine,
+      mode: input.mode
+    });
+    if (!res.ok)
+      return error(res.reason);
+    return {
+      kind: "write",
+      op: {
+        kind: "whole",
+        content: res.lines.join("\n"),
+        expect: input.snap.content
+      }
+    };
+  }
+  /**
+   * 删除节点（画布上按 Delete/Backspace）。
+   *
+   * 删的是**整棵子树**：一行 + 它下面所有更深缩进的行。只删一行的话，
+   * 子节点会失去父节点、被缩进规则挂到更上层，导图结构在用户眼里就乱了。
+   */
+  remove(input) {
+    const src = this.nodeAt(input.snap, input.line);
+    if (!src)
+      return error("\u627E\u4E0D\u5230\u8981\u5220\u9664\u7684\u8282\u70B9");
+    if (src.depth === 0)
+      return error("\u6839\u8282\u70B9\u662F\u7B14\u8BB0\u672C\u8EAB\uFF0C\u5220\u4E0D\u4E86");
+    return { kind: "write", op: this.removeOp(input.snap, src) };
+  }
+  /** 某个节点在树里的父节点行号；根节点返回 -1（删完用它把选中挪过去） */
+  parentLineOf(snap, line) {
+    const src = this.nodeAt(snap, line);
+    if (!src || src.depth === 0)
+      return -1;
+    let best = -1;
+    for (const n of snap.nodes) {
+      if (n.line >= src.line)
+        break;
+      if (n.depth < src.depth)
+        best = n.line;
+    }
+    return best;
+  }
+  /** 要删掉这个节点一共占几行（含自己） */
+  subtreeSize(snap, line) {
+    const src = this.nodeAt(snap, line);
+    if (!src)
+      return 0;
+    return subtreeEndOf(src, snap.nodes) - src.line + 1;
+  }
+  /**
+   * 删除用的行区间：从该行到子树最后一行。
+   *
+   * 首尾都要锚定：跨越多行时，中间任何一行被外部改过，写入都必须放弃，
+   * 否则会拿旧内容覆盖用户刚敲的字。
+   */
+  removeOp(snap, src) {
+    var _a;
+    const end = subtreeEndOf(src, snap.nodes);
+    const lines = snap.content.split("\n");
+    const span = {
+      start: src.line,
+      end: end + 1,
+      lines: [],
+      checkLine: src.line,
+      checkText: src.full,
+      checkEnd: end > src.line ? { line: end, text: (_a = lines[end]) != null ? _a : "" } : void 0
+    };
+    return { kind: "span", span };
+  }
+};
+
+// src/app/NavStack.ts
+var NAV_LIMIT = 24;
+function topOf(stack) {
+  return stack.length > 0 ? stack[stack.length - 1] : null;
 }
-function parseEditorValue(src, raw) {
-  let text = raw.trim();
-  let checked = src.checked;
-  if (src.checked !== null) {
-    const m = /^([☐☑])\s*/u.exec(text);
-    if (m) {
-      checked = m[1] === "\u2611";
-      text = text.slice(m[0].length).trim();
+function pushEntryDetailed(stack, entry, limit = NAV_LIMIT) {
+  const cur = topOf(stack);
+  if (cur && cur.path === entry.path) {
+    if (cur.leafId === entry.leafId)
+      return { stack: [...stack], dropped: [] };
+    return { stack: [...stack.slice(0, stack.length - 1), entry], dropped: [cur] };
+  }
+  const hit = stack.findIndex((e) => e.path === entry.path);
+  const base = hit >= 0 ? stack.slice(0, hit) : [...stack];
+  const dropped = hit >= 0 ? stack.slice(hit + 1) : [];
+  let next = [...base, entry];
+  if (next.length > limit) {
+    const cut = next.length - limit;
+    dropped.push(...next.slice(0, cut));
+    next = next.slice(cut);
+  }
+  return { stack: next, dropped };
+}
+function pushEntry(stack, entry, limit = NAV_LIMIT) {
+  return pushEntryDetailed(stack, entry, limit).stack;
+}
+function truncateTo(stack, index) {
+  if (index < 0 || index >= stack.length)
+    return [...stack];
+  return stack.slice(0, index + 1);
+}
+
+// src/app/NavPolicy.ts
+var NAV_SYNC_OPTIONS = [
+  {
+    value: "map-only",
+    label: "\u4EC5\u5BFC\u56FE\u8DF3\u8F6C",
+    desc: "\u7B14\u8BB0\u7A97\u53E3\u5B8C\u5168\u4E0D\u8DDF\u968F\uFF0C\u5BFC\u56FE\u539F\u5730\u6362\u5185\u5BB9\u3002\u9002\u5408\u628A\u5BFC\u56FE\u5F53\u72EC\u7ACB\u6D4F\u89C8\u5668\u7528\u3002"
+  },
+  {
+    value: "same-leaf",
+    label: "\u8DDF\u968F\u5F53\u524D\u7B14\u8BB0\u7A97\u53E3\uFF08\u9ED8\u8BA4\uFF09",
+    desc: "\u5728\u5F53\u524D\u7B14\u8BB0\u7A97\u53E3\u91CC\u6253\u5F00\u76EE\u6807\u7B14\u8BB0\uFF0C\u540E\u9000\u65F6\u540C\u4E00\u4E2A\u7A97\u53E3\u5207\u56DE\u4E0A\u7EA7\u3002\u6807\u7B7E\u680F\u4E0D\u589E\u52A0\u3002"
+  },
+  {
+    value: "new-leaf-close",
+    label: "\u65B0\u6807\u7B7E\u6253\u5F00\uFF0C\u8FD4\u56DE\u65F6\u5173\u95ED",
+    desc: "\u76EE\u6807\u7B14\u8BB0\u5728\u65B0\u6807\u7B7E\u9875\u6253\u5F00\uFF0C\u70B9\u9762\u5305\u5C51\u56DE\u5230\u4E0A\u7EA7\u65F6\u81EA\u52A8\u5173\u6389\u90A3\u4E2A\u6807\u7B7E\u3002"
+  },
+  {
+    value: "new-leaf-keep",
+    label: "\u65B0\u6807\u7B7E\u6253\u5F00\uFF0C\u8FD4\u56DE\u65F6\u4FDD\u7559",
+    desc: "\u76EE\u6807\u7B14\u8BB0\u5728\u65B0\u6807\u7B7E\u9875\u6253\u5F00\uFF1B\u56DE\u5230\u4E0A\u7EA7\u65F6\u4E0D\u5173\u95ED\u6807\u7B7E\uFF0C\u4E5F\u4E0D\u5207\u6362\u8FC7\u53BB\uFF0C\u9002\u5408\u5DE6\u53F3\u5BF9\u7167\u3002"
+  }
+];
+var DEFAULT_NAV_SYNC = "same-leaf";
+function normalizeNavSync(value) {
+  const hit = NAV_SYNC_OPTIONS.find((o) => o.value === value);
+  return hit ? hit.value : DEFAULT_NAV_SYNC;
+}
+function forwardTarget(mode) {
+  switch (mode) {
+    case "map-only":
+      return "none";
+    case "same-leaf":
+      return "current";
+    default:
+      return "new";
+  }
+}
+function trackOpenedLeaf(mode) {
+  return mode === "new-leaf-close";
+}
+function planBack(mode) {
+  switch (mode) {
+    case "map-only":
+      return { closeOpened: false, followCurrent: false };
+    case "same-leaf":
+      return { closeOpened: false, followCurrent: true };
+    case "new-leaf-close":
+      return { closeOpened: true, followCurrent: false };
+    case "new-leaf-keep":
+      return { closeOpened: false, followCurrent: false };
+  }
+}
+
+// src/app/QueryService.ts
+function collectSrcRefs(root2) {
+  const out = [];
+  const walk = (n) => {
+    var _a, _b;
+    const src = (_a = n.payload) == null ? void 0 : _a.src;
+    if (src && typeof src.line === "number")
+      out.push(src);
+    for (const c of (_b = n.children) != null ? _b : [])
+      walk(c);
+  };
+  walk(root2);
+  return out.sort((a, b) => a.line - b.line);
+}
+function payloadOf(tree) {
+  const p = tree.payload;
+  return {
+    step: typeof (p == null ? void 0 : p.step) === "number" && p.step > 0 ? p.step : 2,
+    unit: typeof (p == null ? void 0 : p.indentUnit) === "string" && p.indentUnit !== "" ? p.indentUnit : "  ",
+    hasHeadings: (p == null ? void 0 : p.hasHeadings) === true
+  };
+}
+var QueryService = class {
+  constructor(read) {
+    this.read = read;
+  }
+  /** 只解析，不读文件（内容已经在手上时用，比如刚写完的 buffer） */
+  parse(content, basename, options = {}) {
+    const tree = buildTree2(content, basename, options);
+    const meta = payloadOf(tree);
+    return {
+      content,
+      tree,
+      nodes: collectSrcRefs(tree),
+      step: meta.step,
+      unit: meta.unit,
+      hasHeadings: meta.hasHeadings
+    };
+  }
+  /** 读文件再解析 */
+  async load(path2, basename, options = {}) {
+    const content = await this.read(path2);
+    return this.parse(content, basename, options);
+  }
+};
+
+// src/app/runtime.ts
+var ViewRuntime = class {
+  constructor(onError) {
+    this._phase = "idle";
+    this._rev = 0;
+    this._task = null;
+    this._running = false;
+    this._disposed = false;
+    this.onError = onError;
+  }
+  get phase() {
+    return this._phase;
+  }
+  /** 是否有重建正在执行（代替原来的 refreshing 标志） */
+  get busy() {
+    return this._running;
+  }
+  /** 是否还有未消化的请求（调试 / 测试用） */
+  get pending() {
+    return this._task !== null || this._running;
+  }
+  /**
+   * 切换阶段。离开占用态（editing / dragging / rebuilding）回到 idle 时，
+   * 挂起的请求会立刻补跑 —— 原来那套 pendingRefresh 手写补跑的就是这件事。
+   */
+  setPhase(phase) {
+    if (this._phase === phase)
+      return;
+    this._phase = phase;
+    void this.pump();
+  }
+  /**
+   * 请求一次重建。
+   *
+   * 新的请求会覆盖还没开始跑的旧请求（都是「把最新状态画出来」，没必要排队），
+   * 同时把正在跑的那一轮标记为过期 —— 它手里的数据已经不是最新的了。
+   */
+  request(task) {
+    this._task = task;
+    this._rev++;
+    void this.pump();
+  }
+  /** 任务在 await 之后自查：返回 true 表示自己已经过期，应当放弃投影 */
+  stale(rev) {
+    return rev !== this._rev || this._disposed;
+  }
+  dispose() {
+    this._disposed = true;
+    this._rev++;
+    this._task = null;
+  }
+  async pump() {
+    if (this._running || this._disposed)
+      return;
+    if (this._phase !== "idle")
+      return;
+    this._running = true;
+    try {
+      while (!this._disposed && this._task !== null && this._phase === "idle") {
+        const task = this._task;
+        this._task = null;
+        const rev = this._rev;
+        try {
+          await task(rev);
+        } catch (err) {
+          this.onError(err);
+        }
+      }
+    } finally {
+      this._running = false;
     }
   }
-  return { text, checked };
+};
+
+// src/app/plan.ts
+function srcOf(node) {
+  if (!node)
+    return null;
+  const payload = node.payload;
+  const src = payload == null ? void 0 : payload.src;
+  return src && typeof src.line === "number" ? src : null;
+}
+function planProjection(input) {
+  if (input.forceStructure || input.prev === null)
+    return { kind: "structure" };
+  let changed = 0;
+  let line = -1;
+  let content = "";
+  let structural = false;
+  const walk = (a, b) => {
+    var _a, _b, _c, _d, _e, _f;
+    if (structural)
+      return;
+    if (a.content !== b.content) {
+      const src = srcOf(b);
+      if (!src || src.depth === 0) {
+        structural = true;
+        return;
+      }
+      changed++;
+      if (changed > 1) {
+        structural = true;
+        return;
+      }
+      line = src.line;
+      content = b.content;
+    }
+    const ac = (_a = a.children) != null ? _a : [];
+    const bc = (_b = b.children) != null ? _b : [];
+    if (ac.length !== bc.length) {
+      structural = true;
+      return;
+    }
+    for (let i = 0; i < ac.length; i++) {
+      const sa = srcOf(ac[i]);
+      const sb = srcOf(bc[i]);
+      if (((_c = sa == null ? void 0 : sa.line) != null ? _c : -1) !== ((_d = sb == null ? void 0 : sb.line) != null ? _d : -1)) {
+        structural = true;
+        return;
+      }
+      if (((_e = sa == null ? void 0 : sa.depth) != null ? _e : -1) !== ((_f = sb == null ? void 0 : sb.depth) != null ? _f : -1)) {
+        structural = true;
+        return;
+      }
+      walk(ac[i], bc[i]);
+    }
+  };
+  walk(input.prev, input.next);
+  if (structural)
+    return { kind: "structure" };
+  if (changed === 0) {
+    return input.sourceSame ? { kind: "none" } : { kind: "structure" };
+  }
+  return { kind: "patch", line, content };
 }
 
 // src/MindmapView.ts
@@ -5970,37 +6854,70 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.pendingFit = false;
     this.painter = new NodePainter();
     this.currentSpec = null;
-    /** 待执行的绘制帧（rAF），用它合并同一帧内的多次重绘请求 */
-    this.paintFrame = 0;
-    /** 本次待绘制的内容：全量（结构变了）还是只刷连线（节点只是位移） */
-    this.paintMode = "links";
-    /** 本帧发生位移的节点 path；空集表示「全部连线」 */
-    this.paintPaths = /* @__PURE__ */ new Set();
     // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
     this.targetFile = null;
-    // 防止并发刷新导致对同一 svg 重复 create 出多个 Markmap 实例。
-    this.refreshing = false;
-    this.pending = false;
-    // 记录已渲染的正文与主题，内容没变就不重建导图（避免打字时反复重排）
-    this.lastContent = "";
-    this.appliedThemeKey = "";
-    // 上次渲染的笔记路径：只有换笔记时才重新适配视图
-    this.lastFilePath = "";
-    // 编辑态闸门：编辑期间禁止重建导图，否则输入框会连同节点一起被冲掉
-    this.editing = false;
+    // 上一次成功投影的结果，下次刷新用它做 diff
+    this.snapshot = null;
     this.editorHandle = null;
-    this.pendingRefresh = false;
-    // 重建导图期间暂停绘制：这段时间的 DOM 是半成品，画出来的线必然错
-    this.rebuilding = false;
     // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
     this.indentStep = 2;
     this.indentUnit = "  ";
     // 新建同级节点后，等重建完成再把编辑框落到新行上
     this.pendingEditLine = -1;
+    /**
+     * 下一次投影是否保留当前缩放/位置（不重新适配）。
+     *
+     * 只在「导图内跳转」时置位：面包屑回退、点双链换一篇，都属于顺着路径继续看，
+     * 缩放被重置会让人瞬间找不到自己在哪。用户主动切笔记则照旧适配。
+     */
+    this.keepViewport = false;
+    /** 当前选中的节点（记源行号，重建后仍能按行号恢复高亮） */
+    this.selectedLine = -1;
+    /**
+     * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
+     *
+     * 栈非空时导图显示的是**栈顶那篇**。笔记窗口要不要跟着走，
+     * 由设置项 `navSync` 决定（见 app/NavPolicy.ts）—— 导图这边的"看哪篇"
+     * 与 Obsidian 的 leaf 是两件事，四种联动方式只是对 leaf 的处理不同。
+     */
+    this.navStack = [];
+    this.breadcrumbEl = null;
+    /**
+     * 「新标签打开」模式下的标签编号 → leaf 映射。
+     *
+     * 栈本身是纯数据（只存编号），真正的 WorkspaceLeaf 留在这里 ——
+     * 这样 NavStack 仍然可以在 Node 里跑用例，不需要 mock Obsidian。
+     */
+    this.leafSeq = 0;
+    this.leafById = /* @__PURE__ */ new Map();
     this.drag = null;
-    /** 最近一次渲染用的节点树：拖动时靠它取全部节点的源坐标（折叠的节点不在 DOM 里） */
-    this.lastTree = null;
+    /** 块级渲染（代码块/公式块）用到的组件，下次重建前统一释放 */
+    this.blockParts = [];
+    /**
+     * 块渲染结果缓存：`kind|lang|raw` → HTML。
+     * 每打一个字都会重建整棵树，不缓存的话一篇有几十个代码块的笔记
+     * 每次按键都要重新跑一遍高亮/MathJax，输入会明显发滞。
+     */
+    this.blockCache = /* @__PURE__ */ new Map();
+    // --- 读写分离：视图只做「事件 → 用例 → 投影」，不自己算文本变更 ---------
+    /** 写路径：编辑意图 → 写入计划（纯计算，不碰文件、不弹提示） */
+    this.editSvc = new EditService();
+    /** 读路径：内容 → 只读快照（解析 + 节点坐标 + 缩进检测） */
+    this.query = new QueryService(async (path2) => {
+      const file = this.app.vault.getAbstractFileByPath(path2);
+      return file instanceof import_obsidian2.TFile ? this.readContent(file) : "";
+    });
     this.plugin = plugin;
+    this.rt = new ViewRuntime((err) => {
+      console.error("[obmind] \u91CD\u5EFA\u5BFC\u56FE\u5931\u8D25", err);
+      this.snapshot = null;
+    });
+    this.frames = new FrameScheduler(this.painter, {
+      svg: () => this.svgEl,
+      spec: () => this.currentSpec,
+      // 重建期间的 DOM 是半成品，画出来必然是错的
+      blocked: () => this.rt.phase === "rebuilding"
+    });
   }
   getViewType() {
     return MINDMAP_VIEW_TYPE;
@@ -6015,7 +6932,8 @@ var MindmapView = class extends import_obsidian2.ItemView {
     const container = this.containerEl.children[1];
     container.empty();
     container.classList.add("obmind-container");
-    const toolbar = container.createDiv({ cls: "obmind-toolbar" });
+    const header = container.createDiv({ cls: "obmind-header" });
+    const toolbar = header.createDiv({ cls: "obmind-toolbar" });
     const select = toolbar.createEl("select", { cls: "dropdown" });
     for (const opt of THEME_OPTIONS) {
       const optionEl = select.createEl("option", { text: opt.label });
@@ -6031,8 +6949,8 @@ var MindmapView = class extends import_obsidian2.ItemView {
       text: "\u5237\u65B0"
     });
     refreshBtn.addEventListener("click", () => {
-      this.lastContent = "";
-      void this.refresh();
+      this.snapshot = null;
+      this.refresh();
     });
     const fitBtn = toolbar.createEl("button", {
       cls: "obmind-fit",
@@ -6048,15 +6966,23 @@ var MindmapView = class extends import_obsidian2.ItemView {
       text: "?",
       attr: {
         title: [
-          "\u53CC\u51FB\u8282\u70B9\uFF1A\u539F\u5730\u7F16\u8F91",
-          "Enter \u5B8C\u6210 \xB7 Esc \u53D6\u6D88 \xB7 Ctrl+Enter \u65B0\u5EFA\u540C\u7EA7",
-          "Tab \u7F29\u8FDB \xB7 Shift+Tab \u53CD\u7F29\u8FDB \xB7 \u6E05\u7A7A\u540E\u9000\u683C\u5220\u9664\u8BE5\u884C",
-          "Ctrl/\u2318 + \u5355\u51FB\u8282\u70B9\uFF1A\u6253\u5F00\u540C\u540D\u7B14\u8BB0"
+          "\u5DE6\u952E\u5355\u51FB\uFF1A\u9009\u4E2D\u8282\u70B9\uFF0C\u4E4B\u540E Tab \u5EFA\u5B50\u7EA7 / Enter \u5EFA\u540C\u7EA7",
+          "\u9009\u4E2D\u540E Delete / Backspace\uFF1A\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9",
+          "\u53F3\u952E\u62D6\u52A8\u8282\u70B9\uFF1A\u6539\u53D8\u7236\u5B50\u5173\u7CFB\uFF08\u5DE6\u952E\u4E0D\u518D\u62D6\u52A8\uFF09",
+          "\u53CC\u51FB\u8282\u70B9 / F2\uFF1A\u539F\u5730\u7F16\u8F91",
+          "\u7F16\u8F91\u6846\u5185\uFF1AEnter \u5B8C\u6210 \xB7 Esc \u53D6\u6D88 \xB7 Ctrl+Enter \u65B0\u5EFA\u540C\u7EA7",
+          "\u7F16\u8F91\u6846\u5185\uFF1ATab \u7F29\u8FDB \xB7 Shift+Tab \u53CD\u7F29\u8FDB \xB7 \u6E05\u7A7A\u540E\u9000\u683C\u5220\u9664\u8BE5\u8282\u70B9",
+          "Ctrl/\u2318 + \u5355\u51FB\u8282\u70B9\uFF1A\u6253\u5F00\u540C\u540D\u7B14\u8BB0",
+          "\u70B9\u53CC\u94FE / \u9762\u5305\u5C51\uFF1A\u7B14\u8BB0\u7A97\u53E3\u662F\u5426\u8DDF\u968F\uFF0C\u89C1\u8BBE\u7F6E\u91CC\u7684\u300C\u9762\u5305\u5C51\u4E0E\u7B14\u8BB0\u89C6\u56FE\u8054\u52A8\u300D"
         ].join("\n")
       }
     });
+    this.breadcrumbEl = header.createDiv({ cls: "obmind-breadcrumb" });
+    this.breadcrumbEl.addClass("is-hidden");
     const canvas = container.createDiv({ cls: "obmind-canvas" });
     this.canvasEl = canvas;
+    canvas.setAttribute("tabindex", "0");
+    canvas.addEventListener("keydown", (e) => this.onCanvasKeyDown(e));
     const svg = canvas.createSvg("svg");
     svg.classList.add("markmap");
     svg.style.width = "100%";
@@ -6064,15 +6990,27 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.svgEl = svg;
     this.observeLayout(svg);
     this.observeSize(canvas);
-    await this.refresh();
+    this.refresh();
     this.registerEvent(
       this.app.workspace.on(
         "editor-change",
-        (0, import_obsidian2.debounce)(() => void this.refresh(), 300, true)
+        (0, import_obsidian2.debounce)(() => this.refresh(), 300, true)
       )
     );
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => void this.refresh())
+      this.app.workspace.on("active-leaf-change", () => this.refresh())
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        var _a;
+        if (!file || file.extension !== "md")
+          return;
+        if (file.path === ((_a = this.targetFile) == null ? void 0 : _a.path))
+          return;
+        this.resetNav();
+        this.targetFile = file;
+        this.refresh();
+      })
     );
     svg.addEventListener("click", (e) => this.onNodeClick(e));
     svg.addEventListener("dblclick", (e) => this.onNodeDblClick(e), true);
@@ -6080,11 +7018,19 @@ var MindmapView = class extends import_obsidian2.ItemView {
       srcOf: (g) => this.srcOf(g),
       onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(srcLine, targetLine, mode)
     });
+    this.renderBreadcrumb();
   }
   /**
-   * 监听导图的结构与布局变化，并按变化类型分流：
-   * - childList（节点增删）→ 全量绘制；
-   * - 节点 g 的 transform（折叠展开动画里每帧都在变）→ 只刷连线。
+   * 监听导图的布局变化，并按变化类型分流。
+   *
+   * **只听 transform，不听 width/height**。实测（257 节点、折叠一帧动画）：
+   * markmap 每帧都会把全部节点的 foreignObject 宽高重写一遍（257×2 条记录/帧），
+   * 而值根本没变。听它就等于每帧判定「尺寸变了」→ 全量重绘，
+   * 上千节点时折叠/展开必然掉帧。而内容尺寸真正变化的场景只有「原地改字」，
+   * 那条路径（applyPatch）自己会请求全量重绘，不需要观察器兜底。
+   *
+   * - childList（节点增删，折叠展开也会触发）→ 全量绘制；
+   * - 节点 g 的 transform（折叠动画里每帧都在变）→ 只刷连线。
    *
    * 卡片画在节点局部坐标里，与 transform 无关，所以动画期间一次都不用重写；
    * 只有跨节点的连线需要重算起终点。
@@ -6112,9 +7058,9 @@ var MindmapView = class extends import_obsidian2.ItemView {
           moved.add(path2);
       }
       if (structural)
-        this.requestPaint("all");
+        this.frames.request("all");
       else if (moved.size > 0)
-        this.requestPaint("links", moved);
+        this.frames.request("links", moved);
     });
     this.observer.observe(svg, {
       childList: true,
@@ -6140,131 +7086,41 @@ var MindmapView = class extends import_obsidian2.ItemView {
         void this.fitInstant();
         return;
       }
-      if (this.editing)
+      if (this.rt.phase === "editing")
         (_a2 = this.editorHandle) == null ? void 0 : _a2.reposition();
     });
     this.resizeObserver.observe(el);
   }
-  /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
-  requestPaint(mode, paths) {
-    if (this.rebuilding)
-      return;
-    if (mode === "all") {
-      this.paintMode = "all";
-      this.paintPaths.clear();
-    } else if (this.paintMode !== "all" && paths) {
-      for (const p of paths)
-        this.paintPaths.add(p);
-    }
-    if (this.paintFrame)
-      return;
-    this.paintFrame = window.requestAnimationFrame(() => {
-      this.paintFrame = 0;
-      const svg = this.svgEl;
-      const spec = this.currentSpec;
-      if (!svg || !spec)
-        return;
-      if (this.paintMode === "all") {
-        this.painter.paintAll(svg, spec);
-      } else {
-        this.painter.paintLinks(
-          svg,
-          spec,
-          this.paintPaths.size ? this.paintPaths : null
-        );
-      }
-      this.paintMode = "links";
-      this.paintPaths.clear();
-    });
-  }
-  /**
-   * 立刻同步画一遍，不等 rAF。
-   *
-   * 重建之后必须抢在浏览器绘制这一帧之前把卡片和连线摆正，否则会先画出一帧
-   * 「新位置的节点 + 旧父节点的连线」，看起来就是线闪一下。
-   */
-  paintAllSync() {
-    const svg = this.svgEl;
-    const spec = this.currentSpec;
-    if (this.paintFrame) {
-      window.cancelAnimationFrame(this.paintFrame);
-      this.paintFrame = 0;
-    }
-    this.paintMode = "links";
-    this.paintPaths.clear();
-    if (!svg || !spec)
-      return;
-    this.painter.paintAll(svg, spec);
-  }
-  /**
-   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
-   *
-   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
-   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
-   *    过渡期间旧连线是从「错的父节点」出发的；
-   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
-   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
-   *
-   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
-   * 紧跟着同步重绘一次（paintAllSync），整个过程在一帧内结束，不会播出中间态。
-   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
-   * 这里只临时改了本次 setData 的 duration。
-   */
-  async applyTree(tree) {
-    const mm = this.mm;
-    const svg = this.svgEl;
-    if (!mm || !svg)
-      return;
-    this.rebuilding = true;
-    const prev = mm.options.duration;
-    mm.setOptions({ duration: 0 });
-    try {
-      await mm.setData(tree);
-      this.dropDetached();
-      this.painter.reset();
-      this.paintAllSync();
-    } finally {
-      mm.setOptions({ duration: prev });
-      this.rebuilding = false;
-    }
-  }
-  /**
-   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
-   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
-   *
-   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
-   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
-   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
-   */
-  dropDetached() {
-    var _a;
-    const svg = this.svgEl;
-    const root2 = (_a = this.mm) == null ? void 0 : _a.state.data;
-    if (!svg || !root2)
-      return;
-    const alive = /* @__PURE__ */ new Set();
-    const walk = (n) => {
-      var _a2;
-      alive.add(n);
-      for (const c of (_a2 = n.children) != null ? _a2 : [])
-        walk(c);
-    };
-    walk(root2);
-    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-      const data = g.__data__;
-      if (!data || !alive.has(data))
-        g.remove();
-    }
-  }
   /** 供插件在激活视图时指定要展示的笔记 */
   setTargetFile(file) {
+    if (this.navStack.length > 0) {
+      this.closeTracked(this.navStack);
+      this.navStack = [];
+      this.renderBreadcrumb();
+    }
     if (file && file.extension === "md")
       this.targetFile = file;
+  }
+  /**
+   * 结束一次导图内导航：清栈。
+   *
+   * 只丢映射、**不**关标签 —— 用户已经在别处切走了，那些标签现在归他管。
+   */
+  resetNav() {
+    if (this.navStack.length === 0)
+      return;
+    this.navStack = [];
+    this.leafById.clear();
+    this.renderBreadcrumb();
+  }
+  /** 当前生效的联动策略（配置缺失或非法值时退回默认档） */
+  navSync() {
+    return normalizeNavSync(this.plugin.settings.navSync);
   }
   async onThemeChange(theme) {
     this.plugin.settings.theme = theme;
     await this.plugin.saveSettings();
-    await this.refresh();
+    this.refresh();
   }
   /**
    * 解析当前应该渲染哪篇笔记。
@@ -6272,6 +7128,11 @@ var MindmapView = class extends import_obsidian2.ItemView {
    * 活跃视图就是导图自身，那样会拿不到笔记而中断刷新（之前“切换主题无效”的根因）。
    */
   resolveTargetFile() {
+    const pinned = this.pinnedFile();
+    if (pinned) {
+      this.targetFile = pinned;
+      return pinned;
+    }
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile && activeFile.extension === "md") {
       this.targetFile = activeFile;
@@ -6304,6 +7165,51 @@ var MindmapView = class extends import_obsidian2.ItemView {
     if (editor)
       return editor.getValue();
     return this.app.vault.read(file);
+  }
+  /**
+   * 把代码块 / 公式块交给 Obsidian 自己的 MarkdownRenderer 渲染。
+   *
+   * 为什么不自己渲染：
+   * - 公式要么引 katex（打包多 300KB，还要带一整套字体），要么自己写 LaTeX 解析，都不划算；
+   * - 代码高亮同理，Obsidian 内部已有一套且跟随主题配色。
+   * 走官方渲染器的额外好处是观感和笔记里完全一致，用户不用适应两套排版。
+   *
+   * 必须在 setData **之前**跑完：markmap 是按 content 里的 DOM 量节点宽高的，
+   * 先用占位灌图、事后再替换内容，节点尺寸会和实际文字脱节（裁剪或留白）。
+   */
+  async renderBlocks(tree, file) {
+    const jobs = collectBlocks(tree);
+    for (const part of this.blockParts)
+      part.unload();
+    this.blockParts = [];
+    if (jobs.length === 0)
+      return;
+    await Promise.all(
+      jobs.map(async ({ node, block }) => {
+        const key = `${block.kind}|${block.lang}|${block.raw}`;
+        const cached = this.blockCache.get(key);
+        if (cached !== void 0) {
+          node.content = cached;
+          return;
+        }
+        const holder = document.createElement("div");
+        const part = new import_obsidian2.Component();
+        part.load();
+        this.blockParts.push(part);
+        try {
+          await import_obsidian2.MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
+          const html = holder.innerHTML.trim();
+          if (html !== "") {
+            node.content = html;
+            if (this.blockCache.size > 300)
+              this.blockCache.clear();
+            this.blockCache.set(key, html);
+          }
+        } catch (err) {
+          console.warn("[obmind] \u4EE3\u7801\u5757/\u516C\u5F0F\u5757\u6E32\u67D3\u5931\u8D25\uFF0C\u4FDD\u7559\u5360\u4F4D", err);
+        }
+      })
+    );
   }
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
   applyTheme(spec) {
@@ -6384,69 +7290,207 @@ var MindmapView = class extends import_obsidian2.ItemView {
       window.requestAnimationFrame(() => resolve());
     });
   }
-  async refresh(knownContent) {
-    var _a, _b, _c;
-    if (this.editing) {
-      this.pendingRefresh = true;
+  // -------------------------------------------------------------------------
+  // 投影：一次内容变化该走哪条通道
+  // -------------------------------------------------------------------------
+  /**
+   * 请求把最新状态画出来。
+   *
+   * 这里不再自己做「正在刷新就排队 / 正在编辑就跳过」的判断——那些交给
+   * ViewRuntime：非 idle 阶段自动挂起，回到 idle 自动补跑，并发请求只保留最新一个。
+   */
+  refresh(knownContent) {
+    this.rt.request((rev) => this.project(rev, knownContent));
+  }
+  async project(rev, knownContent) {
+    var _a, _b;
+    if (this.themeSelect)
+      this.themeSelect.value = this.plugin.settings.theme;
+    const file = this.resolveTargetFile();
+    if (!file || !this.svgEl)
       return;
-    }
-    if (this.refreshing) {
-      this.pending = true;
+    const prev = this.snapshot;
+    const filter2 = this.plugin.settings.filterFrontmatter;
+    const doc = knownContent === void 0 ? await this.query.load(file.path, file.basename, { filterFrontmatter: filter2 }) : this.query.parse(knownContent, file.basename, { filterFrontmatter: filter2 });
+    if (this.rt.stale(rev))
       return;
-    }
-    this.refreshing = true;
-    try {
-      if (this.themeSelect)
-        this.themeSelect.value = this.plugin.settings.theme;
-      const file = this.resolveTargetFile();
-      if (!file || !this.svgEl)
-        return;
-      const content = knownContent != null ? knownContent : await this.readContent(file);
-      const fileChanged = this.lastFilePath !== file.path;
-      const isDark = document.body.classList.contains("theme-dark");
-      const spec = resolveTheme(this.plugin.settings.theme, isDark);
-      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
-      this.applyTheme(spec);
-      if (!fileChanged && this.mm && content === this.lastContent && themeKey === this.appliedThemeKey) {
-        this.flushPendingEdit();
-        return;
-      }
-      const tree = buildTree(content, file.basename, {
-        filterFrontmatter: this.plugin.settings.filterFrontmatter
-      });
-      this.lastContent = content;
-      this.lastTree = tree;
-      const step = (_a = tree.payload) == null ? void 0 : _a.step;
-      if (typeof step === "number" && step > 0)
-        this.indentStep = step;
-      const unit = (_b = tree.payload) == null ? void 0 : _b.indentUnit;
-      if (typeof unit === "string" && unit !== "")
-        this.indentUnit = unit;
-      applyFolds(tree, collectFolds((_c = this.mm) == null ? void 0 : _c.state.data));
-      if (!this.mm) {
-        this.mm = it.create(this.svgEl, this.buildOptions(spec));
-        this.appliedThemeKey = themeKey;
-        await this.applyTree(tree);
-        await this.fitInstant();
-      } else {
-        if (themeKey !== this.appliedThemeKey) {
-          this.mm.setOptions(this.buildOptions(spec));
-          this.appliedThemeKey = themeKey;
-        }
-        await this.applyTree(tree);
-        if (fileChanged)
-          await this.fitInstant();
-      }
-      this.lastFilePath = file.path;
+    const keepViewport = this.keepViewport;
+    this.keepViewport = false;
+    const content = doc.content;
+    const tree = doc.tree;
+    this.indentStep = doc.step;
+    this.indentUnit = doc.unit;
+    const isDark = document.body.classList.contains("theme-dark");
+    const spec = resolveTheme(this.plugin.settings.theme, isDark);
+    const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+    this.applyTheme(spec);
+    const sameFile = prev !== null && prev.path === file.path;
+    const sameTheme = prev !== null && prev.themeKey === themeKey;
+    const sameFilter = prev !== null && prev.filterFrontmatter === filter2;
+    if (sameFile && sameTheme && sameFilter && prev.content === content) {
       this.flushPendingEdit();
+      return;
+    }
+    const plan = planProjection({
+      prev: (_a = prev == null ? void 0 : prev.tree) != null ? _a : null,
+      next: tree,
+      forceStructure: !sameFile || !sameTheme || !sameFilter,
+      sourceSame: prev !== null && prev.content === content
+    });
+    if (plan.kind === "none") {
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter2
+      };
+      this.flushPendingEdit();
+      return;
+    }
+    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content)) {
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter2
+      };
+      this.flushPendingEdit();
+      return;
+    }
+    applyFolds(tree, collectFolds((_b = this.mm) == null ? void 0 : _b.state.data));
+    await this.renderBlocks(tree, file);
+    if (this.rt.stale(rev))
+      return;
+    const restructure = () => this.applyTree(tree);
+    if (!this.mm) {
+      this.mm = it.create(this.svgEl, this.buildOptions(spec));
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter2
+      };
+      await restructure();
+      await this.fitInstant();
+    } else {
+      if (!sameTheme)
+        this.mm.setOptions(this.buildOptions(spec));
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter2
+      };
+      await restructure();
+      if (!sameFile && !keepViewport)
+        await this.fitInstant();
+    }
+    this.flushPendingEdit();
+  }
+  /**
+   * 原地改字：只替换该节点的内容 DOM，不 setData。
+   *
+   * 为什么能这么做：markmap 的节点 key 是 `父id.子id + hash(content)`，
+   * 一旦 setData，内容变了的节点 key 全变，d3 会把整个子树重新 enter
+   * （foreignObject、内容 DOM、代码高亮、公式全部重来）。而它内部对每个节点的
+   * 内容 div 挂了 ResizeObserver（100ms 防抖 → renderData），
+   * 所以「改 DOM」本身就是它支持的增量路径：不重建，只重排。
+   *
+   * @returns false 表示这个节点当前不在 DOM 里（折叠/已被替换），只能退回全量重建
+   */
+  applyPatch(line, content) {
+    var _a, _b;
+    const g = this.findNodeByLine(line);
+    if (!g)
+      return false;
+    const fo = g.querySelector(":scope > foreignObject");
+    const box = (_b = (_a = fo == null ? void 0 : fo.firstElementChild) == null ? void 0 : _a.firstElementChild) != null ? _b : null;
+    if (!fo || !box)
+      return false;
+    box.innerHTML = content;
+    const data = g.__data__;
+    if (data)
+      data.content = content;
+    const w = box.scrollWidth;
+    const h2 = box.scrollHeight;
+    if (w > 0 && h2 > 0) {
+      fo.setAttribute("width", String(w));
+      fo.setAttribute("height", String(h2));
+    }
+    this.frames.request("all");
+    return true;
+  }
+  /**
+   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
+   *
+   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
+   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
+   *    过渡期间旧连线是从「错的父节点」出发的；
+   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
+   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
+   *
+   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
+   * 紧跟着同步重绘一次（paintNow），整个过程在一帧内结束，不会播出中间态。
+   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
+   * 这里只临时改了本次 setData 的 duration。
+   */
+  async applyTree(tree) {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg)
+      return;
+    this.rt.setPhase("rebuilding");
+    const prev = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.setData(tree);
+      this.dropDetached();
+      this.frames.reset();
+      this.frames.paintNow();
     } finally {
-      this.refreshing = false;
-      if (this.pending) {
-        this.pending = false;
-        void this.refresh();
-      }
+      mm.setOptions({ duration: prev });
+      this.rt.setPhase("idle");
     }
   }
+  /**
+   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
+   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
+   *
+   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
+   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
+   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
+   */
+  dropDetached() {
+    var _a;
+    const svg = this.svgEl;
+    const root2 = (_a = this.mm) == null ? void 0 : _a.state.data;
+    if (!svg || !root2)
+      return;
+    const alive = /* @__PURE__ */ new Set();
+    const walk = (n) => {
+      var _a2;
+      alive.add(n);
+      for (const c of (_a2 = n.children) != null ? _a2 : [])
+        walk(c);
+    };
+    walk(root2);
+    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      const data = g.__data__;
+      if (!data || !alive.has(data))
+        g.remove();
+    }
+  }
+  // -------------------------------------------------------------------------
+  // 点击 / 编辑 / 拖动
+  // -------------------------------------------------------------------------
   onNodeClick(e) {
     var _a, _b, _c, _d, _e, _f, _g;
     const target = e.target;
@@ -6461,36 +7505,358 @@ var MindmapView = class extends import_obsidian2.ItemView {
         window.open(href, "_blank");
         return;
       }
-      const dest2 = this.app.metadataCache.getFirstLinkpathDest(
+      const dest = this.app.metadataCache.getFirstLinkpathDest(
         href,
         (_d = (_c = this.targetFile) == null ? void 0 : _c.path) != null ? _d : ""
       );
-      if (dest2 instanceof import_obsidian2.TFile) {
-        void this.app.workspace.getLeaf("tab").openFile(dest2);
+      if (dest instanceof import_obsidian2.TFile) {
+        this.openDoc(dest);
       }
       return;
     }
     if (target.closest("circle"))
       return;
-    if (!(e.ctrlKey || e.metaKey))
-      return;
     const g = target.closest("g.markmap-node");
     if (!g)
       return;
-    const text = ((_e = g.textContent) != null ? _e : "").trim();
-    if (!text)
+    if (e.ctrlKey || e.metaKey) {
+      const text = ((_e = g.textContent) != null ? _e : "").trim();
+      if (!text)
+        return;
+      const dest = this.app.metadataCache.getFirstLinkpathDest(
+        text,
+        (_g = (_f = this.targetFile) == null ? void 0 : _f.path) != null ? _g : ""
+      );
+      if (dest instanceof import_obsidian2.TFile)
+        this.openDoc(dest);
       return;
-    const dest = this.app.metadataCache.getFirstLinkpathDest(
-      text,
-      (_g = (_f = this.targetFile) == null ? void 0 : _f.path) != null ? _g : ""
-    );
-    if (dest instanceof import_obsidian2.TFile) {
-      void this.app.workspace.getLeaf("tab").openFile(dest);
+    }
+    this.selectNode(g);
+  }
+  /**
+   * 打开一篇笔记 —— 这里是「导图内跳转」的唯一入口。
+   *
+   * 两件事必须分开看：
+   * 1. 导图看哪篇：永远是 `targetFile`（配合 navStack 栈顶），与 Obsidian 的 leaf 无关；
+   * 2. 笔记窗口要不要跟、怎么跟：由设置项 navSync 决定，交给 presentNote。
+   *
+   * 顺序很讲究：先压栈 + 定 targetFile，**再**动 leaf。因为 openFile 会触发
+   * file-open，而处理器判断「打开的是不是导图当前显示的那篇」，只有先改完
+   * targetFile，自己触发的打开才不会被误判成「用户切了笔记」而清栈。
+   */
+  openDoc(file) {
+    const hit = this.navStack.findIndex((e) => e.path === file.path);
+    if (hit >= 0) {
+      this.goBackTo(hit);
+      return;
+    }
+    const mode = this.navSync();
+    const current = this.targetFile;
+    const previous = current && current.path !== file.path ? current : null;
+    if (this.navStack.length === 0 && previous) {
+      this.navStack = pushEntry(this.navStack, {
+        path: previous.path,
+        title: previous.basename
+      });
+    }
+    this.keepViewport = true;
+    this.targetFile = file;
+    const res = pushEntryDetailed(this.navStack, {
+      path: file.path,
+      title: file.basename
+    });
+    this.navStack = res.stack;
+    this.closeTracked(res.dropped);
+    const leafId = this.presentNote(file, mode, previous);
+    if (leafId !== void 0) {
+      const last = this.navStack[this.navStack.length - 1];
+      this.navStack = [...this.navStack.slice(0, -1), { ...last, leafId }];
+    }
+    this.renderBreadcrumb();
+    this.refresh();
+  }
+  /**
+   * 把目标笔记"呈现"到 Obsidian 里，返回新分配标签的编号。
+   *
+   * 决策在 app/NavPolicy.ts（纯函数），这里只执行：
+   * - map-only：什么都不做，导图自己换内容；
+   * - same-leaf：复用正在显示上一篇的编辑器；
+   * - new-leaf-*：新标签打开，2.3 额外记下编号以便回退时关闭。
+   */
+  presentNote(file, mode, previous) {
+    var _a, _b, _c;
+    const target = forwardTarget(mode);
+    if (target === "none")
+      return void 0;
+    if (target === "current") {
+      const leaf2 = (_c = (_b = this.leafShowing(previous)) != null ? _b : (_a = this.app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView)) == null ? void 0 : _a.leaf) != null ? _c : null;
+      if (leaf2) {
+        this.openInLeaf(leaf2, file);
+        return void 0;
+      }
+    }
+    const leaf = this.newNoteLeaf();
+    this.openInLeaf(leaf, file);
+    void this.app.workspace.revealLeaf(this.leaf);
+    if (!trackOpenedLeaf(mode))
+      return void 0;
+    const id2 = ++this.leafSeq;
+    this.leafById.set(id2, leaf);
+    return id2;
+  }
+  /** 在指定 leaf 里打开笔记；失败只记日志，不打断导航（导图仍会换内容） */
+  openInLeaf(leaf, file) {
+    void leaf.openFile(file).catch((err) => {
+      console.error("[obmind] \u6253\u5F00\u7B14\u8BB0\u5931\u8D25", err);
+    });
+  }
+  /**
+   * 在主编辑区新开一个标签。
+   *
+   * 不能直接用 `getLeaf("tab")`：它是在「当前活动 leaf 所在区域」新建的，
+   * 而点双链时活动 leaf 往往就是侧栏里的导图 —— 笔记会被塞进侧栏的标签组。
+   * 有主区的 markdown 标签就用它的父容器建标签；一个都没有才退回 getLeaf。
+   */
+  newNoteLeaf() {
+    var _a;
+    const main = this.app.workspace.rootSplit;
+    const anchor = this.app.workspace.getLeavesOfType("markdown").find((leaf) => leaf.getRoot() === main);
+    const parent = (_a = anchor == null ? void 0 : anchor.parent) != null ? _a : null;
+    if (parent) {
+      const split = parent;
+      const kids = split.children;
+      const at = Array.isArray(kids) ? kids.length : 0;
+      return this.app.workspace.createLeafInParent(split, at);
+    }
+    return this.app.workspace.getLeaf("tab");
+  }
+  /** 正在显示某篇笔记的编辑器；没有就返回 null */
+  leafShowing(file) {
+    var _a;
+    if (!file)
+      return null;
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof import_obsidian2.MarkdownView && ((_a = view.file) == null ? void 0 : _a.path) === file.path)
+        return leaf;
+    }
+    return null;
+  }
+  /**
+   * 关掉「当初为导航新开」的标签。
+   *
+   * 不看当前模式：条目上带 leafId 就说明那个标签是 obmind 为这次跳转开的，
+   * 用户中途改设置也不该把它变成孤儿。
+   */
+  closeTracked(entries) {
+    for (const entry of entries)
+      this.detachLeaf(entry.leafId);
+  }
+  detachLeaf(id2) {
+    if (id2 === void 0)
+      return;
+    const leaf = this.leafById.get(id2);
+    this.leafById.delete(id2);
+    if (!leaf)
+      return;
+    try {
+      leaf.detach();
+    } catch (err) {
+      console.warn("[obmind] \u5173\u95ED\u5BFC\u822A\u6807\u7B7E\u5931\u8D25", err);
     }
   }
-  // -------------------------------------------------------------------------
-  // 双向编辑
-  // -------------------------------------------------------------------------
+  /** 栈顶对应的文件；文件没了就作废整条栈，回到跟随编辑器 */
+  pinnedFile() {
+    const top = topOf(this.navStack);
+    if (!top)
+      return null;
+    const file = this.app.vault.getAbstractFileByPath(top.path);
+    if (file instanceof import_obsidian2.TFile)
+      return file;
+    this.resetNav();
+    return null;
+  }
+  /** 点面包屑某一级：截断到它，导图换回那篇 */
+  goBackTo(index) {
+    const entry = this.navStack[index];
+    if (!entry)
+      return;
+    const target = this.app.vault.getAbstractFileByPath(entry.path);
+    if (!(target instanceof import_obsidian2.TFile)) {
+      this.resetNav();
+      this.refresh();
+      return;
+    }
+    const back = planBack(this.navSync());
+    const dropped = this.navStack.slice(index + 1);
+    const shown = this.targetFile;
+    this.keepViewport = true;
+    this.navStack = truncateTo(this.navStack, index);
+    this.targetFile = target;
+    this.closeTracked(dropped);
+    if (back.followCurrent) {
+      const leaf = this.leafShowing(shown);
+      if (leaf)
+        this.openInLeaf(leaf, target);
+    }
+    this.renderBreadcrumb();
+    this.refresh();
+  }
+  /**
+   * 重画面包屑。
+   *
+   * 用 span 而不是 a：这是一级级往回退，不是打开新文档，
+   * 用链接会被 Obsidian 的链接处理器接管。
+   */
+  renderBreadcrumb() {
+    const el = this.breadcrumbEl;
+    if (!el)
+      return;
+    el.empty();
+    el.toggleClass("is-hidden", this.navStack.length === 0);
+    if (this.navStack.length === 0)
+      return;
+    el.setAttribute("title", "\u5BFC\u56FE\u5185\u7684\u8DF3\u8F6C\u8DEF\u5F84\uFF1A\u70B9\u524D\u9762\u4EFB\u610F\u4E00\u7EA7\u8FD4\u56DE");
+    this.navStack.forEach((entry, i) => {
+      if (i > 0)
+        el.createSpan({ cls: "obmind-crumb-sep", text: "\u203A" });
+      const last = i === this.navStack.length - 1;
+      const item = el.createSpan({ cls: "obmind-crumb", text: entry.title });
+      item.toggleClass("is-current", last);
+      item.setAttribute("aria-label", entry.path);
+      item.setAttribute("title", last ? entry.path : `${entry.path}\uFF08\u70B9\u51FB\u8FD4\u56DE\uFF09`);
+      if (!last)
+        item.addEventListener("click", () => this.goBackTo(i));
+    });
+    el.scrollLeft = el.scrollWidth;
+  }
+  /**
+   * 选中一个节点。
+   *
+   * 选中态记的是**源行号**而不是 DOM 引用：每次 setData 之后 g 元素都是新的一批，
+   * 存引用等于存了个已经断掉的东西。行号在重建后仍然有效，重新挂 class 就行。
+   */
+  selectNode(g) {
+    var _a, _b, _c;
+    this.setSelectedLine(g ? (_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1 : -1);
+    (_c = this.canvasEl) == null ? void 0 : _c.focus({ preventScroll: true });
+  }
+  setSelectedLine(line) {
+    if (this.selectedLine === line)
+      return;
+    this.selectedLine = line;
+    this.paintSelection();
+  }
+  /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
+  paintSelection() {
+    var _a;
+    const svg = this.svgEl;
+    if (!svg)
+      return;
+    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      const on = ((_a = this.srcOf(g)) == null ? void 0 : _a.line) === this.selectedLine;
+      g.classList.toggle("obmind-selected", on);
+    }
+  }
+  /**
+   * 画布上的键盘操作。
+   *
+   * 两道闸门：
+   * - 事件目标必须是画布本身。编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
+   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」。
+   */
+  onCanvasKeyDown(e) {
+    if (e.target !== this.canvasEl)
+      return;
+    if (e.isComposing)
+      return;
+    if (e.key === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!e.shiftKey)
+        this.createNode("child");
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.createNode("sibling");
+      return;
+    }
+    if (e.key === "Escape") {
+      this.setSelectedLine(-1);
+      return;
+    }
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.removeNode();
+      return;
+    }
+    if (e.key === "F2") {
+      e.preventDefault();
+      const line = this.selectedLine;
+      if (line < 0)
+        return;
+      const g = this.findNodeByLine(line);
+      if (g)
+        this.startEdit(g, false);
+    }
+  }
+  /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
+  createNode(mode) {
+    const line = this.selectedLine;
+    if (line < 0) {
+      new import_obsidian2.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
+      return;
+    }
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap)
+      return;
+    const out = this.editSvc.create({ snap, line, mode });
+    if (out.kind === "error") {
+      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+      return;
+    }
+    if (out.kind === "none")
+      return;
+    if (out.focusLine !== void 0) {
+      this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+  /**
+   * 删除选中节点及其子树（Delete / Backspace）。
+   *
+   * 删完把选中挪到父节点上：行号在删除后往前挪，但父节点在删除行之前，
+   * 所以它的行号不变，可以直接定位。这样才能连着删兄弟节点。
+   */
+  removeNode() {
+    const line = this.selectedLine;
+    if (line < 0)
+      return;
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap)
+      return;
+    const size = this.editSvc.subtreeSize(snap, line);
+    const parentLine = this.editSvc.parentLineOf(snap, line);
+    const out = this.editSvc.remove({ snap, line });
+    if (out.kind === "error") {
+      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+      return;
+    }
+    if (out.kind === "none")
+      return;
+    this.pendingEditLine = -1;
+    this.selectedLine = parentLine;
+    void this.applyPlan(file, out.op);
+    if (size > 1) {
+      new import_obsidian2.Notice(`obmind\uFF1A\u5DF2\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176 ${size - 1} \u4E2A\u5B50\u8282\u70B9`);
+    }
+  }
   /** 双击节点进入原地编辑 */
   onNodeDblClick(e) {
     var _a;
@@ -6504,7 +7870,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     e.preventDefault();
     e.stopPropagation();
-    if (this.editing || this.refreshing) {
+    if (this.rt.phase !== "idle") {
       const pendingLine = (_a = this.srcOf(g)) == null ? void 0 : _a.line;
       if (pendingLine !== void 0)
         this.pendingEditLine = pendingLine;
@@ -6513,43 +7879,34 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.startEdit(g, false);
   }
   /**
-   * 拖拽落下：把「移动」翻译成整篇新内容，一次性写回。
+   * 拖拽落下：把「移动」交给 EditService，产出整篇重写的写入计划。
    *
    * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
    * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
    */
   onNodeDrop(srcLine, targetLine, mode) {
     const file = this.targetFile;
-    const tree = this.lastTree;
-    const content = this.lastContent;
-    if (!file || !tree || !content)
+    const snap = this.editSnapshot();
+    if (!file || !snap)
       return;
-    const res = moveNode({
-      lines: content.split("\n"),
-      nodes: collectSrc(tree),
-      step: this.indentStep,
-      unit: this.indentUnit,
-      srcLine,
-      targetLine,
-      mode
-    });
-    if (!res.ok) {
-      new import_obsidian2.Notice(`obmind\uFF1A${res.reason}`);
+    const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
+    if (out.kind === "error") {
+      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
       return;
     }
-    void this.applyMove(file, res.lines.join("\n"), content);
+    if (out.kind === "none")
+      return;
+    void this.applyPlan(file, out.op);
   }
-  async applyMove(file, next, expect) {
+  /** 执行写入计划并刷新（拖动、新建节点这类不属于编辑框的操作走这里） */
+  async applyPlan(file, op) {
     try {
-      const ok = await replaceAll(this.app, file, next, expect);
-      if (!ok) {
-        new import_obsidian2.Notice("\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u79FB\u52A8\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002");
-        return;
-      }
-      await this.refresh(next);
+      const res = await this.runWrite(file, op);
+      if (res.ok)
+        this.refresh(res.next);
     } catch (err) {
-      console.error("[obmind] \u79FB\u52A8\u8282\u70B9\u5931\u8D25", err);
-      new import_obsidian2.Notice("\u79FB\u52A8\u8282\u70B9\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
+      console.error("[obmind] \u5199\u5165\u5931\u8D25", err);
+      new import_obsidian2.Notice("\u5199\u5165\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
     }
   }
   /** 从节点的绑定数据里取源行坐标 */
@@ -6574,9 +7931,9 @@ var MindmapView = class extends import_obsidian2.ItemView {
   /** 打开原地编辑框；根节点（文件名）不可编辑 */
   startEdit(g, selectAll) {
     var _a, _b, _c;
-    if (this.editing || !this.canvasEl)
+    if (this.rt.phase === "editing" || !this.canvasEl)
       return;
-    if (this.refreshing) {
+    if (this.rt.phase === "rebuilding") {
       const pendingLine = (_a = this.srcOf(g)) == null ? void 0 : _a.line;
       if (pendingLine !== void 0) {
         window.setTimeout(() => {
@@ -6595,7 +7952,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     const spec = (_c = this.currentSpec) != null ? _c : resolveTheme(this.plugin.settings.theme, false);
     const value = src.checked === null ? src.text : `${src.checked ? "\u2611" : "\u2610"} ${src.text}`;
-    this.editing = true;
+    this.rt.setPhase("editing");
     const handle = openInlineEditor({
       container: this.canvasEl,
       target: g,
@@ -6608,114 +7965,115 @@ var MindmapView = class extends import_obsidian2.ItemView {
       }
     });
     if (!handle) {
-      this.editing = false;
+      this.rt.setPhase("idle");
       return;
     }
     this.editorHandle = handle;
   }
-  /** 编辑结束后：翻译成文本变更 → 写回笔记 → 重建导图 */
+  /**
+   * 编辑结束后：交给 EditService 算出写入计划 → 写文件 → 重建导图。
+   *
+   * 视图这里只剩三件事：准备快照、拿计划、执行计划。
+   * 「改一个字该动哪几行」全部在 app/EditService.ts 里，能单独跑用例断言。
+   */
   async commitEdit(action, value, src) {
+    let next;
     try {
       if (action === "cancel")
         return;
       const file = this.targetFile;
-      if (!file)
+      const snap = this.editSnapshot();
+      if (!file || !snap)
         return;
-      const parsed = parseEditorValue(src, value);
-      let span = null;
-      if (parsed.text === "" && action !== "delete")
-        return;
-      if (action === "delete") {
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [],
-          checkLine: src.line,
-          checkText: src.full
-        };
-      } else if (action === "sibling") {
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked), siblingLine(src)],
-          checkLine: src.line,
-          checkText: src.full
-        };
-        this.pendingEditLine = src.line + 1;
-      } else if (action === "indent" || action === "outdent") {
-        const nextIndent = indentBy(src, action === "indent" ? 1 : -1, this.indentStep);
-        if (nextIndent === null)
-          return;
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked, nextIndent)],
-          checkLine: src.line,
-          checkText: src.full
-        };
-      } else {
-        if (parsed.text === src.text && parsed.checked === src.checked)
-          return;
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked)],
-          checkLine: src.line,
-          checkText: src.full
-        };
-      }
-      const ok = await applySpan(this.app, file, span);
-      if (!ok) {
+      const out = this.editSvc.commit({ snap, src, action, value });
+      if (out.kind === "error") {
         this.pendingEditLine = -1;
-        new import_obsidian2.Notice("\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u4FEE\u6539\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002");
+        new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+        return;
       }
+      if (out.kind === "none")
+        return;
+      if (out.focusLine !== void 0)
+        this.pendingEditLine = out.focusLine;
+      const res = await this.runWrite(file, out.op);
+      next = res.next;
     } catch (err) {
       this.pendingEditLine = -1;
       console.error("[obmind] \u5199\u56DE\u7B14\u8BB0\u5931\u8D25", err);
       new import_obsidian2.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
     } finally {
       this.editorHandle = null;
-      this.editing = false;
-      this.pendingRefresh = false;
-      await this.refresh();
+      this.rt.setPhase("idle");
+      this.refresh(next);
     }
+  }
+  /** 当前快照 → EditService 的输入（只读视图，写路径不修改它） */
+  editSnapshot() {
+    const s = this.snapshot;
+    if (!s)
+      return null;
+    return { content: s.content, nodes: s.nodes, step: this.indentStep, unit: this.indentUnit };
+  }
+  /**
+   * 执行一次写入计划。
+   *
+   * 这里是视图与文件 IO 的唯一接触点：计划怎么写由 writer 决定
+   * （有编辑器走 transaction 保留 Ctrl+Z，没有才退回 vault.process）。
+   */
+  async runWrite(file, op) {
+    const res = await applyOp(this.app, file, op);
+    if (!res.ok) {
+      this.pendingEditLine = -1;
+      new import_obsidian2.Notice(`obmind\uFF1A${res.reason}`);
+      return { ok: false };
+    }
+    return { ok: true, next: res.next };
   }
   /** 重建完成后，把编辑框落到新建的那一行上 */
   flushPendingEdit() {
+    this.paintSelection();
     const line = this.pendingEditLine;
     if (line < 0)
       return;
     this.pendingEditLine = -1;
-    window.setTimeout(() => {
-      const g = this.findNodeByLine(line);
-      if (g)
-        this.startEdit(g, true);
-    }, 240);
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (this.rt.phase !== "idle") {
+          this.pendingEditLine = line;
+          window.setTimeout(() => this.flushPendingEdit(), 60);
+          return;
+        }
+        const g = this.findNodeByLine(line);
+        if (g)
+          this.startEdit(g, true);
+      });
+    });
   }
   async onClose() {
     var _a, _b, _c, _d, _e;
+    this.rt.dispose();
     (_a = this.editorHandle) == null ? void 0 : _a.close();
     this.editorHandle = null;
-    this.editing = false;
     (_b = this.observer) == null ? void 0 : _b.disconnect();
     this.observer = null;
     (_c = this.resizeObserver) == null ? void 0 : _c.disconnect();
     this.resizeObserver = null;
     this.pendingFit = false;
-    if (this.paintFrame) {
-      window.cancelAnimationFrame(this.paintFrame);
-      this.paintFrame = 0;
-    }
+    this.frames.cancel();
     this.painter.reset();
     (_d = this.mm) == null ? void 0 : _d.destroy();
     this.mm = null;
+    for (const part of this.blockParts)
+      part.unload();
+    this.blockParts = [];
+    this.blockCache.clear();
     (_e = this.drag) == null ? void 0 : _e.destroy();
     this.drag = null;
-    this.lastTree = null;
-    this.lastContent = "";
-    this.lastFilePath = "";
-    this.appliedThemeKey = "";
-    this.paintPaths.clear();
+    this.snapshot = null;
+    this.navStack = [];
+    this.leafById.clear();
+    this.breadcrumbEl = null;
+    this.selectedLine = -1;
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;
@@ -6726,7 +8084,8 @@ var MindmapView = class extends import_obsidian2.ItemView {
 var import_obsidian3 = require("obsidian");
 var DEFAULT_SETTINGS = {
   theme: "follow",
-  filterFrontmatter: true
+  filterFrontmatter: true,
+  navSync: DEFAULT_NAV_SYNC
 };
 var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
@@ -6742,6 +8101,26 @@ var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
         this.plugin.settings.filterFrontmatter = value;
         await this.plugin.saveSettings();
         this.plugin.refreshMindmap();
+      });
+    });
+    const hint = containerEl.createDiv({ cls: "setting-item-description obmind-nav-hint" });
+    const paintHint = (mode) => {
+      const hit = NAV_SYNC_OPTIONS.find(
+        (o) => o.value === mode
+      );
+      hint.setText(hit ? hit.desc : "");
+    };
+    new import_obsidian3.Setting(containerEl).setName("\u9762\u5305\u5C51\u4E0E\u7B14\u8BB0\u89C6\u56FE\u8054\u52A8").setDesc("\u5728\u5BFC\u56FE\u91CC\u70B9\u53CC\u94FE\u3001\u6216\u7528\u9762\u5305\u5C51\u56DE\u9000\u65F6\uFF0C\u7B14\u8BB0\u7A97\u53E3\u600E\u4E48\u8DDF\u968F\u3002").addDropdown((dd) => {
+      for (const opt of NAV_SYNC_OPTIONS)
+        dd.addOption(opt.value, opt.label);
+      const current = normalizeNavSync(this.plugin.settings.navSync);
+      dd.setValue(current);
+      paintHint(current);
+      dd.onChange(async (value) => {
+        const mode = normalizeNavSync(value);
+        this.plugin.settings.navSync = mode;
+        paintHint(mode);
+        await this.plugin.saveSettings();
       });
     });
   }

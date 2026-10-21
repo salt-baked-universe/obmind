@@ -23,8 +23,8 @@
  */
 
 import type { IPureNode } from "markmap-common";
-import { colsOfIndent } from "../parser";
-import type { SrcRef } from "../parser";
+import { colsOfIndent } from "../domain/syntax";
+import type { DropMode, SrcRef } from "../types";
 
 /** 从节点树里按行号顺序取出所有源坐标（折叠中的节点也在树里，不会漏） */
 export function collectSrc(root: IPureNode): SrcRef[] {
@@ -38,7 +38,7 @@ export function collectSrc(root: IPureNode): SrcRef[] {
   return out.sort((a, b) => a.line - b.line);
 }
 
-export type DropMode = "child" | "before" | "after";
+export type { DropMode } from "../types";
 
 export interface MoveInput {
   /** 整篇正文按 \n 切分的行数组 */

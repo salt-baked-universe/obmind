@@ -3,26 +3,40 @@ import {
   Notice,
   WorkspaceLeaf,
   MarkdownView,
+  MarkdownRenderer,
+  Component,
   TFile,
   debounce,
 } from "obsidian";
+import type { WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
-import { buildTree } from "./parser";
-import type { SrcRef } from "./parser";
+import { collectBlocks } from "./parser";
+import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
 import { branchIndex, resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
 import { NodePainter } from "./render/painter";
+import { FrameScheduler } from "./render/frame";
 import { nodePathOf } from "./render/geometry";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { openInlineEditor } from "./edit/inlineText";
 import type { EditorAction, InlineEditorHandle } from "./edit/inlineText";
-import { applySpan, findEditor, replaceAll } from "./edit/writer";
-import type { Span } from "./edit/writer";
+import { applyOp, findEditor } from "./edit/writer";
 import { DragController } from "./edit/drag";
-import { collectSrc, moveNode } from "./edit/move";
-import type { DropMode } from "./edit/move";
-import { indentBy, parseEditorValue, rewriteNode, siblingLine } from "./edit/text";
+import { EditService } from "./app/EditService";
+import type { EditSnapshot } from "./app/EditService";
+import { pushEntry, pushEntryDetailed, topOf, truncateTo } from "./app/NavStack";
+import type { NavEntry } from "./app/NavStack";
+import {
+  forwardTarget,
+  normalizeNavSync,
+  planBack,
+  trackOpenedLeaf,
+} from "./app/NavPolicy";
+import type { ForwardTarget, NavSyncMode } from "./app/NavPolicy";
+import { QueryService } from "./app/QueryService";
+import { ViewRuntime } from "./app/runtime";
+import { planProjection } from "./app/plan";
 import type MindmapPlugin from "./main";
 
 // 必须带插件前缀。早先用的是通用名 "mindmap-view"，一旦 onload 中途抛错，
@@ -33,10 +47,27 @@ export const MINDMAP_VIEW_TYPE = "obmind-view";
 type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
 
 /**
+ * 上一次投影的快照。下一次刷新拿它做 diff，决定走哪条绘制通道。
+ * 同时也是拖动用的节点树来源（折叠的节点不在 DOM 里，只能从树里取源坐标）。
+ */
+interface Snapshot {
+  content: string;
+  tree: IPureNode;
+  /** 全部节点的源坐标，按行升序：新建节点要算子树范围 */
+  nodes: SrcRef[];
+  path: string;
+  themeKey: string;
+  filterFrontmatter: boolean;
+}
+
+/**
  * 思维导图视图。
  *
  * 职责边界：
- * - 本类只管「视图生命周期 + 工具栏 + 事件 + 选哪篇笔记」；
+ * - 本类只管「视图生命周期 + 工具栏 + 事件 + 选哪篇笔记 + 投影」；
+ * - 状态闸门与重建串行化在 app/runtime.ts（一个显式 phase 代替一堆布尔）；
+ * - 走哪条绘制通道在 app/plan.ts（纯函数，可单测）；
+ * - 帧合并与全量/定向绘制在 render/frame.ts；
  * - 节点卡片/连线怎么画在 render/painter.ts；
  * - 节点几何与路径计算在 render/geometry.ts；
  * - 笔记文本 → 节点树在 parser.ts。
@@ -51,42 +82,81 @@ export class MindmapView extends ItemView {
   private resizeObserver: ResizeObserver | null = null;
   /** 尺寸还没就绪时挂起的首次适配请求 */
   private pendingFit = false;
-  private painter = new NodePainter();
+  private readonly painter = new NodePainter();
+  private readonly frames: FrameScheduler;
+  /** 状态闸门 + 重建串行化（替代原来的 refreshing / pending / rebuilding / pendingRefresh） */
+  private readonly rt: ViewRuntime;
   private currentSpec: ThemeSpec | null = null;
-  /** 待执行的绘制帧（rAF），用它合并同一帧内的多次重绘请求 */
-  private paintFrame = 0;
-  /** 本次待绘制的内容：全量（结构变了）还是只刷连线（节点只是位移） */
-  private paintMode: "all" | "links" = "links";
-  /** 本帧发生位移的节点 path；空集表示「全部连线」 */
-  private paintPaths = new Set<string>();
   // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
   private targetFile: TFile | null = null;
-  // 防止并发刷新导致对同一 svg 重复 create 出多个 Markmap 实例。
-  private refreshing = false;
-  private pending = false;
-  // 记录已渲染的正文与主题，内容没变就不重建导图（避免打字时反复重排）
-  private lastContent = "";
-  private appliedThemeKey = "";
-  // 上次渲染的笔记路径：只有换笔记时才重新适配视图
-  private lastFilePath = "";
-  // 编辑态闸门：编辑期间禁止重建导图，否则输入框会连同节点一起被冲掉
-  private editing = false;
+  // 上一次成功投影的结果，下次刷新用它做 diff
+  private snapshot: Snapshot | null = null;
   private editorHandle: InlineEditorHandle | null = null;
-  private pendingRefresh = false;
-  // 重建导图期间暂停绘制：这段时间的 DOM 是半成品，画出来的线必然错
-  private rebuilding = false;
   // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
   private indentStep = 2;
   private indentUnit = "  ";
   // 新建同级节点后，等重建完成再把编辑框落到新行上
   private pendingEditLine = -1;
+  /**
+   * 下一次投影是否保留当前缩放/位置（不重新适配）。
+   *
+   * 只在「导图内跳转」时置位：面包屑回退、点双链换一篇，都属于顺着路径继续看，
+   * 缩放被重置会让人瞬间找不到自己在哪。用户主动切笔记则照旧适配。
+   */
+  private keepViewport = false;
+  /** 当前选中的节点（记源行号，重建后仍能按行号恢复高亮） */
+  private selectedLine = -1;
+  /**
+   * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
+   *
+   * 栈非空时导图显示的是**栈顶那篇**。笔记窗口要不要跟着走，
+   * 由设置项 `navSync` 决定（见 app/NavPolicy.ts）—— 导图这边的"看哪篇"
+   * 与 Obsidian 的 leaf 是两件事，四种联动方式只是对 leaf 的处理不同。
+   */
+  private navStack: NavEntry[] = [];
+  private breadcrumbEl: HTMLElement | null = null;
+  /**
+   * 「新标签打开」模式下的标签编号 → leaf 映射。
+   *
+   * 栈本身是纯数据（只存编号），真正的 WorkspaceLeaf 留在这里 ——
+   * 这样 NavStack 仍然可以在 Node 里跑用例，不需要 mock Obsidian。
+   */
+  private leafSeq = 0;
+  private readonly leafById = new Map<number, WorkspaceLeaf>();
   private drag: DragController | null = null;
-  /** 最近一次渲染用的节点树：拖动时靠它取全部节点的源坐标（折叠的节点不在 DOM 里） */
-  private lastTree: IPureNode | null = null;
+  /** 块级渲染（代码块/公式块）用到的组件，下次重建前统一释放 */
+  private blockParts: Component[] = [];
+  /**
+   * 块渲染结果缓存：`kind|lang|raw` → HTML。
+   * 每打一个字都会重建整棵树，不缓存的话一篇有几十个代码块的笔记
+   * 每次按键都要重新跑一遍高亮/MathJax，输入会明显发滞。
+   */
+  private blockCache = new Map<string, string>();
+
+  // --- 读写分离：视图只做「事件 → 用例 → 投影」，不自己算文本变更 ---------
+  /** 写路径：编辑意图 → 写入计划（纯计算，不碰文件、不弹提示） */
+  private readonly editSvc = new EditService();
+  /** 读路径：内容 → 只读快照（解析 + 节点坐标 + 缩进检测） */
+  private readonly query = new QueryService(async (path: string): Promise<string> => {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? this.readContent(file) : "";
+  });
 
   constructor(leaf: WorkspaceLeaf, plugin: MindmapPlugin) {
     super(leaf);
     this.plugin = plugin;
+    this.rt = new ViewRuntime((err: unknown) => {
+      console.error("[obmind] 重建导图失败", err);
+      // 重建失败时快照不可信：留着它，下次会因「内容没变」直接短路，
+      // 视图就永远停在半成品上。清掉，下一次刷新强制走全量。
+      this.snapshot = null;
+    });
+    this.frames = new FrameScheduler(this.painter, {
+      svg: () => this.svgEl,
+      spec: () => this.currentSpec,
+      // 重建期间的 DOM 是半成品，画出来必然是错的
+      blocked: () => this.rt.phase === "rebuilding",
+    });
   }
 
   getViewType(): string {
@@ -106,8 +176,13 @@ export class MindmapView extends ItemView {
     container.empty();
     container.classList.add("obmind-container");
 
-    // 顶部工具条：主题下拉 + 刷新
-    const toolbar = container.createDiv({ cls: "obmind-toolbar" });
+    // 顶部（上→下）：
+    // 1) 工具条 —— 「我能做什么」：主题、刷新、适配、操作说明
+    // 2) 面包屑 —— 「我在哪」：导图内的跳转路径
+    // 两者语义不同，各占一行。挤在一行时路径一长就会把按钮顶出可视区，
+    // 而且面包屑出现/消失会让工具条高度跳动。
+    const header = container.createDiv({ cls: "obmind-header" });
+    const toolbar = header.createDiv({ cls: "obmind-toolbar" });
     const select = toolbar.createEl("select", { cls: "dropdown" });
     for (const opt of THEME_OPTIONS) {
       const optionEl = select.createEl("option", { text: opt.label });
@@ -124,8 +199,9 @@ export class MindmapView extends ItemView {
       text: "刷新",
     });
     refreshBtn.addEventListener("click", () => {
-      this.lastContent = "";
-      void this.refresh();
+      // 手点刷新 = 明确要求忽略缓存，直接作废快照强制重建
+      this.snapshot = null;
+      this.refresh();
     });
 
     // 手动适配：折叠/展开不再自动缩放，想回到全览时点这里
@@ -144,17 +220,29 @@ export class MindmapView extends ItemView {
       text: "?",
       attr: {
         title: [
-          "双击节点：原地编辑",
-          "Enter 完成 · Esc 取消 · Ctrl+Enter 新建同级",
-          "Tab 缩进 · Shift+Tab 反缩进 · 清空后退格删除该行",
+          "左键单击：选中节点，之后 Tab 建子级 / Enter 建同级",
+          "选中后 Delete / Backspace：删除该节点及其全部子节点",
+          "右键拖动节点：改变父子关系（左键不再拖动）",
+          "双击节点 / F2：原地编辑",
+          "编辑框内：Enter 完成 · Esc 取消 · Ctrl+Enter 新建同级",
+          "编辑框内：Tab 缩进 · Shift+Tab 反缩进 · 清空后退格删除该节点",
           "Ctrl/⌘ + 单击节点：打开同名笔记",
+          "点双链 / 面包屑：笔记窗口是否跟随，见设置里的「面包屑与笔记视图联动」",
         ].join("\n"),
       },
     });
 
+    // 面包屑独占一行：横向可滚动，路径再长也不会挤压上面的按钮
+    this.breadcrumbEl = header.createDiv({ cls: "obmind-breadcrumb" });
+    this.breadcrumbEl.addClass("is-hidden");
+
     // 画布
     const canvas = container.createDiv({ cls: "obmind-canvas" });
     this.canvasEl = canvas;
+    // 画布必须可聚焦，否则选中节点后收不到 Tab / Enter。
+    // 点击节点时会主动 focus，键盘操作才有落点。
+    canvas.setAttribute("tabindex", "0");
+    canvas.addEventListener("keydown", (e: KeyboardEvent) => this.onCanvasKeyDown(e));
     const svg = canvas.createSvg("svg");
     // markmap 基础样式挂在 .markmap 上（文字色/字体变量），需手动补类
     svg.classList.add("markmap");
@@ -166,17 +254,33 @@ export class MindmapView extends ItemView {
     this.observeSize(canvas);
 
     // 首次渲染
-    await this.refresh();
+    this.refresh();
 
     // 编辑器内容变更（防抖 300ms）+ 活跃 leaf 切换
     this.registerEvent(
       this.app.workspace.on(
         "editor-change",
-        debounce(() => void this.refresh(), 300, true),
+        debounce(() => this.refresh(), 300, true),
       ),
     );
     this.registerEvent(
-      this.app.workspace.on("active-leaf-change", () => void this.refresh()),
+      this.app.workspace.on("active-leaf-change", () => this.refresh()),
+    );
+    // 在同一个标签页里换文件时 active-leaf-change 不会触发（leaf 没变），
+    // 只靠上面那个监听，就会出现「切了笔记，导图还停在上篇」。
+    // file-open 才是真正的钩子。
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file: TFile | null) => {
+        if (!file || file.extension !== "md") return;
+        // 导图自己打开的笔记（面包屑前进/后退）也会触发 file-open。
+        // 判据：打开的正是导图当前显示的那篇 —— 那就是 obmind 自己干的，不能清栈。
+        // 只是移动光标、或者切回同一篇，也走这条短路。
+        if (file.path === this.targetFile?.path) return;
+        // 用户确实在别处换了文件 = 这次「潜入」结束，面包屑作废
+        this.resetNav();
+        this.targetFile = file;
+        this.refresh();
+      }),
     );
 
     // 绑定点击跳转
@@ -191,12 +295,22 @@ export class MindmapView extends ItemView {
       onDrop: (srcLine: number, targetLine: number, mode: DropMode) =>
         this.onNodeDrop(srcLine, targetLine, mode),
     });
+
+    // 初始没有导航，先置成隐藏，免得空容器占位
+    this.renderBreadcrumb();
   }
 
   /**
-   * 监听导图的结构与布局变化，并按变化类型分流：
-   * - childList（节点增删）→ 全量绘制；
-   * - 节点 g 的 transform（折叠展开动画里每帧都在变）→ 只刷连线。
+   * 监听导图的布局变化，并按变化类型分流。
+   *
+   * **只听 transform，不听 width/height**。实测（257 节点、折叠一帧动画）：
+   * markmap 每帧都会把全部节点的 foreignObject 宽高重写一遍（257×2 条记录/帧），
+   * 而值根本没变。听它就等于每帧判定「尺寸变了」→ 全量重绘，
+   * 上千节点时折叠/展开必然掉帧。而内容尺寸真正变化的场景只有「原地改字」，
+   * 那条路径（applyPatch）自己会请求全量重绘，不需要观察器兜底。
+   *
+   * - childList（节点增删，折叠展开也会触发）→ 全量绘制；
+   * - 节点 g 的 transform（折叠动画里每帧都在变）→ 只刷连线。
    *
    * 卡片画在节点局部坐标里，与 transform 无关，所以动画期间一次都不用重写；
    * 只有跨节点的连线需要重算起终点。
@@ -226,8 +340,8 @@ export class MindmapView extends ItemView {
         if (path) moved.add(path);
       }
 
-      if (structural) this.requestPaint("all");
-      else if (moved.size > 0) this.requestPaint("links", moved);
+      if (structural) this.frames.request("all");
+      else if (moved.size > 0) this.frames.request("links", moved);
     });
     this.observer.observe(svg, {
       childList: true,
@@ -252,136 +366,45 @@ export class MindmapView extends ItemView {
         void this.fitInstant();
         return;
       }
-      if (this.editing) this.editorHandle?.reposition();
+      if (this.rt.phase === "editing") this.editorHandle?.reposition();
     });
     this.resizeObserver.observe(el);
   }
 
-  /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
-  private requestPaint(mode: "all" | "links", paths?: Set<string>): void {
-    // 重建导图期间不画：此刻 DOM 是半成品（新节点的 g 可能还没拿到 transform，
-    // 卡片/连线还挂在被复用的旧 g 上），画出来必然是错的。重建结束后统一同步全量画一次。
-    if (this.rebuilding) return;
-
-    if (mode === "all") {
-      this.paintMode = "all";
-      this.paintPaths.clear();
-    } else if (this.paintMode !== "all" && paths) {
-      for (const p of paths) this.paintPaths.add(p);
-    }
-
-    if (this.paintFrame) return;
-    this.paintFrame = window.requestAnimationFrame(() => {
-      this.paintFrame = 0;
-      const svg = this.svgEl;
-      const spec = this.currentSpec;
-      if (!svg || !spec) return;
-
-      if (this.paintMode === "all") {
-        this.painter.paintAll(svg, spec);
-      } else {
-        this.painter.paintLinks(
-          svg,
-          spec,
-          this.paintPaths.size ? this.paintPaths : null,
-        );
-      }
-      this.paintMode = "links";
-      this.paintPaths.clear();
-    });
-  }
-
-  /**
-   * 立刻同步画一遍，不等 rAF。
-   *
-   * 重建之后必须抢在浏览器绘制这一帧之前把卡片和连线摆正，否则会先画出一帧
-   * 「新位置的节点 + 旧父节点的连线」，看起来就是线闪一下。
-   */
-  private paintAllSync(): void {
-    const svg = this.svgEl;
-    const spec = this.currentSpec;
-    if (this.paintFrame) {
-      window.cancelAnimationFrame(this.paintFrame);
-      this.paintFrame = 0;
-    }
-    this.paintMode = "links";
-    this.paintPaths.clear();
-    if (!svg || !spec) return;
-    this.painter.paintAll(svg, spec);
-  }
-
-  /**
-   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
-   *
-   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
-   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
-   *    过渡期间旧连线是从「错的父节点」出发的；
-   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
-   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
-   *
-   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
-   * 紧跟着同步重绘一次（paintAllSync），整个过程在一帧内结束，不会播出中间态。
-   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
-   * 这里只临时改了本次 setData 的 duration。
-   */
-  private async applyTree(tree: IPureNode): Promise<void> {
-    const mm = this.mm;
-    const svg = this.svgEl;
-    if (!mm || !svg) return;
-
-    this.rebuilding = true;
-    const prev: number = mm.options.duration;
-    mm.setOptions({ duration: 0 });
-    try {
-      await mm.setData(tree);
-      // 旧节点是走 transition 移除的，即使 duration=0 也要等一个 tick。
-      // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
-      // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
-      this.dropDetached();
-      // 结构变了，缓存的 g/元素引用可能已经对应到别的节点上，全部作废重来
-      this.painter.reset();
-      this.paintAllSync();
-    } finally {
-      mm.setOptions({ duration: prev });
-      this.rebuilding = false;
-    }
-  }
-
-  /**
-   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
-   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
-   *
-   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
-   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
-   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
-   */
-  private dropDetached(): void {
-    const svg = this.svgEl;
-    const root = this.mm?.state.data;
-    if (!svg || !root) return;
-
-    const alive = new Set<unknown>();
-    const walk = (n: INode): void => {
-      alive.add(n);
-      for (const c of n.children ?? []) walk(c);
-    };
-    walk(root);
-
-    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
-      const data: unknown = (g as SVGGElement & { __data__?: unknown }).__data__;
-      if (!data || !alive.has(data)) g.remove();
-    }
-  }
-
   /** 供插件在激活视图时指定要展示的笔记 */
   setTargetFile(file: TFile | null): void {
+    // 从 ribbon / 命令重新打开导图 = 明确要求看「当前笔记」，
+    // 结束之前的导图内导航，否则会继续停在栈顶那篇上。
+    // 这时把导航过程中新开的笔记标签一并收掉：那次「潜入」已经结束了。
+    if (this.navStack.length > 0) {
+      this.closeTracked(this.navStack);
+      this.navStack = [];
+      this.renderBreadcrumb();
+    }
     if (file && file.extension === "md") this.targetFile = file;
+  }
+
+  /**
+   * 结束一次导图内导航：清栈。
+   *
+   * 只丢映射、**不**关标签 —— 用户已经在别处切走了，那些标签现在归他管。
+   */
+  private resetNav(): void {
+    if (this.navStack.length === 0) return;
+    this.navStack = [];
+    this.leafById.clear();
+    this.renderBreadcrumb();
+  }
+
+  /** 当前生效的联动策略（配置缺失或非法值时退回默认档） */
+  private navSync(): NavSyncMode {
+    return normalizeNavSync(this.plugin.settings.navSync);
   }
 
   private async onThemeChange(theme: MindmapTheme): Promise<void> {
     this.plugin.settings.theme = theme;
     await this.plugin.saveSettings();
-    await this.refresh();
+    this.refresh();
   }
 
   /**
@@ -390,6 +413,14 @@ export class MindmapView extends ItemView {
    * 活跃视图就是导图自身，那样会拿不到笔记而中断刷新（之前“切换主题无效”的根因）。
    */
   private resolveTargetFile(): TFile | null {
+    // 面包屑导航中：导图显示栈顶那篇，不跟随编辑器。
+    // 「复用当前视图」就是靠这一句实现的 —— 不碰 Obsidian 的 leaf。
+    const pinned: TFile | null = this.pinnedFile();
+    if (pinned) {
+      this.targetFile = pinned;
+      return pinned;
+    }
+
     const activeFile: TFile | null = this.app.workspace.getActiveFile();
     if (activeFile && activeFile.extension === "md") {
       this.targetFile = activeFile;
@@ -422,6 +453,56 @@ export class MindmapView extends ItemView {
     const editor = findEditor(this.app, file);
     if (editor) return editor.getValue();
     return this.app.vault.read(file);
+  }
+
+  /**
+   * 把代码块 / 公式块交给 Obsidian 自己的 MarkdownRenderer 渲染。
+   *
+   * 为什么不自己渲染：
+   * - 公式要么引 katex（打包多 300KB，还要带一整套字体），要么自己写 LaTeX 解析，都不划算；
+   * - 代码高亮同理，Obsidian 内部已有一套且跟随主题配色。
+   * 走官方渲染器的额外好处是观感和笔记里完全一致，用户不用适应两套排版。
+   *
+   * 必须在 setData **之前**跑完：markmap 是按 content 里的 DOM 量节点宽高的，
+   * 先用占位灌图、事后再替换内容，节点尺寸会和实际文字脱节（裁剪或留白）。
+   */
+  private async renderBlocks(tree: IPureNode, file: TFile): Promise<void> {
+    const jobs = collectBlocks(tree);
+    // 上一轮的组件（MathJax、语法高亮注册）先释放，否则每刷新一次堆一批
+    for (const part of this.blockParts) part.unload();
+    this.blockParts = [];
+    if (jobs.length === 0) return;
+
+    await Promise.all(
+      jobs.map(async ({ node, block }: { node: IPureNode; block: BlockInfo }) => {
+        const key = `${block.kind}|${block.lang}|${block.raw}`;
+        const cached: string | undefined = this.blockCache.get(key);
+        if (cached !== undefined) {
+          node.content = cached;
+          return;
+        }
+
+        const holder = document.createElement("div");
+        const part = new Component();
+        // 先 load：MarkdownRenderer 会把高亮/MathJax 渲染器作为子组件挂上来，
+        // 父组件没 load 的话子组件不会启动，公式就一直是原始 `$$…$$`。
+        part.load();
+        this.blockParts.push(part);
+        try {
+          await MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
+          const html: string = holder.innerHTML.trim();
+          if (html !== "") {
+            node.content = html;
+            // 缓存控制在几百条，够覆盖正常切换；无限涨没意义
+            if (this.blockCache.size > 300) this.blockCache.clear();
+            this.blockCache.set(key, html);
+          }
+        } catch (err) {
+          // 渲染失败就保留占位（「代码块 · js · 12 行」），至少不整块消失
+          console.warn("[obmind] 代码块/公式块渲染失败，保留占位", err);
+        }
+      }),
+    );
   }
 
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
@@ -512,93 +593,255 @@ export class MindmapView extends ItemView {
     });
   }
 
-  async refresh(knownContent?: string): Promise<void> {
-    if (this.editing) {
-      // 编辑期间绝不重建：markmap 会重建 foreignObject，输入框和光标一起没
-      this.pendingRefresh = true;
-      return;
-    }
-    if (this.refreshing) {
-      // 正在刷新时再来的请求（例如切主题）不能丢，结束后补一次
-      this.pending = true;
-      return;
-    }
-    this.refreshing = true;
-    try {
-      if (this.themeSelect) this.themeSelect.value = this.plugin.settings.theme;
+  // -------------------------------------------------------------------------
+  // 投影：一次内容变化该走哪条通道
+  // -------------------------------------------------------------------------
 
-      const file = this.resolveTargetFile();
-      if (!file || !this.svgEl) return;
+  /**
+   * 请求把最新状态画出来。
+   *
+   * 这里不再自己做「正在刷新就排队 / 正在编辑就跳过」的判断——那些交给
+   * ViewRuntime：非 idle 阶段自动挂起，回到 idle 自动补跑，并发请求只保留最新一个。
+   */
+  refresh(knownContent?: string): void {
+    this.rt.request((rev: number) => this.project(rev, knownContent));
+  }
 
-      // 写回之后调用方直接传入刚写完的内容，不再依赖「读回来的东西是新的」，
-      // 彻底避开「文件变了但导图不更新」的竞态。
-      const content: string = knownContent ?? (await this.readContent(file));
-      const fileChanged = this.lastFilePath !== file.path;
-      const isDark = document.body.classList.contains("theme-dark");
-      const spec = resolveTheme(this.plugin.settings.theme, isDark);
-      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
-      this.applyTheme(spec);
+  private async project(rev: number, knownContent?: string): Promise<void> {
+    if (this.themeSelect) this.themeSelect.value = this.plugin.settings.theme;
 
-      // 内容与主题都没变（例如只是移动光标触发的 editor-change）：
-      // 什么都不用画，直接返回。之前这里还会全量重绘一次，纯属浪费。
-      if (
-        !fileChanged &&
-        this.mm &&
-        content === this.lastContent &&
-        themeKey === this.appliedThemeKey
-      ) {
-        // 内容没变就不重画，但排队中的「编辑下一个节点」还得接上，
-        // 否则点过去那次双击会被这条短路永久吞掉。
-        this.flushPendingEdit();
-        return;
-      }
+    const file = this.resolveTargetFile();
+    if (!file || !this.svgEl) return;
 
-      const tree = buildTree(content, file.basename, {
-        filterFrontmatter: this.plugin.settings.filterFrontmatter,
-      });
-      this.lastContent = content;
-      // 留给拖拽用：DOM 里只有展开的节点，折叠的节点只能从树里拿
-      this.lastTree = tree;
+    const prev = this.snapshot;
+    const filter: boolean = this.plugin.settings.filterFrontmatter;
 
-      const step: unknown = tree.payload?.step;
-      if (typeof step === "number" && step > 0) this.indentStep = step;
-      const unit: unknown = tree.payload?.indentUnit;
-      if (typeof unit === "string" && unit !== "") this.indentUnit = unit;
+    // 读路径统一走 QueryService（读 → 解析 → 节点坐标 + 缩进检测），一次产出只读快照。
+    // 写回之后调用方直接传入刚写完的内容，不再依赖「读回来的东西是新的」，
+    // 彻底避开「文件变了但导图不更新」的竞态。
+    const doc =
+      knownContent === undefined
+        ? await this.query.load(file.path, file.basename, { filterFrontmatter: filter })
+        : this.query.parse(knownContent, file.basename, { filterFrontmatter: filter });
+    // 读文件期间用户可能又改了一版、或者切走了笔记：这一轮作废，新请求会接管
+    if (this.rt.stale(rev)) return;
 
-      // setData 会重建整棵树并把 payload.fold 冲掉，
-      // 不接住的话用户折起来的分支每次编辑都会全弹开。
-      applyFolds(tree, collectFolds(this.mm?.state.data));
+    // 面包屑 / 双链跳转是「同一张导图里换个地方看」，不是重新打开一篇：
+    // 这时候重置缩放会让人瞬间失去方位感。读一次即清，不影响真正的换文件。
+    const keepViewport: boolean = this.keepViewport;
+    this.keepViewport = false;
 
-      if (!this.mm) {
-        // 注意不要用 Markmap.create(svg, opts, tree)：传了 data 它会在内部
-        // 直接 fit 一次，而 fit 带 180ms 过渡动画，打开视图时会看到画面缩一下。
-        // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
-        this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
-        this.appliedThemeKey = themeKey;
-        await this.applyTree(tree);
-        await this.fitInstant();
-      } else {
-        // 主题变了才需要换一整套绘制选项（线宽、字号、maxWidth）。
-        // setOptions 只合并选项、不渲染，但会重绑一次 zoom 手势，没必要每次重建都调。
-        if (themeKey !== this.appliedThemeKey) {
-          this.mm.setOptions(this.buildOptions(spec));
-          this.appliedThemeKey = themeKey;
-        }
-        await this.applyTree(tree);
-        // 换了一篇笔记才重新适配；同一篇里改内容保持用户的缩放与位置
-        if (fileChanged) await this.fitInstant();
-      }
+    const content: string = doc.content;
+    const tree: IPureNode = doc.tree;
+    this.indentStep = doc.step;
+    this.indentUnit = doc.unit;
 
-      this.lastFilePath = file.path;
+    const isDark = document.body.classList.contains("theme-dark");
+    const spec = resolveTheme(this.plugin.settings.theme, isDark);
+    const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+    this.applyTheme(spec);
+
+    const sameFile = prev !== null && prev.path === file.path;
+    const sameTheme = prev !== null && prev.themeKey === themeKey;
+    const sameFilter = prev !== null && prev.filterFrontmatter === filter;
+
+    // 内容、主题、解析参数都没变（例如只是移动光标触发的 editor-change）：
+    // 什么都不用画，但排队中的「编辑下一个节点」还得接上。
+    if (sameFile && sameTheme && sameFilter && prev.content === content) {
       this.flushPendingEdit();
+      return;
+    }
+
+    const plan = planProjection({
+      prev: prev?.tree ?? null,
+      next: tree,
+      forceStructure: !sameFile || !sameTheme || !sameFilter,
+      sourceSame: prev !== null && prev.content === content,
+    });
+
+    if (plan.kind === "none") {
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter,
+      };
+      this.flushPendingEdit();
+      return;
+    }
+
+    // 只改了一处文字：直接换那个节点的 DOM，不 setData。
+    // markmap 的 key 里带内容哈希，setData 会让整棵树重新 enter（DOM 全量重建）；
+    // 而它自己对节点内容挂了 ResizeObserver，尺寸一变会重排，这就是官方支持的增量路径。
+    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content)) {
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter,
+      };
+      this.flushPendingEdit();
+      return;
+    }
+
+    // 结构变化：setData 全量重建
+    // setData 会重建整棵树并把 payload.fold 冲掉，
+    // 不接住的话用户折起来的分支每次编辑都会全弹开。
+    applyFolds(tree, collectFolds(this.mm?.state.data));
+
+    // 代码块/公式块必须在 setData 前渲染成真正的 HTML，
+    // 否则 markmap 量到的是占位字符串的尺寸
+    await this.renderBlocks(tree, file);
+    if (this.rt.stale(rev)) return;
+
+    const restructure = (): Promise<void> => this.applyTree(tree);
+
+    if (!this.mm) {
+      // 注意不要用 Markmap.create(svg, opts, tree)：传了 data 它会在内部
+      // 直接 fit 一次，而 fit 带 180ms 过渡动画，打开视图时会看到画面缩一下。
+      // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
+      this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter,
+      };
+      await restructure();
+      await this.fitInstant();
+    } else {
+      // 主题变了才需要换一整套绘制选项（线宽、字号、maxWidth）。
+      // setOptions 只合并选项、不渲染，但会重绑一次 zoom 手势，没必要每次重建都调。
+      if (!sameTheme) this.mm.setOptions(this.buildOptions(spec));
+      this.snapshot = {
+        content,
+        tree,
+        nodes: doc.nodes,
+        path: file.path,
+        themeKey,
+        filterFrontmatter: filter,
+      };
+      await restructure();
+      // 换了一篇笔记才重新适配；同一篇里改内容保持用户的缩放与位置。
+      // 导航跳转（面包屑 / 双链）也保持视口 —— 想回全览点「适配」。
+      if (!sameFile && !keepViewport) await this.fitInstant();
+    }
+
+    this.flushPendingEdit();
+  }
+
+  /**
+   * 原地改字：只替换该节点的内容 DOM，不 setData。
+   *
+   * 为什么能这么做：markmap 的节点 key 是 `父id.子id + hash(content)`，
+   * 一旦 setData，内容变了的节点 key 全变，d3 会把整个子树重新 enter
+   * （foreignObject、内容 DOM、代码高亮、公式全部重来）。而它内部对每个节点的
+   * 内容 div 挂了 ResizeObserver（100ms 防抖 → renderData），
+   * 所以「改 DOM」本身就是它支持的增量路径：不重建，只重排。
+   *
+   * @returns false 表示这个节点当前不在 DOM 里（折叠/已被替换），只能退回全量重建
+   */
+  private applyPatch(line: number, content: string): boolean {
+    const g = this.findNodeByLine(line);
+    if (!g) return false;
+
+    const fo = g.querySelector<SVGForeignObjectElement>(":scope > foreignObject");
+    // markmap 的结构是 foreignObject.markmap-foreign > div > div，最内层承载内容
+    const box = fo?.firstElementChild?.firstElementChild ?? null;
+    if (!fo || !box) return false;
+
+    box.innerHTML = content;
+
+    // 同步写回 markmap 手里的节点数据：后续拖动等逻辑读的是 DOM，
+    // 但下次结构重建前若有其它代码看 state.data，内容不能是旧的。
+    // 刻意不动 state.key —— 一改 key 就等于宣布「这是新节点」，patch 就白做了。
+    const data = (g as SVGGElement & { __data__?: INode }).__data__;
+    if (data) data.content = content;
+
+    // 尺寸可能变了（文字变长/变短）。立刻量一次让卡片先跟上，
+    // markmap 稍后自己重排时会把 width/height 覆盖成最终值，届时 observer 会再刷一次。
+    const w: number = box.scrollWidth;
+    const h: number = box.scrollHeight;
+    if (w > 0 && h > 0) {
+      fo.setAttribute("width", String(w));
+      fo.setAttribute("height", String(h));
+    }
+    this.frames.request("all");
+    return true;
+  }
+
+  /**
+   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
+   *
+   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
+   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
+   *    过渡期间旧连线是从「错的父节点」出发的；
+   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
+   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
+   *
+   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
+   * 紧跟着同步重绘一次（paintNow），整个过程在一帧内结束，不会播出中间态。
+   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
+   * 这里只临时改了本次 setData 的 duration。
+   */
+  private async applyTree(tree: IPureNode): Promise<void> {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg) return;
+
+    this.rt.setPhase("rebuilding");
+    const prev: number = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.setData(tree);
+      // 旧节点是走 transition 移除的，即使 duration=0 也要等一个 tick。
+      // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
+      // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
+      this.dropDetached();
+      // 结构变了，缓存的 g/元素引用可能已经对应到别的节点上，全部作废重来
+      this.frames.reset();
+      this.frames.paintNow();
     } finally {
-      this.refreshing = false;
-      if (this.pending) {
-        this.pending = false;
-        void this.refresh();
-      }
+      mm.setOptions({ duration: prev });
+      this.rt.setPhase("idle");
     }
   }
+
+  /**
+   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
+   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
+   *
+   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
+   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
+   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
+   */
+  private dropDetached(): void {
+    const svg = this.svgEl;
+    const root = this.mm?.state.data;
+    if (!svg || !root) return;
+
+    const alive = new Set<unknown>();
+    const walk = (n: INode): void => {
+      alive.add(n);
+      for (const c of n.children ?? []) walk(c);
+    };
+    walk(root);
+
+    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+      const data: unknown = (g as SVGGElement & { __data__?: unknown }).__data__;
+      if (!data || !alive.has(data)) g.remove();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 点击 / 编辑 / 拖动
+  // -------------------------------------------------------------------------
 
   onNodeClick(e: MouseEvent): void {
     const target = e.target as Element;
@@ -620,7 +863,7 @@ export class MindmapView extends ItemView {
         this.targetFile?.path ?? "",
       );
       if (dest instanceof TFile) {
-        void this.app.workspace.getLeaf("tab").openFile(dest);
+        this.openDoc(dest);
       }
       return;
     }
@@ -628,30 +871,403 @@ export class MindmapView extends ItemView {
     // 2) 折叠圆点交给 markmap 自己处理，避免折叠与跳转冲突
     if (target.closest("circle")) return;
 
-    // 3) 节点整体：Ctrl/⌘ + 单击才把节点文字当笔记名打开。
-    //    普通单击不做跳转——双击已经留给原地编辑，单击再跳转就会互相打架。
-    if (!(e.ctrlKey || e.metaKey)) return;
     const g = target.closest("g.markmap-node") as SVGGElement | null;
     if (!g) return;
-    const text: string = (g.textContent ?? "").trim();
-    if (!text) return;
 
-    const dest = this.app.metadataCache.getFirstLinkpathDest(
-      text,
-      this.targetFile?.path ?? "",
-    );
-    if (dest instanceof TFile) {
-      void this.app.workspace.getLeaf("tab").openFile(dest);
+    // 3) Ctrl/⌘ + 单击节点：把节点文字当笔记名打开（原行为保留）
+    if (e.ctrlKey || e.metaKey) {
+      const text: string = (g.textContent ?? "").trim();
+      if (!text) return;
+      const dest = this.app.metadataCache.getFirstLinkpathDest(
+        text,
+        this.targetFile?.path ?? "",
+      );
+      if (dest instanceof TFile) this.openDoc(dest);
+      return;
+    }
+
+    // 4) 普通左键单击 = 选中。选中之后 Tab 建子级、Enter 建同级才有基准。
+    this.selectNode(g);
+  }
+
+  /**
+   * 打开一篇笔记 —— 这里是「导图内跳转」的唯一入口。
+   *
+   * 两件事必须分开看：
+   * 1. 导图看哪篇：永远是 `targetFile`（配合 navStack 栈顶），与 Obsidian 的 leaf 无关；
+   * 2. 笔记窗口要不要跟、怎么跟：由设置项 navSync 决定，交给 presentNote。
+   *
+   * 顺序很讲究：先压栈 + 定 targetFile，**再**动 leaf。因为 openFile 会触发
+   * file-open，而处理器判断「打开的是不是导图当前显示的那篇」，只有先改完
+   * targetFile，自己触发的打开才不会被误判成「用户切了笔记」而清栈。
+   */
+  private openDoc(file: TFile): void {
+    // 走到栈里已有的条目 = 回退，不是新跳转。
+    // 交给 goBackTo 才能走对策略：2.3 要关掉中间那些标签，2.4 一个都不动；
+    // 若当成新跳转处理，会在 A › B › A 时白白再开一个 A 的标签。
+    const hit: number = this.navStack.findIndex((e: NavEntry) => e.path === file.path);
+    if (hit >= 0) {
+      this.goBackTo(hit);
+      return;
+    }
+
+    const mode: NavSyncMode = this.navSync();
+    const current: TFile | null = this.targetFile;
+    const previous: TFile | null = current && current.path !== file.path ? current : null;
+
+    // 起点压栈：第一次跳转时面包屑要有「从哪来」（A › B）
+    if (this.navStack.length === 0 && previous) {
+      this.navStack = pushEntry(this.navStack, {
+        path: previous.path,
+        title: previous.basename,
+      });
+    }
+
+    // 顺着链接继续看，不重置缩放（见 keepViewport 说明）
+    this.keepViewport = true;
+    this.targetFile = file;
+
+    // 先压栈、后动 leaf。
+    // presentNote 里会 openFile，而 openFile 可能同步触发 active-leaf-change /
+    // file-open；那一刻栈里必须已经是新条目，否则回调会按旧栈顶再画一次旧笔记（闪一下）。
+    const res = pushEntryDetailed(this.navStack, {
+      path: file.path,
+      title: file.basename,
+    });
+    this.navStack = res.stack;
+    // 被上限挤掉的条目如果当初开过标签，现在没人会再回退到它了 —— 一并收掉
+    this.closeTracked(res.dropped);
+
+    const leafId: number | undefined = this.presentNote(file, mode, previous);
+    if (leafId !== undefined) {
+      const last: NavEntry = this.navStack[this.navStack.length - 1];
+      this.navStack = [...this.navStack.slice(0, -1), { ...last, leafId }];
+    }
+
+    this.renderBreadcrumb();
+    this.refresh();
+  }
+
+  /**
+   * 把目标笔记"呈现"到 Obsidian 里，返回新分配标签的编号。
+   *
+   * 决策在 app/NavPolicy.ts（纯函数），这里只执行：
+   * - map-only：什么都不做，导图自己换内容；
+   * - same-leaf：复用正在显示上一篇的编辑器；
+   * - new-leaf-*：新标签打开，2.3 额外记下编号以便回退时关闭。
+   */
+  private presentNote(
+    file: TFile,
+    mode: NavSyncMode,
+    previous: TFile | null,
+  ): number | undefined {
+    const target: ForwardTarget = forwardTarget(mode);
+    if (target === "none") return undefined;
+
+    if (target === "current") {
+      // "当前笔记窗口" = 正在显示上一篇的那个编辑器。
+      // 找不到（比如导图独占整个区域）就退化成新标签 —— 点了双链却什么都看不到更糟。
+      const leaf: WorkspaceLeaf | null =
+        this.leafShowing(previous) ??
+        this.app.workspace.getActiveViewOfType(MarkdownView)?.leaf ??
+        null;
+      if (leaf) {
+        this.openInLeaf(leaf, file);
+        return undefined;
+      }
+    }
+
+    const leaf: WorkspaceLeaf = this.newNoteLeaf();
+    this.openInLeaf(leaf, file);
+    // 新标签会激活自己、把导图挤到后台 —— 那样面包屑就点不到了。
+    // 把导图重新显示到前台：笔记留在标签栏里，要对照可以自己拖成分屏。
+    void this.app.workspace.revealLeaf(this.leaf);
+
+    if (!trackOpenedLeaf(mode)) return undefined;
+    const id: number = ++this.leafSeq;
+    this.leafById.set(id, leaf);
+    return id;
+  }
+
+  /** 在指定 leaf 里打开笔记；失败只记日志，不打断导航（导图仍会换内容） */
+  private openInLeaf(leaf: WorkspaceLeaf, file: TFile): void {
+    void leaf.openFile(file).catch((err: unknown) => {
+      console.error("[obmind] 打开笔记失败", err);
+    });
+  }
+
+  /**
+   * 在主编辑区新开一个标签。
+   *
+   * 不能直接用 `getLeaf("tab")`：它是在「当前活动 leaf 所在区域」新建的，
+   * 而点双链时活动 leaf 往往就是侧栏里的导图 —— 笔记会被塞进侧栏的标签组。
+   * 有主区的 markdown 标签就用它的父容器建标签；一个都没有才退回 getLeaf。
+   */
+  private newNoteLeaf(): WorkspaceLeaf {
+    const main = this.app.workspace.rootSplit;
+    const anchor: WorkspaceLeaf | undefined = this.app.workspace
+      .getLeavesOfType("markdown")
+      .find((leaf: WorkspaceLeaf) => leaf.getRoot() === main);
+    const parent = anchor?.parent ?? null;
+    if (parent) {
+      // children 是运行时的内部数组，类型声明里没公开；拿不到就插到 0
+      const split = parent as WorkspaceSplit;
+      const kids = (split as unknown as { children?: unknown[] }).children;
+      const at: number = Array.isArray(kids) ? kids.length : 0;
+      return this.app.workspace.createLeafInParent(split, at);
+    }
+    return this.app.workspace.getLeaf("tab");
+  }
+
+  /** 正在显示某篇笔记的编辑器；没有就返回 null */
+  private leafShowing(file: TFile | null): WorkspaceLeaf | null {
+    if (!file) return null;
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === file.path) return leaf;
+    }
+    return null;
+  }
+
+  /**
+   * 关掉「当初为导航新开」的标签。
+   *
+   * 不看当前模式：条目上带 leafId 就说明那个标签是 obmind 为这次跳转开的，
+   * 用户中途改设置也不该把它变成孤儿。
+   */
+  private closeTracked(entries: readonly NavEntry[]): void {
+    for (const entry of entries) this.detachLeaf(entry.leafId);
+  }
+
+  private detachLeaf(id: number | undefined): void {
+    if (id === undefined) return;
+    const leaf: WorkspaceLeaf | undefined = this.leafById.get(id);
+    this.leafById.delete(id);
+    if (!leaf) return;
+    try {
+      leaf.detach();
+    } catch (err) {
+      // 用户可能已经手动关了它，或所属 pane 已销毁 —— 不该影响导航
+      console.warn("[obmind] 关闭导航标签失败", err);
     }
   }
 
-  // -------------------------------------------------------------------------
-  // 双向编辑
-  // -------------------------------------------------------------------------
+  /** 栈顶对应的文件；文件没了就作废整条栈，回到跟随编辑器 */
+  private pinnedFile(): TFile | null {
+    const top = topOf(this.navStack);
+    if (!top) return null;
+    const file = this.app.vault.getAbstractFileByPath(top.path);
+    if (file instanceof TFile) return file;
+    // 标签可能还在显示这个已删除的文件，交给 Obsidian 处理，这里不 detach
+    this.resetNav();
+    return null;
+  }
+
+  /** 点面包屑某一级：截断到它，导图换回那篇 */
+  private goBackTo(index: number): void {
+    const entry: NavEntry | undefined = this.navStack[index];
+    if (!entry) return;
+
+    const target = this.app.vault.getAbstractFileByPath(entry.path);
+    if (!(target instanceof TFile)) {
+      // 上级文件没了，这条路径没法还原：整条栈作废
+      this.resetNav();
+      this.refresh();
+      return;
+    }
+
+    const back = planBack(this.navSync());
+    const dropped: NavEntry[] = this.navStack.slice(index + 1);
+    const shown: TFile | null = this.targetFile;
+
+    // 同样先改「看哪篇」再动 leaf：关闭标签会触发 active-leaf-change，
+    // 那一刻若 targetFile 还停在子笔记，导图会先闪回子笔记再跳到上级。
+    this.keepViewport = true;
+    this.navStack = truncateTo(this.navStack, index);
+    this.targetFile = target;
+
+    // 先关标签再切换：关闭会让活跃标签变化，顺序反了会把刚打开的那篇挤掉
+    this.closeTracked(dropped);
+
+    if (back.followCurrent) {
+      // 「跟随当前窗口」：把正在看下级的那篇编辑器切回上级
+      const leaf: WorkspaceLeaf | null = this.leafShowing(shown);
+      if (leaf) this.openInLeaf(leaf, target);
+    }
+
+    this.renderBreadcrumb();
+    this.refresh();
+  }
+
+  /**
+   * 重画面包屑。
+   *
+   * 用 span 而不是 a：这是一级级往回退，不是打开新文档，
+   * 用链接会被 Obsidian 的链接处理器接管。
+   */
+  private renderBreadcrumb(): void {
+    const el = this.breadcrumbEl;
+    if (!el) return;
+    el.empty();
+    el.toggleClass("is-hidden", this.navStack.length === 0);
+    if (this.navStack.length === 0) return;
+
+    el.setAttribute("title", "导图内的跳转路径：点前面任意一级返回");
+
+    this.navStack.forEach((entry: NavEntry, i: number) => {
+      if (i > 0) el.createSpan({ cls: "obmind-crumb-sep", text: "›" });
+      const last: boolean = i === this.navStack.length - 1;
+      const item = el.createSpan({ cls: "obmind-crumb", text: entry.title });
+      item.toggleClass("is-current", last);
+      item.setAttribute("aria-label", entry.path);
+      item.setAttribute("title", last ? entry.path : `${entry.path}（点击返回）`);
+      if (!last) item.addEventListener("click", () => this.goBackTo(i));
+    });
+
+    // 当前项永远在最后。路径一长默认滚到最左，用户只看得到最早的几级 ——
+    // 滚到最右，让「我现在在哪」始终可见。
+    el.scrollLeft = el.scrollWidth;
+  }
+
+  /**
+   * 选中一个节点。
+   *
+   * 选中态记的是**源行号**而不是 DOM 引用：每次 setData 之后 g 元素都是新的一批，
+   * 存引用等于存了个已经断掉的东西。行号在重建后仍然有效，重新挂 class 就行。
+   */
+  private selectNode(g: SVGGElement | null): void {
+    this.setSelectedLine(g ? (this.srcOf(g)?.line ?? -1) : -1);
+    // 画布拿到焦点，后面的 Tab / Enter 才有人接
+    this.canvasEl?.focus({ preventScroll: true });
+  }
+
+  private setSelectedLine(line: number): void {
+    if (this.selectedLine === line) return;
+    this.selectedLine = line;
+    this.paintSelection();
+  }
+
+  /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
+  private paintSelection(): void {
+    const svg = this.svgEl;
+    if (!svg) return;
+    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+      const on: boolean = this.srcOf(g)?.line === this.selectedLine;
+      g.classList.toggle("obmind-selected", on);
+    }
+  }
+
+  /**
+   * 画布上的键盘操作。
+   *
+   * 两道闸门：
+   * - 事件目标必须是画布本身。编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
+   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」。
+   */
+  private onCanvasKeyDown(e: KeyboardEvent): void {
+    if (e.target !== this.canvasEl) return;
+    if (e.isComposing) return;
+
+    if (e.key === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      // Shift+Tab 不建节点：反缩进是编辑框里的语义，画布上先不抢这个键
+      if (!e.shiftKey) this.createNode("child");
+      return;
+    }
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.createNode("sibling");
+      return;
+    }
+
+    if (e.key === "Escape") {
+      this.setSelectedLine(-1);
+      return;
+    }
+
+    // Delete / Backspace：删掉选中节点（含整棵子树）。
+    // 没有撤销栈兜底场景是「笔记没开在编辑器里」，所以在提示里写清怎么撤回。
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.removeNode();
+      return;
+    }
+
+    // F2：等价于双击，键盘流也能改字
+    if (e.key === "F2") {
+      e.preventDefault();
+      const line: number = this.selectedLine;
+      if (line < 0) return;
+      const g = this.findNodeByLine(line);
+      if (g) this.startEdit(g, false);
+    }
+  }
+
+  /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
+  private createNode(mode: "sibling" | "child"): void {
+    const line: number = this.selectedLine;
+    if (line < 0) {
+      new Notice("obmind：先左键点一下要挂在哪个节点上");
+      return;
+    }
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
+
+    const out = this.editSvc.create({ snap, line, mode });
+    if (out.kind === "error") {
+      new Notice(`obmind：${out.reason}`);
+      return;
+    }
+    if (out.kind === "none") return;
+
+    if (out.focusLine !== undefined) {
+      this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+
+  /**
+   * 删除选中节点及其子树（Delete / Backspace）。
+   *
+   * 删完把选中挪到父节点上：行号在删除后往前挪，但父节点在删除行之前，
+   * 所以它的行号不变，可以直接定位。这样才能连着删兄弟节点。
+   */
+  private removeNode(): void {
+    const line: number = this.selectedLine;
+    if (line < 0) return;
+
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
+
+    const size: number = this.editSvc.subtreeSize(snap, line);
+    const parentLine: number = this.editSvc.parentLineOf(snap, line);
+    const out = this.editSvc.remove({ snap, line });
+    if (out.kind === "error") {
+      new Notice(`obmind：${out.reason}`);
+      return;
+    }
+    if (out.kind === "none") return;
+
+    // 不再等新节点的编辑框；选中改到父节点（根节点就取消选中）
+    this.pendingEditLine = -1;
+    this.selectedLine = parentLine;
+    void this.applyPlan(file, out.op);
+
+    // 一次删掉整棵分支时给个反馈：没有编辑器就没有 Ctrl+Z 兜底，用户要心里有数
+    if (size > 1) {
+      new Notice(`obmind：已删除该节点及其 ${size - 1} 个子节点`);
+    }
+  }
 
   /** 双击节点进入原地编辑 */
-  private onNodeDblClick(e: MouseEvent): void {
-    const target = e.target as Element;
+  private onNodeDblClick(e: MouseEvent): void {    const target = e.target as Element;
     // 双链上双击是选中文字，不接管
     if (target.closest("a")) return;
     // 折叠圆点交给 markmap
@@ -666,7 +1282,7 @@ export class MindmapView extends ItemView {
     // 正在编辑上一个节点、或正在重建时，双击另一个节点不能被丢掉：
     // 记下目标行号，等这一轮提交+重建跑完自动接上。
     // 否则「改完一个想接着改下一个」点过去毫无反应，就是没法连着编辑。
-    if (this.editing || this.refreshing) {
+    if (this.rt.phase !== "idle") {
       const pendingLine: number | undefined = this.srcOf(g)?.line;
       if (pendingLine !== undefined) this.pendingEditLine = pendingLine;
       return;
@@ -676,48 +1292,36 @@ export class MindmapView extends ItemView {
   }
 
   /**
-   * 拖拽落下：把「移动」翻译成整篇新内容，一次性写回。
+   * 拖拽落下：把「移动」交给 EditService，产出整篇重写的写入计划。
    *
    * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
    * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
    */
   private onNodeDrop(srcLine: number, targetLine: number, mode: DropMode): void {
     const file = this.targetFile;
-    const tree = this.lastTree;
-    const content: string = this.lastContent;
-    if (!file || !tree || !content) return;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
 
-    const res = moveNode({
-      lines: content.split("\n"),
-      nodes: collectSrc(tree),
-      step: this.indentStep,
-      unit: this.indentUnit,
-      srcLine,
-      targetLine,
-      mode,
-    });
-
-    if (!res.ok) {
-      new Notice(`obmind：${res.reason}`);
+    const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
+    if (out.kind === "error") {
+      new Notice(`obmind：${out.reason}`);
       return;
     }
+    if (out.kind === "none") return;
 
-    void this.applyMove(file, res.lines.join("\n"), content);
+    void this.applyPlan(file, out.op);
   }
 
-  private async applyMove(file: TFile, next: string, expect: string): Promise<void> {
+  /** 执行写入计划并刷新（拖动、新建节点这类不属于编辑框的操作走这里） */
+  private async applyPlan(file: TFile, op: WriteOp): Promise<void> {
     try {
-      const ok: boolean = await replaceAll(this.app, file, next, expect);
-      if (!ok) {
-        new Notice("笔记内容已变化，本次移动未写入。请点「刷新」后重试。");
-        return;
-      }
+      const res = await this.runWrite(file, op);
       // 直接把刚写完的内容交给 refresh：不依赖读回结果，
       // 编辑器缓冲还没落盘时也能立刻重建（否则要手动点刷新）。
-      await this.refresh(next);
+      if (res.ok) this.refresh(res.next);
     } catch (err) {
-      console.error("[obmind] 移动节点失败", err);
-      new Notice("移动节点失败，详见控制台。");
+      console.error("[obmind] 写入失败", err);
+      new Notice("写入失败，详见控制台。");
     }
   }
 
@@ -740,10 +1344,10 @@ export class MindmapView extends ItemView {
 
   /** 打开原地编辑框；根节点（文件名）不可编辑 */
   private startEdit(g: SVGGElement, selectAll: boolean): void {
-    if (this.editing || !this.canvasEl) return;
+    if (this.rt.phase === "editing" || !this.canvasEl) return;
 
     // 重建正在进行时会把这个 g 换掉，等这一轮跑完再按行号重新定位
-    if (this.refreshing) {
+    if (this.rt.phase === "rebuilding") {
       const pendingLine: number | undefined = this.srcOf(g)?.line;
       if (pendingLine !== undefined) {
         window.setTimeout(() => {
@@ -760,11 +1364,12 @@ export class MindmapView extends ItemView {
     // 根节点没有 src；折叠起来的节点不渲染，也不会有 DOM
     if (!src || data?.state?.depth === 0) return;
 
-    const spec: ThemeSpec = this.currentSpec ?? resolveTheme(this.plugin.settings.theme, false);
+    const spec: ThemeSpec =
+      this.currentSpec ?? resolveTheme(this.plugin.settings.theme, false);
     const value: string =
       src.checked === null ? src.text : `${src.checked ? "☑" : "☐"} ${src.text}`;
 
-    this.editing = true;
+    this.rt.setPhase("editing");
     const handle = openInlineEditor({
       container: this.canvasEl,
       target: g,
@@ -778,125 +1383,133 @@ export class MindmapView extends ItemView {
     });
 
     if (!handle) {
-      this.editing = false;
+      this.rt.setPhase("idle");
       return;
     }
     this.editorHandle = handle;
   }
 
-  /** 编辑结束后：翻译成文本变更 → 写回笔记 → 重建导图 */
+  /**
+   * 编辑结束后：交给 EditService 算出写入计划 → 写文件 → 重建导图。
+   *
+   * 视图这里只剩三件事：准备快照、拿计划、执行计划。
+   * 「改一个字该动哪几行」全部在 app/EditService.ts 里，能单独跑用例断言。
+   */
   private async commitEdit(
     action: EditorAction,
     value: string,
     src: SrcRef,
   ): Promise<void> {
+    let next: string | undefined;
     try {
       if (action === "cancel") return;
 
       const file = this.targetFile;
-      if (!file) return;
+      const snap = this.editSnapshot();
+      if (!file || !snap) return;
 
-      const parsed = parseEditorValue(src, value);
-      let span: Span | null = null;
-
-      // 只有「退格清空」才删行；否则空文本一律视为放弃修改。
-      // 笔记里一行就是一条内容，误删比改不动代价大得多。
-      if (parsed.text === "" && action !== "delete") return;
-
-      if (action === "delete") {
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [],
-          checkLine: src.line,
-          checkText: src.full,
-        };
-      } else if (action === "sibling") {
-        // 改写当前行 + 插入同级行，合成一次写入，避免中途冲突
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked), siblingLine(src)],
-          checkLine: src.line,
-          checkText: src.full,
-        };
-        this.pendingEditLine = src.line + 1;
-      } else if (action === "indent" || action === "outdent") {
-        const nextIndent = indentBy(src, action === "indent" ? 1 : -1, this.indentStep);
-        if (nextIndent === null) return;
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked, nextIndent)],
-          checkLine: src.line,
-          checkText: src.full,
-        };
-      } else {
-        // 内容没变就别写文件，省掉一次无谓的重建
-        if (parsed.text === src.text && parsed.checked === src.checked) return;
-        span = {
-          start: src.line,
-          end: src.line + 1,
-          lines: [rewriteNode(src, parsed.text, parsed.checked)],
-          checkLine: src.line,
-          checkText: src.full,
-        };
-      }
-
-      const ok: boolean = await applySpan(this.app, file, span);
-      if (!ok) {
+      const out = this.editSvc.commit({ snap, src, action, value });
+      if (out.kind === "error") {
         this.pendingEditLine = -1;
-        new Notice("笔记内容已变化，本次修改未写入。请点「刷新」后重试。");
+        new Notice(`obmind：${out.reason}`);
+        return;
       }
+      if (out.kind === "none") return;
+
+      if (out.focusLine !== undefined) this.pendingEditLine = out.focusLine;
+      const res = await this.runWrite(file, out.op);
+      next = res.next;
     } catch (err) {
       this.pendingEditLine = -1;
       console.error("[obmind] 写回笔记失败", err);
       new Notice("写回笔记失败，详见控制台。");
     } finally {
       this.editorHandle = null;
-      this.editing = false;
-      // 编辑期间被挡下的刷新请求，这时候一并消化
-      this.pendingRefresh = false;
-      await this.refresh();
+      // 退出编辑态：runtime 会把编辑期间挂起的刷新请求自动补跑，
+      // 这里再显式请求一次，保证刚写进编辑器缓冲的内容立刻反映到导图上。
+      this.rt.setPhase("idle");
+      this.refresh(next);
     }
+  }
+
+  /** 当前快照 → EditService 的输入（只读视图，写路径不修改它） */
+  private editSnapshot(): EditSnapshot | null {
+    const s = this.snapshot;
+    if (!s) return null;
+    return { content: s.content, nodes: s.nodes, step: this.indentStep, unit: this.indentUnit };
+  }
+
+  /**
+   * 执行一次写入计划。
+   *
+   * 这里是视图与文件 IO 的唯一接触点：计划怎么写由 writer 决定
+   * （有编辑器走 transaction 保留 Ctrl+Z，没有才退回 vault.process）。
+   */
+  private async runWrite(
+    file: TFile,
+    op: WriteOp,
+  ): Promise<{ ok: boolean; next?: string }> {
+    const res = await applyOp(this.app, file, op);
+    if (!res.ok) {
+      this.pendingEditLine = -1;
+      new Notice(`obmind：${res.reason}`);
+      return { ok: false };
+    }
+    // writer 顺手把写入后的内容算出来了，直接用 —— 不再读一次文件。
+    // 少的那次 IO 正是「按了 Delete/Enter 之后画面要停顿一下才更新」的原因。
+    return { ok: true, next: res.next };
   }
 
   /** 重建完成后，把编辑框落到新建的那一行上 */
   private flushPendingEdit(): void {
+    // 重建后 g 元素全换了，选中态要按行号重新挂上
+    this.paintSelection();
+
     const line: number = this.pendingEditLine;
     if (line < 0) return;
     this.pendingEditLine = -1;
 
-    // markmap 的位置变化是 180ms 过渡，等它停稳再定位，否则会画在旧坐标上
-    window.setTimeout(() => {
-      const g = this.findNodeByLine(line);
-      if (g) this.startEdit(g, true);
-    }, 240);
+    // 结构更新的 duration 是 0，节点在 setData 完成时就已经落到最终位置了，
+    // 所以等两帧（浏览器布局 + markmap 的 renderData 收尾）就能开框。
+    // 原来固定等 240ms —— 那段空白就是「新建后先看到占位文字、随后被输入框盖住」的闪。
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (this.rt.phase !== "idle") {
+          // 又赶上一轮重建：重新排队，等那一轮结束再开
+          this.pendingEditLine = line;
+          window.setTimeout(() => this.flushPendingEdit(), 60);
+          return;
+        }
+        const g = this.findNodeByLine(line);
+        if (g) this.startEdit(g, true);
+      });
+    });
   }
 
   async onClose(): Promise<void> {
+    this.rt.dispose();
     this.editorHandle?.close();
     this.editorHandle = null;
-    this.editing = false;
     this.observer?.disconnect();
     this.observer = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.pendingFit = false;
-    if (this.paintFrame) {
-      window.cancelAnimationFrame(this.paintFrame);
-      this.paintFrame = 0;
-    }
+    this.frames.cancel();
     this.painter.reset();
     this.mm?.destroy();
     this.mm = null;
+    for (const part of this.blockParts) part.unload();
+    this.blockParts = [];
+    this.blockCache.clear();
     this.drag?.destroy();
     this.drag = null;
-    this.lastTree = null;
-    this.lastContent = "";
-    this.lastFilePath = "";
-    this.appliedThemeKey = "";
-    this.paintPaths.clear();
+    this.snapshot = null;
+    this.navStack = [];
+    // 只丢映射，不 detach：插件卸载 / 视图关闭不该替用户关掉笔记标签
+    this.leafById.clear();
+    this.breadcrumbEl = null;
+    this.selectedLine = -1;
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;

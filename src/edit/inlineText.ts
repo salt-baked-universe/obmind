@@ -11,9 +11,10 @@
  * 字号、行高、换行位置都和卡片里完全一致。
  */
 
+import type { EditorAction } from "../types";
 import type { ThemeSpec } from "../theme";
 
-export type EditorAction = "commit" | "sibling" | "indent" | "outdent" | "delete" | "cancel";
+export type { EditorAction } from "../types";
 
 export interface InlineEditorOptions {
   container: HTMLElement;
@@ -130,10 +131,33 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     });
   };
 
+  /**
+   * 打开后的一小段时间里，节点位置可能还在变：markmap 对每个节点的内容挂了
+   * ResizeObserver（100ms 防抖后才 renderData），刚重建完的节点会晚一步挪到位。
+   * 这期间每帧贴一次，否则编辑框停在旧坐标上，身后卡片文字又是透明的 ——
+   * 看起来就是「输入框飘在半空闪一下」。超过窗口期就停，不做常驻监听。
+   */
+  let follow = 0;
+  const followUntil: number = performance.now() + 420;
+  const followLoop = (): void => {
+    if (done) {
+      follow = 0;
+      return;
+    }
+    place();
+    follow =
+      performance.now() < followUntil ? window.requestAnimationFrame(followLoop) : 0;
+  };
+  follow = window.requestAnimationFrame(followLoop);
+
   const cleanup = (): void => {
     if (frame) {
       window.cancelAnimationFrame(frame);
       frame = 0;
+    }
+    if (follow) {
+      window.cancelAnimationFrame(follow);
+      follow = 0;
     }
     ta.removeEventListener("keydown", onKeyDown);
     ta.removeEventListener("blur", onBlur);

@@ -5,6 +5,18 @@
   flex-direction: column;
   height: 100%;
   padding: 0;
+  /* 面包屑是 nowrap 的，容器不给 min-width:0 会被长路径撑宽，
+     把整个视图顶出侧栏 */
+  min-width: 0;
+}
+
+/* 顶部区：工具条（能做什么）+ 面包屑（我在哪）。两块各占一行、各带分隔线，
+   面包屑变长时横向滚动，不会把工具条上的按钮挤出可视区。 */
+.obmind-header {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-width: 0;
 }
 
 .obmind-toolbar {
@@ -26,6 +38,61 @@
   height: 26px;
   padding: 0 10px;
   font-size: var(--font-ui-smaller, 12px);
+}
+
+/* 面包屑：导图内双链跳转的路径。点前面任意一级 = 退回那篇笔记。
+   独占一行、可横向滚动，路径再长也不换行（工具条高度必须稳定）。 */
+.obmind-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 10px 4px;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  scrollbar-width: none;
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+.obmind-breadcrumb::-webkit-scrollbar {
+  display: none;
+}
+
+.obmind-breadcrumb.is-hidden {
+  display: none;
+}
+
+.obmind-breadcrumb .obmind-crumb {
+  max-width: 200px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.obmind-breadcrumb .obmind-crumb:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.obmind-breadcrumb .obmind-crumb.is-current {
+  color: var(--text-normal);
+  font-weight: 500;
+  cursor: default;
+}
+
+.obmind-breadcrumb .obmind-crumb.is-current:hover {
+  background: transparent;
+}
+
+.obmind-breadcrumb .obmind-crumb-sep {
+  opacity: 0.45;
 }
 
 .obmind-toolbar .obmind-hint {
@@ -62,6 +129,13 @@
 .obmind-canvas .obmind-node-card,
 .obmind-canvas .obmind-node-shadow {
   transition: fill 0.18s ease, opacity 0.18s ease;
+}
+
+/* 选中节点：卡片是 JS 自绘的原生 rect，描边直接加在它上面。
+   不用 outline —— SVG 里的 outline 会按 bbox 画，遇到圆角卡片会露出来。 */
+.obmind-canvas .markmap-node.obmind-selected .obmind-node-card {
+  stroke: var(--interactive-accent, #4a7dff);
+  stroke-width: 2;
 }
 
 /* markmap 自带的连线接在节点底边（像"线贴在卡片下面"），且无法通过选项改成
@@ -102,6 +176,61 @@
 .obmind-canvas .markmap-foreign a:hover {
   opacity: 1;
   text-decoration-thickness: 2px;
+}
+
+/* 代码块 / 公式块：由 Obsidian 的 MarkdownRenderer 渲染成真正的 HTML 再塞进卡片。
+   markmap 只给 pre 设了 margin:0，没有任何折行约束 —— 长行会把
+   .markmap-foreign > div > div（inline-block）撑到上限后直接溢出卡片。
+   强制折行后测量出的宽度才是可预期的。 */
+.obmind-canvas .markmap-foreign pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--code-background, rgba(127, 127, 127, 0.12));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: left;
+  font-family: var(--font-monospace, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  /* 必须写死上限。
+     markmap 的 maxWidth 是设在 svg 上的 --markmap-max-width，只约束那层 div
+     的可用宽度，pre 的 max-content（不折行的整行宽）才是决定 inline-block
+     实际宽度的那一项 —— 一行 110 字符的代码能把节点撑到 700 以上。
+     320 是「卡片主题 380 上限 - 内边距」留出来的余量。 */
+  max-width: 320px;
+}
+
+.obmind-canvas .markmap-foreign pre > code {
+  display: block;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  white-space: inherit;
+}
+
+/* 公式块：MathJax 的 CHTML 输出是普通 HTML，能在 foreignObject 里正常排版。
+   字号收一档——公式按 em 计算，按正文 14px 渲染会比节点文字大一圈。 */
+.obmind-canvas .markmap-foreign .math,
+.obmind-canvas .markmap-foreign .math-block {
+  margin: 0;
+  text-align: center;
+}
+
+.obmind-canvas .markmap-foreign mjx-container {
+  font-size: 92% !important;
+  margin: 2px 0 !important;
+}
+
+/* 块节点在渲染完成前（或渲染失败时）的占位：至少能看出这里有个代码块 / 公式，
+   而不是整块凭空消失。 */
+.obmind-canvas .obmind-block {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-style: italic;
 }
 
 /* 原地编辑框。
@@ -146,4 +275,10 @@
   height: 3px;
   border-radius: 2px;
   background: var(--interactive-accent, #4a7dff);
+}
+
+/* 设置页：联动模式的说明文字，紧贴在下拉框下面 */
+.obmind-nav-hint {
+  margin: -10px 0 18px;
+  line-height: 1.5;
 }

@@ -10,19 +10,10 @@
  */
 
 import { App, Editor, EditorPosition, MarkdownView, TFile } from "obsidian";
+import type { Span, WriteOp, WriteResult } from "../types";
 
-/** 一次行区间替换；空 lines 表示删除这些行 */
-export interface Span {
-  /** 起始行（0 基） */
-  start: number;
-  /** 结束行（不含） */
-  end: number;
-  /** 替换成的行 */
-  lines: string[];
-  /** 冲突校验：第 checkLine 行必须仍等于 checkText */
-  checkLine: number;
-  checkText: string;
-}
+export type { Span } from "../types";
+
 
 /** 找到正在打开这篇笔记的编辑器（优先活跃视图） */
 export function findEditor(app: App, file: TFile): Editor | null {
@@ -119,25 +110,60 @@ export async function replaceAll(
 
 /**
  * 应用一次行区间替换（改文字、缩进、新建同级、删行都走这里）。
- * @returns true = 已写入；false = 源文件已变化（锚点行对不上），什么都没做
+ * @returns ok=true 时顺带给出写入后的整篇内容；ok=false 表示源文件已变化
+ *          （锚点行对不上），什么都没做
  */
-export async function applySpan(app: App, file: TFile, span: Span): Promise<boolean> {
+export async function applySpan(
+  app: App,
+  file: TFile,
+  span: Span,
+): Promise<{ ok: boolean; next?: string }> {
   const editor = findEditor(app, file);
 
   if (editor) {
-    if (span.checkLine >= editor.lineCount()) return false;
-    if (editor.getLine(span.checkLine) !== span.checkText) return false;
+    if (span.checkLine >= editor.lineCount()) return { ok: false };
+    if (editor.getLine(span.checkLine) !== span.checkText) return { ok: false };
+    if (span.checkEnd) {
+      const end = span.checkEnd;
+      if (end.line >= editor.lineCount()) return { ok: false };
+      if (editor.getLine(end.line) !== end.text) return { ok: false };
+    }
     editor.transaction({ changes: [buildChange(editor, span)] });
-    return true;
+    // transaction 是同步的，写完立刻能读到新内容
+    return { ok: true, next: editor.getValue() };
   }
 
-  let ok = false;
+  let next: string | undefined;
   await app.vault.process(file, (data: string) => {
     const lines: string[] = data.split("\n");
     if (lines[span.checkLine] !== span.checkText) return data;
-    ok = true;
+    if (span.checkEnd && lines[span.checkEnd.line] !== span.checkEnd.text) return data;
     lines.splice(span.start, span.end - span.start, ...span.lines);
-    return lines.join("\n");
+    next = lines.join("\n");
+    return next;
   });
-  return ok;
+  return next === undefined ? { ok: false } : { ok: true, next };
+}
+
+/**
+ * 执行一个写入意图（service 的唯一出口）。
+ *
+ * 把「哪种写法」的细节关在这里：行区间走 applySpan（保留光标与撤销栈），
+ * 整篇走 replaceAll（拖动改层级后行号全变，只能整体替换）。
+ */
+export async function applyOp(
+  app: App,
+  file: TFile,
+  op: WriteOp,
+): Promise<WriteResult> {
+  if (op.kind === "whole") {
+    const ok: boolean = await replaceAll(app, file, op.content, op.expect);
+    return ok
+      ? { ok: true, next: op.content }
+      : { ok: false, reason: "笔记内容已变化，本次修改未写入。请点「刷新」后重试。" };
+  }
+  const res = await applySpan(app, file, op.span);
+  return res.ok
+    ? { ok: true, next: res.next }
+    : { ok: false, reason: "笔记内容已变化，本次修改未写入。请点「刷新」后重试。" };
 }
