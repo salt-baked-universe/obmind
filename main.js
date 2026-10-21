@@ -4834,20 +4834,337 @@ function nodeStyleAt(spec, depth, branch) {
   return { bg: mixColor(branch, spec.mixBase, spec.tint), fg: spec.nodeText, bold: false };
 }
 
+// src/render/geometry.ts
+var SVG_NS2 = "http://www.w3.org/2000/svg";
+var CONTENT_X = 6;
+var TRANSLATE_RE = /translate\(\s*(-?[\d.]+)[\s,]+(-?[\d.]+)\s*\)/;
+function readTranslate(g) {
+  const raw = g.getAttribute("transform");
+  if (!raw)
+    return null;
+  const m = TRANSLATE_RE.exec(raw);
+  if (!m)
+    return null;
+  return { x: Number.parseFloat(m[1]), y: Number.parseFloat(m[2]) };
+}
+function depthOf(path2) {
+  let n = 0;
+  for (let i = 0; i < path2.length; i++) {
+    if (path2.charCodeAt(i) === 46)
+      n++;
+  }
+  return n;
+}
+function parentPathOf(path2) {
+  const i = path2.lastIndexOf(".");
+  return i < 0 ? "" : path2.slice(0, i);
+}
+function nodePathOf(g) {
+  var _a;
+  const node = g.__data__;
+  const path2 = (_a = node == null ? void 0 : node.state) == null ? void 0 : _a.path;
+  return typeof path2 === "string" ? path2 : null;
+}
+function readNodeBox(g) {
+  var _a, _b;
+  const path2 = nodePathOf(g);
+  if (!path2)
+    return null;
+  const fo = g.querySelector(":scope > foreignObject");
+  if (!fo)
+    return null;
+  const w = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "");
+  const h2 = Number.parseFloat((_b = fo.getAttribute("height")) != null ? _b : "");
+  if (!Number.isFinite(w) || !Number.isFinite(h2) || w <= 0 || h2 <= 0)
+    return null;
+  const origin = readTranslate(g);
+  if (!origin)
+    return null;
+  const depth = depthOf(path2);
+  return {
+    g,
+    fo,
+    path: path2,
+    depth,
+    ox: origin.x,
+    oy: origin.y,
+    w,
+    h: h2,
+    // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）
+    padX: depth === 0 ? 12 : 9,
+    padY: depth === 0 ? 7 : 5
+  };
+}
+function cardRect(box, dy = 0) {
+  return {
+    x: CONTENT_X - box.padX,
+    y: -box.padY + dy,
+    w: box.w + box.padX * 2,
+    h: box.h + box.padY * 2
+  };
+}
+function cardRightX(box) {
+  return CONTENT_X + box.w + box.padX;
+}
+function cardCenterY(box) {
+  return box.h / 2;
+}
+var round2 = (n) => Math.round(n * 100) / 100;
+function circleOffset(box, nativeCx, nativeCy) {
+  return {
+    x: round2(cardRightX(box) - nativeCx),
+    y: round2(cardCenterY(box) - nativeCy)
+  };
+}
+function linkPath(child, parent) {
+  const startX = round2(parent.ox + cardRightX(parent) - child.ox);
+  const startY = round2(parent.oy + cardCenterY(parent) - child.oy);
+  const endX = CONTENT_X - child.padX;
+  const endY = round2(cardCenterY(child));
+  const span = endX - startX;
+  const ctrl = Math.max(10, Math.abs(span) * 0.45);
+  const dir = span >= 0 ? 1 : -1;
+  const c1x = round2(startX + ctrl * dir);
+  const c2x = round2(endX - ctrl * dir);
+  return `M ${startX} ${startY} C ${c1x} ${startY}, ${c2x} ${endY}, ${endX} ${endY}`;
+}
+
+// src/render/painter.ts
+var CLS_SHADOW = "obmind-node-shadow";
+var CLS_LINK = "obmind-node-link";
+var CLS_CARD = "obmind-node-card";
+var NodePainter = class {
+  constructor() {
+    this.entries = /* @__PURE__ */ new Map();
+  }
+  /** 视图重建导图时调用，丢掉所有缓存 */
+  reset() {
+    this.entries.clear();
+  }
+  /**
+   * 全量绘制：结构发生变化时调用。
+   * 只在「重建导图 / 节点增删 / 主题切换」这类低频事件里跑。
+   */
+  paintAll(svg, spec) {
+    const { boxes, byPath } = this.collect(svg);
+    if (boxes.length === 0)
+      return;
+    for (const box of boxes) {
+      const entry = this.entryOf(box);
+      this.ensureLayers(box.g, entry);
+      this.applyStyle(box, entry, spec);
+      this.applySize(box, entry);
+      this.applyCircle(box, entry);
+      if (box.depth === 0)
+        continue;
+      const parent = byPath.get(parentPathOf(box.path));
+      if (parent)
+        this.applyLink(box, parent, entry, spec);
+    }
+    this.prune(boxes);
+  }
+  /**
+   * 只更新连线：节点位移时调用（折叠/展开的 180ms 动画里每帧都会来一次）。
+   *
+   * @param only 本帧发生位移的节点 path 集合；null 表示全部重算。
+   *             传入集合时只处理「自己动了」和「父节点动了」的节点，
+   *             节点越多收益越明显。
+   */
+  paintLinks(svg, spec, only = null) {
+    const { boxes, byPath } = this.collect(svg);
+    if (boxes.length === 0)
+      return;
+    for (const box of boxes) {
+      if (box.depth === 0)
+        continue;
+      const parentPath = parentPathOf(box.path);
+      if (only && !only.has(box.path) && !only.has(parentPath))
+        continue;
+      const parent = byPath.get(parentPath);
+      if (!parent)
+        continue;
+      const entry = this.entryOf(box);
+      if (!entry.link)
+        this.ensureLayers(box.g, entry);
+      this.applyLink(box, parent, entry, spec);
+    }
+  }
+  /** 一次性读完所有节点几何，供写阶段使用 */
+  collect(svg) {
+    const boxes = [];
+    const byPath = /* @__PURE__ */ new Map();
+    for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      const box = readNodeBox(el);
+      if (!box)
+        continue;
+      boxes.push(box);
+      byPath.set(box.path, box);
+    }
+    return { boxes, byPath };
+  }
+  /** 取（或重建）节点缓存。g 被 markmap 重建、元素掉出 DOM 时都要重置。 */
+  entryOf(box) {
+    var _a;
+    const cached = this.entries.get(box.path);
+    if (cached && cached.g === box.g && ((_a = cached.card) == null ? void 0 : _a.isConnected))
+      return cached;
+    const g = box.g;
+    const entry = {
+      g,
+      shadow: g.querySelector(`:scope > rect.${CLS_SHADOW}`),
+      link: g.querySelector(`:scope > path.${CLS_LINK}`),
+      card: g.querySelector(`:scope > rect.${CLS_CARD}`),
+      circle: g.querySelector(":scope > circle"),
+      sizeSig: "",
+      styleSig: "",
+      linkSig: "",
+      circleSig: ""
+    };
+    this.entries.set(box.path, entry);
+    return entry;
+  }
+  /** 节点被 markmap 移除后，缓存跟着清掉（path 可能被复用） */
+  prune(boxes) {
+    if (this.entries.size === boxes.length)
+      return;
+    const alive = new Set(boxes.map((b) => b.path));
+    for (const key of Array.from(this.entries.keys())) {
+      if (!alive.has(key))
+        this.entries.delete(key);
+    }
+  }
+  /**
+   * 保证三个自绘元素存在，且 z 序固定为 阴影 → 连线 → 卡片 → markmap 原有内容。
+   * 已经有序时只做几次属性比较，不碰 DOM。
+   */
+  ensureLayers(g, entry) {
+    const shadow = entry.shadow;
+    const link2 = entry.link;
+    const card = entry.card;
+    if (shadow && link2 && card && shadow.isConnected && link2.isConnected && card.isConnected && shadow.nextElementSibling === link2 && link2.nextElementSibling === card) {
+      return;
+    }
+    const anchor = this.anchorOf(g);
+    if (!entry.shadow)
+      entry.shadow = this.createElement("rect", CLS_SHADOW);
+    if (!entry.link)
+      entry.link = this.createElement("path", CLS_LINK);
+    if (!entry.card)
+      entry.card = this.createElement("rect", CLS_CARD);
+    g.insertBefore(entry.shadow, anchor);
+    g.insertBefore(entry.link, anchor);
+    g.insertBefore(entry.card, anchor);
+    entry.circle = g.querySelector(":scope > circle");
+  }
+  /** markmap 自己的第一个子元素（连线/卡片都插在它前面） */
+  anchorOf(g) {
+    for (const child of Array.from(g.children)) {
+      const cls = child.classList;
+      if (cls.contains(CLS_SHADOW) || cls.contains(CLS_LINK) || cls.contains(CLS_CARD))
+        continue;
+      return child;
+    }
+    return null;
+  }
+  createElement(tag, cls) {
+    const el = document.createElementNS(SVG_NS2, tag);
+    el.setAttribute("class", cls);
+    return el;
+  }
+  /** 配色：只在主题 / 层级 / 分支变化时写 */
+  applyStyle(box, entry, spec) {
+    const card = entry.card;
+    const shadow = entry.shadow;
+    if (!card || !shadow)
+      return;
+    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
+    const style = nodeStyleAt(spec, box.depth, branch);
+    const sig = `${spec.id}|${spec.dark ? 1 : 0}|${box.depth}|${branchIndex(box.path)}`;
+    if (entry.styleSig === sig)
+      return;
+    entry.styleSig = sig;
+    const isRoot = box.depth === 0;
+    const radius = Math.max(0, Number.parseFloat(spec.radius) || 0);
+    const rx = String(isRoot ? radius + 2 : radius);
+    card.setAttribute("fill", style.bg);
+    card.setAttribute("opacity", style.bg === "transparent" ? "0" : "1");
+    card.setAttribute("rx", rx);
+    shadow.setAttribute("fill", spec.dark ? "rgba(0,0,0,0.45)" : "rgba(15,23,42,0.10)");
+    shadow.setAttribute("rx", rx);
+    shadow.setAttribute("opacity", spec.card ? "1" : "0");
+    box.fo.style.color = style.fg;
+  }
+  /** 卡片尺寸：只依赖内容宽高，与节点位移无关，所以动画期间零写入 */
+  applySize(box, entry) {
+    const card = entry.card;
+    if (!card)
+      return;
+    const sig = `${box.w}|${box.h}`;
+    if (entry.sizeSig === sig)
+      return;
+    entry.sizeSig = sig;
+    const r = cardRect(box);
+    card.setAttribute("x", String(r.x));
+    card.setAttribute("y", String(r.y));
+    card.setAttribute("width", String(r.w));
+    card.setAttribute("height", String(r.h));
+    if (entry.shadow) {
+      const s = cardRect(box, 2);
+      entry.shadow.setAttribute("x", String(s.x));
+      entry.shadow.setAttribute("y", String(s.y));
+      entry.shadow.setAttribute("width", String(s.w));
+      entry.shadow.setAttribute("height", String(s.h));
+    }
+  }
+  /**
+   * 折叠圆点：用 CSS transform 平移到卡片右边缘的垂直中点。
+   *
+   * 不改 cx/cy —— markmap 每次重渲染都会把这两个属性重置回内容右下角，
+   * 两边抢写同一个属性正是之前「收放点抖动」的根源。
+   * transform 与属性是叠加关系，各写各的，互不覆盖。
+   */
+  applyCircle(box, entry) {
+    var _a, _b;
+    let circle = entry.circle;
+    if (!circle || !circle.isConnected) {
+      circle = box.g.querySelector(":scope > circle");
+      entry.circle = circle;
+      entry.circleSig = "";
+    }
+    if (!circle)
+      return;
+    const nativeCx = Number.parseFloat((_a = circle.getAttribute("cx")) != null ? _a : "");
+    const nativeCy = Number.parseFloat((_b = circle.getAttribute("cy")) != null ? _b : "");
+    if (!Number.isFinite(nativeCx) || !Number.isFinite(nativeCy))
+      return;
+    const offset = circleOffset(box, nativeCx, nativeCy);
+    const sig = `${offset.x}|${offset.y}`;
+    if (entry.circleSig === sig)
+      return;
+    entry.circleSig = sig;
+    circle.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
+  }
+  /** 自绘连线：父卡片右边缘中点 → 子卡片左边缘中点 */
+  applyLink(box, parent, entry, spec) {
+    const link2 = entry.link;
+    if (!link2)
+      return;
+    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
+    const d = linkPath(box, parent);
+    const sig = `${d}|${branch}|${spec.linkWidth}`;
+    if (entry.linkSig === sig)
+      return;
+    entry.linkSig = sig;
+    link2.setAttribute("d", d);
+    link2.setAttribute("fill", "none");
+    link2.setAttribute("stroke", branch);
+    link2.setAttribute("stroke-width", String(spec.linkWidth));
+    link2.setAttribute("stroke-linecap", "round");
+  }
+};
+
 // src/MindmapView.ts
 var MINDMAP_VIEW_TYPE = "mindmap-view";
-var SVG_NS2 = "http://www.w3.org/2000/svg";
-function translateOf(g) {
-  var _a;
-  const raw = (_a = g.getAttribute("transform")) != null ? _a : "";
-  const m = /translate\(\s*(-?[\d.]+)[\s,]+(-?[\d.]+)\s*\)/.exec(raw);
-  if (m)
-    return { x: Number.parseFloat(m[1]), y: Number.parseFloat(m[2]) };
-  const t = g.transform.baseVal.consolidate();
-  if (t)
-    return { x: t.matrix.e, y: t.matrix.f };
-  return { x: 0, y: 0 };
-}
 var MindmapView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -4855,18 +5172,25 @@ var MindmapView = class extends import_obsidian.ItemView {
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;
-    this.currentSpec = null;
     this.observer = null;
-    this.paintTimer = null;
-    // 绘制卡片时会往 g 里插 rect，会触发自己的 MutationObserver，用这个标志防重入
-    this.painting = false;
+    this.painter = new NodePainter();
+    this.currentSpec = null;
+    /** 待执行的绘制帧（rAF），用它合并同一帧内的多次重绘请求 */
+    this.paintFrame = 0;
+    /** 本次待绘制的内容：全量（结构变了）还是只刷连线（节点只是位移） */
+    this.paintMode = "links";
+    /** 本帧发生位移的节点 path；空集表示「全部连线」 */
+    this.paintPaths = /* @__PURE__ */ new Set();
     // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
     this.targetFile = null;
     // 防止并发刷新导致对同一 svg 重复 create 出多个 Markmap 实例。
     this.refreshing = false;
     this.pending = false;
-    // 记录已应用的主题，仅在主题变化时 setOptions，避免每次刷新重置缩放。
+    // 记录已渲染的正文与主题，内容没变就不重建导图（避免打字时反复重排）
+    this.lastContent = "";
     this.appliedThemeKey = "";
+    // 上次渲染的笔记路径：只有换笔记时才重新适配视图
+    this.lastFilePath = "";
     this.plugin = plugin;
   }
   getViewType() {
@@ -4893,8 +5217,23 @@ var MindmapView = class extends import_obsidian.ItemView {
       void this.onThemeChange(select.value);
     });
     this.themeSelect = select;
-    const refreshBtn = toolbar.createEl("button", { cls: "obmind-refresh", text: "\u5237\u65B0" });
-    refreshBtn.addEventListener("click", () => void this.refresh());
+    const refreshBtn = toolbar.createEl("button", {
+      cls: "obmind-refresh",
+      text: "\u5237\u65B0"
+    });
+    refreshBtn.addEventListener("click", () => {
+      this.lastContent = "";
+      void this.refresh();
+    });
+    const fitBtn = toolbar.createEl("button", {
+      cls: "obmind-fit",
+      text: "\u9002\u914D",
+      attr: { title: "\u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3" }
+    });
+    fitBtn.addEventListener("click", () => {
+      var _a;
+      void ((_a = this.mm) == null ? void 0 : _a.fit());
+    });
     const canvas = container.createDiv({ cls: "obmind-canvas" });
     this.canvasEl = canvas;
     const svg = canvas.createSvg("svg");
@@ -4902,24 +5241,7 @@ var MindmapView = class extends import_obsidian.ItemView {
     svg.style.width = "100%";
     svg.style.height = "100%";
     this.svgEl = svg;
-    this.observer = new MutationObserver((records) => {
-      for (const rec of records) {
-        if (rec.type === "childList") {
-          this.schedulePaint();
-          return;
-        }
-        if (rec.type === "attributes" && rec.attributeName === "transform") {
-          this.schedulePaint();
-          return;
-        }
-      }
-    });
-    this.observer.observe(svg, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["transform"]
-    });
+    this.observeLayout(svg);
     await this.refresh();
     this.registerEvent(
       this.app.workspace.on(
@@ -4931,6 +5253,78 @@ var MindmapView = class extends import_obsidian.ItemView {
       this.app.workspace.on("active-leaf-change", () => void this.refresh())
     );
     svg.addEventListener("click", (e) => this.onNodeClick(e));
+  }
+  /**
+   * 监听导图的结构与布局变化，并按变化类型分流：
+   * - childList（节点增删）→ 全量绘制；
+   * - 节点 g 的 transform（折叠展开动画里每帧都在变）→ 只刷连线。
+   *
+   * 卡片画在节点局部坐标里，与 transform 无关，所以动画期间一次都不用重写；
+   * 只有跨节点的连线需要重算起终点。
+   *
+   * 刻意排除外层 g 的 transform：滚轮缩放/平移改的是那一层，
+   * 节点局部坐标没变，重绘纯属浪费（这是缩放抖动的主因）。
+   */
+  observeLayout(svg) {
+    var _a;
+    (_a = this.observer) == null ? void 0 : _a.disconnect();
+    this.observer = new MutationObserver((records) => {
+      let structural = false;
+      const moved = /* @__PURE__ */ new Set();
+      for (const rec of records) {
+        if (rec.type === "childList") {
+          structural = true;
+          continue;
+        }
+        const target = rec.target;
+        if (!(target instanceof SVGGElement) || !target.classList.contains("markmap-node")) {
+          continue;
+        }
+        const path2 = nodePathOf(target);
+        if (path2)
+          moved.add(path2);
+      }
+      if (structural)
+        this.requestPaint("all");
+      else if (moved.size > 0)
+        this.requestPaint("links", moved);
+    });
+    this.observer.observe(svg, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["transform"]
+    });
+  }
+  /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
+  requestPaint(mode, paths) {
+    if (mode === "all") {
+      this.paintMode = "all";
+      this.paintPaths.clear();
+    } else if (this.paintMode !== "all" && paths) {
+      for (const p of paths)
+        this.paintPaths.add(p);
+    }
+    if (this.paintFrame)
+      return;
+    this.paintFrame = window.requestAnimationFrame(() => {
+      this.paintFrame = 0;
+      const svg = this.svgEl;
+      const spec = this.currentSpec;
+      if (!svg || !spec)
+        return;
+      if (this.paintMode === "all") {
+        this.painter.paintAll(svg, spec);
+      } else {
+        this.painter.paintLinks(
+          svg,
+          spec,
+          this.paintPaths.size ? this.paintPaths : null
+        );
+      }
+      this.paintMode = "links";
+      this.paintPaths.clear();
+    });
   }
   /** 供插件在激活视图时指定要展示的笔记 */
   setTargetFile(file) {
@@ -4976,12 +5370,14 @@ var MindmapView = class extends import_obsidian.ItemView {
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
   applyTheme(spec) {
     var _a, _b;
+    const changed = !this.currentSpec || this.currentSpec.id !== spec.id || this.currentSpec.dark !== spec.dark;
     this.currentSpec = spec;
+    if (!changed)
+      return;
     this.containerEl.classList.toggle("markmap-dark", spec.dark);
     if (this.canvasEl) {
       this.canvasEl.style.background = spec.bg;
       this.canvasEl.classList.toggle("obmind-card", spec.card);
-      this.canvasEl.style.setProperty("--obmind-node-radius", spec.radius);
       this.canvasEl.style.setProperty("--obmind-link-width", String(spec.linkWidth));
     }
     const style = (_a = this.svgEl) == null ? void 0 : _a.style;
@@ -4993,144 +5389,6 @@ var MindmapView = class extends import_obsidian.ItemView {
     style.setProperty("--markmap-a-hover-color", (_b = spec.colors[1]) != null ? _b : spec.colors[0]);
     style.setProperty("--markmap-font", "400 14px/20px var(--font-interface, sans-serif)");
   }
-  /**
-   * 给每个节点画一张卡片。
-   *
-   * 这里刻意**不改 markmap 内部那层 div 的样式**：实测 markmap 会在每次重排时重建
-   * foreignObject / 重置内部结构，写上去的 background 会被冲掉，卡片最终只剩节点自带的
-   * 那条横线（看起来像“线托着文字”）。
-   *
-   * 因此改为在节点自己的 <g> 里插入一个 <rect>：
-   * - 用节点局部坐标 (0,0) 绘制，自动跟随节点的位移与缩放，不用做任何坐标换算
-   * - rect 是原生 SVG，填充/圆角/阴影必定渲染
-   * - 插在 g 的最前面，位于连线与文字之下
-   */
-  paintNodes() {
-    var _a, _b, _c;
-    const svg = this.svgEl;
-    const spec = this.currentSpec;
-    if (!svg || !spec)
-      return;
-    this.painting = true;
-    try {
-      const infos = [];
-      const byPath = /* @__PURE__ */ new Map();
-      for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-        const g = el;
-        const node = g.__data__;
-        if (!node || !node.state)
-          continue;
-        const fo = g.querySelector("foreignObject");
-        if (!fo)
-          continue;
-        const w = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "");
-        const h2 = Number.parseFloat((_b = fo.getAttribute("height")) != null ? _b : "");
-        if (!Number.isFinite(w) || !Number.isFinite(h2) || w <= 0 || h2 <= 0)
-          continue;
-        const path2 = node.state.path;
-        const depth = path2.split(".").length - 1;
-        const origin = translateOf(g);
-        const info = {
-          g,
-          fo,
-          path: path2,
-          depth,
-          ox: origin.x,
-          oy: origin.y,
-          w,
-          h: h2,
-          // 卡片比内容框四周各外扩一点，模拟卡片内边距（不参与布局，绝不挤压文字）
-          padX: depth === 0 ? 12 : 9,
-          padY: depth === 0 ? 7 : 5
-        };
-        infos.push(info);
-        byPath.set(path2, info);
-      }
-      for (const info of infos)
-        this.paintCard(info, spec);
-      for (const info of infos) {
-        if (info.depth === 0)
-          continue;
-        const parentPath = info.path.split(".").slice(0, -1).join(".");
-        this.paintLink(info, (_c = byPath.get(parentPath)) != null ? _c : null, spec);
-      }
-    } finally {
-      this.painting = false;
-    }
-  }
-  /** 给单个节点画卡片（原生 rect，插在 g 最前面，位于连线与文字之下） */
-  paintCard(info, spec) {
-    const { g, fo, depth, padX, padY, w, h: h2 } = info;
-    const isRoot = depth === 0;
-    const branch = spec.colors[branchIndex(info.path) % spec.colors.length];
-    const st = nodeStyleAt(spec, depth, branch);
-    let card = g.querySelector(":scope > rect.obmind-node-card");
-    if (!card) {
-      card = document.createElementNS(SVG_NS2, "rect");
-      card.setAttribute("class", "obmind-node-card");
-      g.insertBefore(card, g.firstChild);
-    }
-    card.setAttribute("x", String(6 - padX));
-    card.setAttribute("y", String(-padY));
-    card.setAttribute("width", String(w + padX * 2));
-    card.setAttribute("height", String(h2 + padY * 2));
-    card.setAttribute("rx", String(isRoot ? 10 : Number.parseFloat(spec.radius) || 8));
-    card.setAttribute("fill", st.bg);
-    card.setAttribute("opacity", st.bg === "transparent" ? "0" : "1");
-    const circle = g.querySelector(":scope > circle");
-    if (circle) {
-      circle.setAttribute("cx", String(6 + w + padX));
-      circle.setAttribute("cy", String(h2 / 2));
-    }
-    fo.style.color = st.fg;
-    g.classList.toggle("obmind-root", isRoot);
-  }
-  /**
-   * 画一条 XMind 风格的入线：从父卡片右边缘的**垂直中心**，平滑弯到子卡片左边缘的垂直中心。
-   *
-   * markmap 自带的连线接在每个节点矩形的**底边**（所以看起来像“线贴在卡片下面”），
-   * 且粗细/位置都无法通过选项调整，因此原生连线已在 CSS 里隐藏，这里全部自绘。
-   *
-   * 路径画在**子节点自己的 g 内**，坐标为子节点的局部坐标：
-   * 父节点的绝对位移减去子节点位移即可，自动跟随平移与缩放，无需任何屏幕坐标换算。
-   */
-  paintLink(info, parent, spec) {
-    if (!parent)
-      return;
-    const { g, ox, oy, h: h2, padX } = info;
-    const startX = parent.ox + 6 + parent.w + parent.padX - ox;
-    const startY = parent.oy + parent.h / 2 - oy;
-    const endX = 6 - padX;
-    const endY = h2 / 2;
-    const span = endX - startX;
-    const ctrl = Math.max(10, Math.abs(span) * 0.45);
-    const dir = span >= 0 ? 1 : -1;
-    const d = `M ${startX} ${startY} C ${startX + ctrl * dir} ${startY}, ${endX - ctrl * dir} ${endY}, ${endX} ${endY}`;
-    let link2 = g.querySelector(":scope > path.obmind-node-link");
-    if (!link2) {
-      link2 = document.createElementNS(SVG_NS2, "path");
-      link2.setAttribute("class", "obmind-node-link");
-      const card = g.querySelector(":scope > rect.obmind-node-card");
-      g.insertBefore(link2, card != null ? card : g.firstChild);
-    }
-    const branch = spec.colors[branchIndex(info.path) % spec.colors.length];
-    link2.setAttribute("d", d);
-    link2.setAttribute("fill", "none");
-    link2.setAttribute("stroke", branch);
-    link2.setAttribute("stroke-width", String(spec.linkWidth));
-    link2.setAttribute("stroke-linecap", "round");
-    link2.setAttribute("opacity", "0.9");
-  }
-  schedulePaint() {
-    if (this.painting)
-      return;
-    if (this.paintTimer !== null)
-      return;
-    this.paintTimer = window.setTimeout(() => {
-      this.paintTimer = null;
-      this.paintNodes();
-    }, 30);
-  }
   buildOptions(spec) {
     return {
       // 连线与折叠圆点的颜色：根节点用强调色，其余跟随所属一级分支
@@ -5140,14 +5398,39 @@ var MindmapView = class extends import_obsidian.ItemView {
         return spec.colors[branchIndex(node.state.path) % spec.colors.length];
       },
       paddingX: 6,
-      spacingHorizontal: 72,
+      spacingHorizontal: 64,
       // 卡片上下各外扩 5px，垂直间距留够，否则相邻卡片视觉上会粘在一起
-      spacingVertical: 18,
-      duration: 200,
+      spacingVertical: 16,
+      duration: 180,
       maxWidth: spec.card ? 380 : 640,
-      autoFit: true,
-      fitRatio: 0.92
+      // 关键：必须关掉 markmap 的自动适配。
+      // 它每次 render 结尾都会 fit（折叠/展开也算一次 render），
+      // 而 fit 本身是 180ms 的缩放+平移动画——点一下圆点整个画布就缩放一次，
+      // 既是「收放点抖动」的来源，也是「收起后回到默认缩放级别」的原因。
+      // 现在改成只在我们认为该适配的时机手动调 fit（见 fitInstant / 适配按钮）。
+      autoFit: false,
+      fitRatio: 0.94
     };
+  }
+  /**
+   * 无动画地把内容缩放适配到窗口。
+   *
+   * 只在「首次打开」「切换笔记」时调用：
+   * - 打开时用无动画版，避免画面先缩一下；
+   * - 换笔记时必须重新适配（autoFit 已关，否则新笔记可能整个在视口外）。
+   * 打字编辑时不调用，用户当前缩放/位置保持不变。
+   */
+  async fitInstant() {
+    const mm = this.mm;
+    if (!mm)
+      return;
+    const prev = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.fit();
+    } finally {
+      mm.setOptions({ duration: prev });
+    }
   }
   async refresh() {
     if (this.refreshing) {
@@ -5162,23 +5445,37 @@ var MindmapView = class extends import_obsidian.ItemView {
       if (!file || !this.svgEl)
         return;
       const content = await this.readContent(file);
+      const fileChanged = this.lastFilePath !== file.path;
+      const isDark = document.body.classList.contains("theme-dark");
+      const spec = resolveTheme(this.plugin.settings.theme, isDark);
+      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+      this.applyTheme(spec);
+      if (!fileChanged && this.mm && content === this.lastContent && themeKey === this.appliedThemeKey) {
+        return;
+      }
       const tree = buildTree(content, file.basename, {
         filterFrontmatter: this.plugin.settings.filterFrontmatter
       });
-      const isDark = document.body.classList.contains("theme-dark");
-      const spec = resolveTheme(this.plugin.settings.theme, isDark);
-      this.applyTheme(spec);
-      const opts = this.buildOptions(spec);
-      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+      this.lastContent = content;
       if (!this.mm) {
-        this.mm = it.create(this.svgEl, opts, tree);
-      } else {
-        if (themeKey !== this.appliedThemeKey)
-          this.mm.setOptions(opts);
+        this.mm = it.create(this.svgEl, this.buildOptions(spec));
+        this.appliedThemeKey = themeKey;
         await this.mm.setData(tree);
+        this.painter.reset();
+        this.requestPaint("all");
+        await this.fitInstant();
+      } else {
+        if (themeKey !== this.appliedThemeKey) {
+          this.mm.setOptions(this.buildOptions(spec));
+          this.appliedThemeKey = themeKey;
+        }
+        await this.mm.setData(tree);
+        this.painter.reset();
+        this.requestPaint("all");
+        if (fileChanged)
+          await this.fitInstant();
       }
-      this.appliedThemeKey = themeKey;
-      this.paintNodes();
+      this.lastFilePath = file.path;
     } finally {
       this.refreshing = false;
       if (this.pending) {
@@ -5230,12 +5527,17 @@ var MindmapView = class extends import_obsidian.ItemView {
     var _a, _b;
     (_a = this.observer) == null ? void 0 : _a.disconnect();
     this.observer = null;
-    if (this.paintTimer !== null) {
-      window.clearTimeout(this.paintTimer);
-      this.paintTimer = null;
+    if (this.paintFrame) {
+      window.cancelAnimationFrame(this.paintFrame);
+      this.paintFrame = 0;
     }
+    this.painter.reset();
     (_b = this.mm) == null ? void 0 : _b.destroy();
     this.mm = null;
+    this.lastContent = "";
+    this.lastFilePath = "";
+    this.appliedThemeKey = "";
+    this.paintPaths.clear();
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;

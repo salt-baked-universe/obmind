@@ -8,71 +8,50 @@ import {
 import { Markmap } from "markmap-view";
 import type { INode } from "markmap-common";
 import { buildTree } from "./parser";
-import {
-  branchIndex,
-  nodeStyleAt,
-  resolveTheme,
-  THEME_OPTIONS,
-} from "./theme";
+import { branchIndex, resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
+import { NodePainter } from "./render/painter";
+import { nodePathOf } from "./render/geometry";
 import type MindmapPlugin from "./main";
 
 export const MINDMAP_VIEW_TYPE = "mindmap-view";
 
 type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
 
-/** d3 会把绑定数据挂在元素上，借此拿到节点的 depth/path */
-interface D3Element extends SVGGElement {
-  __data__?: INode;
-}
-
-const SVG_NS = "http://www.w3.org/2000/svg";
-
-/** markmap 的每个节点 g 用 translate(x, y) 定位，取出这个位移 */
-function translateOf(g: SVGGElement): { x: number; y: number } {
-  const raw: string = g.getAttribute("transform") ?? "";
-  const m = /translate\(\s*(-?[\d.]+)[\s,]+(-?[\d.]+)\s*\)/.exec(raw);
-  if (m) return { x: Number.parseFloat(m[1]), y: Number.parseFloat(m[2]) };
-  const t = g.transform.baseVal.consolidate();
-  if (t) return { x: t.matrix.e, y: t.matrix.f };
-  return { x: 0, y: 0 };
-}
-
-/** 一个节点绘制卡片/连线所需的全部几何信息 */
-interface NodePaintInfo {
-  g: D3Element;
-  fo: SVGForeignObjectElement;
-  path: string;
-  depth: number;
-  /** g 的 translate 原点 */
-  ox: number;
-  oy: number;
-  /** foreignObject 的内容尺寸 */
-  w: number;
-  h: number;
-  /** 卡片相对内容向外扩展的内边距 */
-  padX: number;
-  padY: number;
-}
-
+/**
+ * 思维导图视图。
+ *
+ * 职责边界：
+ * - 本类只管「视图生命周期 + 工具栏 + 事件 + 选哪篇笔记」；
+ * - 节点卡片/连线怎么画在 render/painter.ts；
+ * - 节点几何与路径计算在 render/geometry.ts；
+ * - 笔记文本 → 节点树在 parser.ts。
+ */
 export class MindmapView extends ItemView {
   private plugin: MindmapPlugin;
   private mm: Markmap | null = null;
   private svgEl: SVGSVGElement | null = null;
   private canvasEl: HTMLElement | null = null;
   private themeSelect: HTMLSelectElement | null = null;
-  private currentSpec: ThemeSpec | null = null;
   private observer: MutationObserver | null = null;
-  private paintTimer: number | null = null;
-  // 绘制卡片时会往 g 里插 rect，会触发自己的 MutationObserver，用这个标志防重入
-  private painting = false;
+  private painter = new NodePainter();
+  private currentSpec: ThemeSpec | null = null;
+  /** 待执行的绘制帧（rAF），用它合并同一帧内的多次重绘请求 */
+  private paintFrame = 0;
+  /** 本次待绘制的内容：全量（结构变了）还是只刷连线（节点只是位移） */
+  private paintMode: "all" | "links" = "links";
+  /** 本帧发生位移的节点 path；空集表示「全部连线」 */
+  private paintPaths = new Set<string>();
   // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
   private targetFile: TFile | null = null;
   // 防止并发刷新导致对同一 svg 重复 create 出多个 Markmap 实例。
   private refreshing = false;
   private pending = false;
-  // 记录已应用的主题，仅在主题变化时 setOptions，避免每次刷新重置缩放。
+  // 记录已渲染的正文与主题，内容没变就不重建导图（避免打字时反复重排）
+  private lastContent = "";
   private appliedThemeKey = "";
+  // 上次渲染的笔记路径：只有换笔记时才重新适配视图
+  private lastFilePath = "";
 
   constructor(leaf: WorkspaceLeaf, plugin: MindmapPlugin) {
     super(leaf);
@@ -109,8 +88,24 @@ export class MindmapView extends ItemView {
     });
     this.themeSelect = select;
 
-    const refreshBtn = toolbar.createEl("button", { cls: "obmind-refresh", text: "刷新" });
-    refreshBtn.addEventListener("click", () => void this.refresh());
+    const refreshBtn = toolbar.createEl("button", {
+      cls: "obmind-refresh",
+      text: "刷新",
+    });
+    refreshBtn.addEventListener("click", () => {
+      this.lastContent = "";
+      void this.refresh();
+    });
+
+    // 手动适配：折叠/展开不再自动缩放，想回到全览时点这里
+    const fitBtn = toolbar.createEl("button", {
+      cls: "obmind-fit",
+      text: "适配",
+      attr: { title: "缩放到适合窗口" },
+    });
+    fitBtn.addEventListener("click", () => {
+      void this.mm?.fit();
+    });
 
     // 画布
     const canvas = container.createDiv({ cls: "obmind-canvas" });
@@ -122,28 +117,7 @@ export class MindmapView extends ItemView {
     svg.style.height = "100%";
     this.svgEl = svg;
 
-    // markmap 在折叠/展开时会自己增删节点（不经过 setData），
-    // 用观察者兜底补样式，否则折叠后新出现的节点没有卡片配色。
-    // 另外必须监听 transform：折叠后其它节点会重新布局，markmap 只改 g 的 transform
-    // 属性、不增删 DOM，若不跟着重算，自绘连线的 d 会停在旧坐标上（表现为线缩成一截）。
-    this.observer = new MutationObserver((records: MutationRecord[]) => {
-      for (const rec of records) {
-        if (rec.type === "childList") {
-          this.schedulePaint();
-          return;
-        }
-        if (rec.type === "attributes" && rec.attributeName === "transform") {
-          this.schedulePaint();
-          return;
-        }
-      }
-    });
-    this.observer.observe(svg, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["transform"],
-    });
+    this.observeLayout(svg);
 
     // 首次渲染
     await this.refresh();
@@ -161,6 +135,80 @@ export class MindmapView extends ItemView {
 
     // 绑定点击跳转
     svg.addEventListener("click", (e: MouseEvent) => this.onNodeClick(e));
+  }
+
+  /**
+   * 监听导图的结构与布局变化，并按变化类型分流：
+   * - childList（节点增删）→ 全量绘制；
+   * - 节点 g 的 transform（折叠展开动画里每帧都在变）→ 只刷连线。
+   *
+   * 卡片画在节点局部坐标里，与 transform 无关，所以动画期间一次都不用重写；
+   * 只有跨节点的连线需要重算起终点。
+   *
+   * 刻意排除外层 g 的 transform：滚轮缩放/平移改的是那一层，
+   * 节点局部坐标没变，重绘纯属浪费（这是缩放抖动的主因）。
+   */
+  private observeLayout(svg: SVGSVGElement): void {
+    this.observer?.disconnect();
+    this.observer = new MutationObserver((records: MutationRecord[]) => {
+      let structural = false;
+      const moved = new Set<string>();
+
+      for (const rec of records) {
+        if (rec.type === "childList") {
+          structural = true;
+          continue;
+        }
+        const target = rec.target;
+        if (
+          !(target instanceof SVGGElement) ||
+          !target.classList.contains("markmap-node")
+        ) {
+          continue;
+        }
+        const path = nodePathOf(target);
+        if (path) moved.add(path);
+      }
+
+      if (structural) this.requestPaint("all");
+      else if (moved.size > 0) this.requestPaint("links", moved);
+    });
+    this.observer.observe(svg, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["transform"],
+    });
+  }
+
+  /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
+  private requestPaint(mode: "all" | "links", paths?: Set<string>): void {
+    if (mode === "all") {
+      this.paintMode = "all";
+      this.paintPaths.clear();
+    } else if (this.paintMode !== "all" && paths) {
+      for (const p of paths) this.paintPaths.add(p);
+    }
+
+    if (this.paintFrame) return;
+    this.paintFrame = window.requestAnimationFrame(() => {
+      this.paintFrame = 0;
+      const svg = this.svgEl;
+      const spec = this.currentSpec;
+      if (!svg || !spec) return;
+
+      if (this.paintMode === "all") {
+        this.painter.paintAll(svg, spec);
+      } else {
+        this.painter.paintLinks(
+          svg,
+          spec,
+          this.paintPaths.size ? this.paintPaths : null,
+        );
+      }
+      this.paintMode = "links";
+      this.paintPaths.clear();
+    });
   }
 
   /** 供插件在激活视图时指定要展示的笔记 */
@@ -209,12 +257,15 @@ export class MindmapView extends ItemView {
 
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
   private applyTheme(spec: ThemeSpec): void {
+    const changed = !this.currentSpec || this.currentSpec.id !== spec.id ||
+      this.currentSpec.dark !== spec.dark;
     this.currentSpec = spec;
+    if (!changed) return;
+
     this.containerEl.classList.toggle("markmap-dark", spec.dark);
     if (this.canvasEl) {
       this.canvasEl.style.background = spec.bg;
       this.canvasEl.classList.toggle("obmind-card", spec.card);
-      this.canvasEl.style.setProperty("--obmind-node-radius", spec.radius);
       this.canvasEl.style.setProperty("--obmind-link-width", String(spec.linkWidth));
     }
     const style = this.svgEl?.style;
@@ -226,158 +277,6 @@ export class MindmapView extends ItemView {
     style.setProperty("--markmap-font", "400 14px/20px var(--font-interface, sans-serif)");
   }
 
-  /**
-   * 给每个节点画一张卡片。
-   *
-   * 这里刻意**不改 markmap 内部那层 div 的样式**：实测 markmap 会在每次重排时重建
-   * foreignObject / 重置内部结构，写上去的 background 会被冲掉，卡片最终只剩节点自带的
-   * 那条横线（看起来像“线托着文字”）。
-   *
-   * 因此改为在节点自己的 <g> 里插入一个 <rect>：
-   * - 用节点局部坐标 (0,0) 绘制，自动跟随节点的位移与缩放，不用做任何坐标换算
-   * - rect 是原生 SVG，填充/圆角/阴影必定渲染
-   * - 插在 g 的最前面，位于连线与文字之下
-   */
-  private paintNodes(): void {
-    const svg = this.svgEl;
-    const spec = this.currentSpec;
-    if (!svg || !spec) return;
-    this.painting = true;
-    try {
-      const infos: NodePaintInfo[] = [];
-      const byPath = new Map<string, NodePaintInfo>();
-
-      for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-        const g = el as D3Element;
-        const node = g.__data__;
-        if (!node || !node.state) continue;
-        const fo = g.querySelector<SVGForeignObjectElement>("foreignObject");
-        if (!fo) continue;
-        const w = Number.parseFloat(fo.getAttribute("width") ?? "");
-        const h = Number.parseFloat(fo.getAttribute("height") ?? "");
-        if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) continue;
-
-        const path: string = node.state.path;
-        // 用 path 的段数算层级：根 "0" → 0，"0.2" → 1，"0.2.1" → 2
-        const depth: number = path.split(".").length - 1;
-        const origin = translateOf(g);
-        const info: NodePaintInfo = {
-          g,
-          fo,
-          path,
-          depth,
-          ox: origin.x,
-          oy: origin.y,
-          w,
-          h,
-          // 卡片比内容框四周各外扩一点，模拟卡片内边距（不参与布局，绝不挤压文字）
-          padX: depth === 0 ? 12 : 9,
-          padY: depth === 0 ? 7 : 5,
-        };
-        infos.push(info);
-        byPath.set(path, info);
-      }
-
-      for (const info of infos) this.paintCard(info, spec);
-      for (const info of infos) {
-        if (info.depth === 0) continue;
-        const parentPath = info.path.split(".").slice(0, -1).join(".");
-        this.paintLink(info, byPath.get(parentPath) ?? null, spec);
-      }
-    } finally {
-      this.painting = false;
-    }
-  }
-
-  /** 给单个节点画卡片（原生 rect，插在 g 最前面，位于连线与文字之下） */
-  private paintCard(info: NodePaintInfo, spec: ThemeSpec): void {
-    const { g, fo, depth, padX, padY, w, h } = info;
-    const isRoot = depth === 0;
-    const branch = spec.colors[branchIndex(info.path) % spec.colors.length];
-    const st = nodeStyleAt(spec, depth, branch);
-
-    let card = g.querySelector(":scope > rect.obmind-node-card") as SVGRectElement | null;
-    if (!card) {
-      card = document.createElementNS(SVG_NS, "rect") as SVGRectElement;
-      card.setAttribute("class", "obmind-node-card");
-      g.insertBefore(card, g.firstChild);
-    }
-    // foreignObject 在 g 内的 x 是 paddingX(6)，内容从 6 开始
-    card.setAttribute("x", String(6 - padX));
-    card.setAttribute("y", String(-padY));
-    card.setAttribute("width", String(w + padX * 2));
-    card.setAttribute("height", String(h + padY * 2));
-    card.setAttribute("rx", String(isRoot ? 10 : Number.parseFloat(spec.radius) || 8));
-    card.setAttribute("fill", st.bg);
-    card.setAttribute("opacity", st.bg === "transparent" ? "0" : "1");
-
-    // markmap 把折叠圆点放在节点右下角（(w, h) 处）。卡片比内容框大一圈，
-    // 看起来就"不居中"。统一挪到卡片右边缘的垂直中心，与 XMind 一致。
-    const circle = g.querySelector(":scope > circle") as SVGCircleElement | null;
-    if (circle) {
-      circle.setAttribute("cx", String(6 + w + padX));
-      circle.setAttribute("cy", String(h / 2));
-    }
-
-    // 文字色写到 foreignObject 上，节点内容会继承
-    fo.style.color = st.fg;
-    g.classList.toggle("obmind-root", isRoot);
-  }
-
-  /**
-   * 画一条 XMind 风格的入线：从父卡片右边缘的**垂直中心**，平滑弯到子卡片左边缘的垂直中心。
-   *
-   * markmap 自带的连线接在每个节点矩形的**底边**（所以看起来像“线贴在卡片下面”），
-   * 且粗细/位置都无法通过选项调整，因此原生连线已在 CSS 里隐藏，这里全部自绘。
-   *
-   * 路径画在**子节点自己的 g 内**，坐标为子节点的局部坐标：
-   * 父节点的绝对位移减去子节点位移即可，自动跟随平移与缩放，无需任何屏幕坐标换算。
-   */
-  private paintLink(info: NodePaintInfo, parent: NodePaintInfo | null, spec: ThemeSpec): void {
-    if (!parent) return;
-    const { g, ox, oy, h, padX } = info;
-
-    // 父卡片右边缘（绝对坐标 → 子节点局部坐标）
-    const startX = parent.ox + 6 + parent.w + parent.padX - ox;
-    // 父卡片垂直中心
-    const startY = parent.oy + parent.h / 2 - oy;
-    // 子卡片左边缘 / 垂直中心
-    const endX = 6 - padX;
-    const endY = h / 2;
-
-    const span = endX - startX;
-    const ctrl = Math.max(10, Math.abs(span) * 0.45);
-    const dir = span >= 0 ? 1 : -1;
-    const d =
-      `M ${startX} ${startY} ` +
-      `C ${startX + ctrl * dir} ${startY}, ${endX - ctrl * dir} ${endY}, ${endX} ${endY}`;
-
-    let link = g.querySelector(":scope > path.obmind-node-link") as SVGPathElement | null;
-    if (!link) {
-      link = document.createElementNS(SVG_NS, "path") as SVGPathElement;
-      link.setAttribute("class", "obmind-node-link");
-      // 插到卡片之前：卡片后绘制，能盖住线头，视觉上正好接在边缘
-      const card = g.querySelector(":scope > rect.obmind-node-card");
-      g.insertBefore(link, card ?? g.firstChild);
-    }
-    const branch = spec.colors[branchIndex(info.path) % spec.colors.length];
-    link.setAttribute("d", d);
-    link.setAttribute("fill", "none");
-    link.setAttribute("stroke", branch);
-    link.setAttribute("stroke-width", String(spec.linkWidth));
-    link.setAttribute("stroke-linecap", "round");
-    link.setAttribute("opacity", "0.9");
-  }
-
-  private schedulePaint(): void {
-    if (this.painting) return;
-    if (this.paintTimer !== null) return;
-    this.paintTimer = window.setTimeout(() => {
-      this.paintTimer = null;
-      this.paintNodes();
-    }, 30);
-  }
-
   private buildOptions(spec: ThemeSpec): MarkmapOptions {
     return {
       // 连线与折叠圆点的颜色：根节点用强调色，其余跟随所属一级分支
@@ -386,14 +285,39 @@ export class MindmapView extends ItemView {
         return spec.colors[branchIndex(node.state.path) % spec.colors.length];
       },
       paddingX: 6,
-      spacingHorizontal: 72,
+      spacingHorizontal: 64,
       // 卡片上下各外扩 5px，垂直间距留够，否则相邻卡片视觉上会粘在一起
-      spacingVertical: 18,
-      duration: 200,
+      spacingVertical: 16,
+      duration: 180,
       maxWidth: spec.card ? 380 : 640,
-      autoFit: true,
-      fitRatio: 0.92,
+      // 关键：必须关掉 markmap 的自动适配。
+      // 它每次 render 结尾都会 fit（折叠/展开也算一次 render），
+      // 而 fit 本身是 180ms 的缩放+平移动画——点一下圆点整个画布就缩放一次，
+      // 既是「收放点抖动」的来源，也是「收起后回到默认缩放级别」的原因。
+      // 现在改成只在我们认为该适配的时机手动调 fit（见 fitInstant / 适配按钮）。
+      autoFit: false,
+      fitRatio: 0.94,
     };
+  }
+
+  /**
+   * 无动画地把内容缩放适配到窗口。
+   *
+   * 只在「首次打开」「切换笔记」时调用：
+   * - 打开时用无动画版，避免画面先缩一下；
+   * - 换笔记时必须重新适配（autoFit 已关，否则新笔记可能整个在视口外）。
+   * 打字编辑时不调用，用户当前缩放/位置保持不变。
+   */
+  private async fitInstant(): Promise<void> {
+    const mm = this.mm;
+    if (!mm) return;
+    const prev: number = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.fit();
+    } finally {
+      mm.setOptions({ duration: prev });
+    }
   }
 
   async refresh(): Promise<void> {
@@ -410,26 +334,52 @@ export class MindmapView extends ItemView {
       if (!file || !this.svgEl) return;
 
       const content: string = await this.readContent(file);
+      const fileChanged = this.lastFilePath !== file.path;
+      const isDark = document.body.classList.contains("theme-dark");
+      const spec = resolveTheme(this.plugin.settings.theme, isDark);
+      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+      this.applyTheme(spec);
+
+      // 内容与主题都没变（例如只是移动光标触发的 editor-change）：
+      // 什么都不用画，直接返回。之前这里还会全量重绘一次，纯属浪费。
+      if (
+        !fileChanged &&
+        this.mm &&
+        content === this.lastContent &&
+        themeKey === this.appliedThemeKey
+      ) {
+        return;
+      }
+
       const tree = buildTree(content, file.basename, {
         filterFrontmatter: this.plugin.settings.filterFrontmatter,
       });
-
-      const isDark = document.body.classList.contains("theme-dark");
-      const spec = resolveTheme(this.plugin.settings.theme, isDark);
-      this.applyTheme(spec);
-
-      const opts = this.buildOptions(spec);
-      const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
+      this.lastContent = content;
 
       if (!this.mm) {
-        this.mm = Markmap.create(this.svgEl, opts, tree);
-      } else {
-        if (themeKey !== this.appliedThemeKey) this.mm.setOptions(opts);
-        // setData 会重新走一遍 renderData，连线/圆点颜色按新色板刷新
+        // 注意不要用 Markmap.create(svg, opts, tree)：传了 data 它会在内部
+        // 直接 fit 一次，而 fit 带 180ms 过渡动画，打开视图时会看到画面缩一下。
+        // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
+        this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
+        this.appliedThemeKey = themeKey;
         await this.mm.setData(tree);
+        this.painter.reset();
+        this.requestPaint("all");
+        await this.fitInstant();
+      } else {
+        // setOptions 只在主题变化时调用：它会触发一次重新渲染，没必要每次都做
+        if (themeKey !== this.appliedThemeKey) {
+          this.mm.setOptions(this.buildOptions(spec));
+          this.appliedThemeKey = themeKey;
+        }
+        await this.mm.setData(tree);
+        this.painter.reset();
+        this.requestPaint("all");
+        // 换了一篇笔记才重新适配；同一篇里改内容保持用户的缩放与位置
+        if (fileChanged) await this.fitInstant();
       }
-      this.appliedThemeKey = themeKey;
-      this.paintNodes();
+
+      this.lastFilePath = file.path;
     } finally {
       this.refreshing = false;
       if (this.pending) {
@@ -485,12 +435,17 @@ export class MindmapView extends ItemView {
   async onClose(): Promise<void> {
     this.observer?.disconnect();
     this.observer = null;
-    if (this.paintTimer !== null) {
-      window.clearTimeout(this.paintTimer);
-      this.paintTimer = null;
+    if (this.paintFrame) {
+      window.cancelAnimationFrame(this.paintFrame);
+      this.paintFrame = 0;
     }
+    this.painter.reset();
     this.mm?.destroy();
     this.mm = null;
+    this.lastContent = "";
+    this.lastFilePath = "";
+    this.appliedThemeKey = "";
+    this.paintPaths.clear();
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;

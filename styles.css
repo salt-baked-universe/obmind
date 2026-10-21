@@ -21,7 +21,8 @@
   height: 26px;
 }
 
-.obmind-toolbar .obmind-refresh {
+.obmind-toolbar .obmind-refresh,
+.obmind-toolbar .obmind-fit {
   height: 26px;
   padding: 0 10px;
   font-size: var(--font-ui-smaller, 12px);
@@ -39,15 +40,13 @@
   display: block;
 }
 
-/* 节点卡片：由 JS 在每个节点的 <g> 里插入一个 <rect> 绘制。
-   放在 <g> 内用局部坐标，自动跟随节点的位移/缩放，不依赖 markmap 内部的 DOM 结构。 */
-.obmind-canvas .obmind-node-card {
-  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.18));
+/* 节点卡片与阴影：由 JS 在节点 <g> 里插入原生 <rect> 绘制。
+   放在 <g> 内用局部坐标，自动跟随节点的位移/缩放，不依赖 markmap 内部 DOM。
+   阴影刻意用「偏移的半透明矩形」而不是 filter: drop-shadow——
+   每个节点挂一个滤镜等于给每节点建一张离屏图，节点一多缩放就会掉帧。 */
+.obmind-canvas .obmind-node-card,
+.obmind-canvas .obmind-node-shadow {
   transition: fill 0.18s ease, opacity 0.18s ease;
-}
-
-.markmap-dark .obmind-node-card {
-  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
 }
 
 /* markmap 自带的连线接在节点底边（像"线贴在卡片下面"），且无法通过选项改成
@@ -62,11 +61,17 @@
   display: none !important;
 }
 
-/* 自绘连线：从父卡片右边缘中点弯到子卡片左边缘中点 */
+/* 自绘连线：粗细/颜色由 JS 按主题设置，这里不做覆盖，避免 CSS 与属性打架 */
 .obmind-canvas .obmind-node-link {
-  stroke-width: var(--obmind-link-width, 2);
-  transition: stroke 0.18s ease;
   pointer-events: none;
+}
+
+/* 折叠圆点：位置由 JS 用 transform 平移（不改 cx/cy，避免与 markmap 抢写）。
+   transform-box 用 view-box，保证平移量按 SVG 用户单位计算；
+   transition 让圆点在节点高度变化时平滑跟随，不跳。 */
+.obmind-canvas .markmap-node > circle {
+  transform-box: view-box;
+  transition: transform 0.12s ease-out;
 }
 
 /* 双链 / 外链：跟随节点文字色，避免实色卡片上蓝色链接看不清 */
