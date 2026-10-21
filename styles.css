@@ -286,6 +286,21 @@
   display: block;
 }
 
+/* 空态提示：没有可显示的笔记时盖在画布中央。
+   pointer-events: none —— 它只是个说明，不该挡住下面的缩放/拖动。 */
+.obmind-canvas .obmind-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
 /* 节点卡片与阴影：由 JS 在节点 <g> 里插入原生 <rect> 绘制。
    放在 <g> 内用局部坐标，自动跟随节点的位移/缩放，不依赖 markmap 内部 DOM。
    阴影刻意用「偏移的半透明矩形」而不是 filter: drop-shadow——
@@ -401,6 +416,51 @@
 .obmind-canvas .markmap-foreign mjx-container {
   font-size: 92% !important;
   margin: 2px 0 !important;
+}
+
+/* GFM 表格：同样交给 MarkdownRenderer 渲染成真正的 <table> 再塞进卡片。
+   卡片里没有 .markdown-rendered 这层容器，Obsidian 的表格样式选择器挂不上去，
+   所以边框、内边距、表头底色都得自己补一套 —— 否则表格是一排没有分隔线的文字。 */
+.obmind-canvas .markmap-foreign table {
+  margin: 2px 0;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  /* 与 pre 同理：宽表格必须封顶，否则 max-content 会把卡片撑到视口外。
+     max-width 生效时浏览器会重新分配列宽，单元格里的长文本随之折行。 */
+  width: max-content;
+  max-width: 320px;
+  table-layout: auto;
+}
+
+.obmind-canvas .markmap-foreign th,
+.obmind-canvas .markmap-foreign td {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  text-align: left;
+  vertical-align: top;
+  /* 长 id / URL 没有空格可断，光有 max-width 也压不下来 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 表头底色跟随节点文字色做半透明混合：卡片主题的底色由 JS 定，
+   用主题变量写死一个颜色在深色卡片上会突兀，混 currentColor 则两套都协调 */
+.obmind-canvas .markmap-foreign thead th {
+  background: color-mix(in srgb, currentColor 9%, transparent);
+  font-weight: 600;
+}
+
+.obmind-canvas .markmap-foreign tbody tr:nth-child(even) {
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+/* 表格里的对齐语法（|:--:|）由 MarkdownRenderer 转成 text-align，别被上面的
+   text-align: left 覆盖掉 */
+.obmind-canvas .markmap-foreign th[style*="center"],
+.obmind-canvas .markmap-foreign td[style*="center"] {
+  text-align: center;
 }
 
 /* 块节点在渲染完成前（或渲染失败时）的占位：至少能看出这里有个代码块 / 公式，

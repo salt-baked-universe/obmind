@@ -17,6 +17,7 @@ import { branchIndex, resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
 import { NodePainter } from "./render/painter";
 import { FrameScheduler } from "./render/frame";
+import { waitStableSize } from "./render/viewport";
 import { nodePathOf } from "./render/geometry";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { openInlineEditor } from "./edit/inlineText";
@@ -72,6 +73,23 @@ function clip(text: string, max = 18): string {
 }
 
 /**
+ * 适配时认定「视口已就绪」的最小边长。
+ *
+ * 视图刚创建 / 侧栏滑出的过程中，svg 的尺寸会是 0 或几十像素。在这种尺寸上
+ * fit 出来的 scale 要么是 0（缩成一个点），要么极小 —— 两者看起来都是空白。
+ */
+const MIN_VIEWPORT = 40;
+
+/**
+ * 适配后认定「内容包围盒有效」的最小宽高。
+ *
+ * markmap 的 `state.rect` 是它自己算出来的内容范围。适配那一刻如果它还是
+ * `{0,0,0,0}`（_relayout 没跑完、或者所有节点尺寸都是 0），内容会全部堆在
+ * 原点，看上去就是一片空白 —— 这种情况只能重试，不能当成「图很小」。
+ */
+const MIN_CONTENT = 1;
+
+/**
  * 上一次投影的快照。下一次刷新拿它做 diff，决定走哪条绘制通道。
  * 同时也是拖动用的节点树来源（折叠的节点不在 DOM 里，只能从树里取源坐标）。
  */
@@ -107,6 +125,26 @@ export class MindmapView extends ItemView {
   private resizeObserver: ResizeObserver | null = null;
   /** 尺寸还没就绪时挂起的首次适配请求 */
   private pendingFit = false;
+  /**
+   * 上一次「适配」时的视口尺寸。
+   *
+   * 有了它才能区分「尺寸变了」和「尺寸没变」：ResizeObserver 会因为
+   * 一个像素的变化反复回调，每次都重新 fit 会把用户的视口按住不放。
+   */
+  private fittedSize: { w: number; h: number } | null = null;
+  /**
+   * 用户是否自己动过视口（滚轮缩放 / 拖动平移）。
+   *
+   * 动过之后就不再跟随容器尺寸自动适配 —— 用户已经摆好了位置，
+   * 我们再去 fit 一次等于把他刚调好的视角抢走。点「适配」按钮会把它清掉。
+   */
+  private userView = false;
+  /** 适配请求的版本号：新的请求作废还在等尺寸的旧请求 */
+  private fitToken = 0;
+  /** 自动适配的去抖定时器（0 表示没有排队） */
+  private autoFitTimer = 0;
+  /** 画布空态提示（没有可显示的笔记时） */
+  private emptyEl: HTMLElement | null = null;
   private readonly painter = new NodePainter();
   private readonly frames: FrameScheduler;
   /** 状态闸门 + 重建串行化（替代原来的 refreshing / pending / rebuilding / pendingRefresh） */
@@ -368,6 +406,18 @@ export class MindmapView extends ItemView {
         this.onNodeDrop(srcLine, targetLine, mode),
     });
 
+    // 用户滚轮缩放过之后，就不要再跟着容器尺寸自动适配了 ——
+    // 他已经把视角调到自己想要的位置，我们再去 fit 一次等于把它抢走。
+    // 用捕获阶段：d3-zoom 在 svg 上会 preventDefault，但事件仍会走到这里。
+    this.registerDomEvent(
+      canvas,
+      "wheel",
+      () => {
+        this.userView = true;
+      },
+      { capture: true, passive: true },
+    );
+
     // 初始没有导航，先置成隐藏，免得空容器占位
     this.renderBreadcrumb();
 
@@ -437,21 +487,48 @@ export class MindmapView extends ItemView {
   /**
    * 监听画布尺寸。
    *
-   * 首次适配完全依赖它：视图创建时右侧栏还在滑出，容器尺寸是 0，
-   * fitInstant 会挂起（pendingFit），等这里的尺寸真正就绪再补做，
-   * 否则就会「打开一片空白，点一下适配才出来」。
-   * 编辑框开着时尺寸变化要跟着重新对齐。
+   * 两个职责，以前只做了第一个：
+   * 1) 首帧适配的兜底：视图创建时右侧栏还在滑出、容器尺寸是 0，
+   *    fitInstant 会挂起（pendingFit），等这里尺寸真正就绪再补做；
+   * 2) **尺寸变化后跟随适配**：侧栏宽度被拖动、窗口缩放、编辑区关掉，
+   *    都会让可视区变小/变大。不重新适配的话，内容会整体偏到视口外 ——
+   *    看起来就是「打开是空白的」。用户自己缩放/平移过（userView）则不动他。
    */
   private observeSize(el: HTMLElement): void {
     this.resizeObserver?.disconnect();
     this.resizeObserver = new ResizeObserver(() => {
+      const w: number = el.clientWidth;
+      const h: number = el.clientHeight;
+      // 尺寸掉到 0（视图被隐藏、侧栏折叠）：标记待适配，
+      // 等它重新有尺寸时再补一次，否则切回来还是一张缩成点的图
+      if (w < MIN_VIEWPORT || h < MIN_VIEWPORT) {
+        this.pendingFit = true;
+        return;
+      }
       if (this.pendingFit) {
         void this.fitInstant();
         return;
       }
       if (this.rt.phase === "editing") this.editorHandle?.reposition();
+      if (!this.userView) this.requestAutoFit(w, h);
     });
     this.resizeObserver.observe(el);
+  }
+
+  /**
+   * 尺寸变化后安排一次适配（去抖）。
+   *
+   * 侧栏滑出/收起是 200ms 左右的过渡，ResizeObserver 会在过渡期间回调十几帧。
+   * 每帧都 fit 一遍纯属浪费，而且会把 markmap 的 zoom 反复重置。等它停下来再适配。
+   */
+  private requestAutoFit(w: number, h: number): void {
+    const prev = this.fittedSize;
+    if (prev && Math.abs(prev.w - w) < 4 && Math.abs(prev.h - h) < 4) return;
+    if (this.autoFitTimer !== 0) return;
+    this.autoFitTimer = window.setTimeout(() => {
+      this.autoFitTimer = 0;
+      void this.fitInstant();
+    }, 140);
   }
 
   /** 供插件在激活视图时指定要展示的笔记 */
@@ -609,8 +686,17 @@ export class MindmapView extends ItemView {
     void this.applyPlan(file, out.op);
   }
 
+  /**
+   * 「适配」按钮：无条件把内容缩放回可视区。
+   *
+   * 走 fitInstant 而不是 mm.fit()：
+   * - mm.fit() 带 180ms 过渡，点下去要等一下才到位；按钮的语义是「立刻归位」；
+   * - 顺带把 userView 清掉 —— 用户主动要求适配，就等于同意重新接受
+   *   「跟着容器尺寸自动适配」这件事。
+   */
   fitView(): void {
-    void this.mm?.fit();
+    this.userView = false;
+    void this.fitInstant();
   }
 
   /**
@@ -747,6 +833,24 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 画布空态提示。
+   *
+   * 只在「没有可显示的笔记」时出现。以前这种情况直接 return，画布是一片空白，
+   * 用户无法区分「没渲染」「渲染了但跑到视口外」「渲染器挂了」三种情况。
+   */
+  private showEmpty(text: string): void {
+    const canvas = this.canvasEl;
+    if (!canvas) return;
+    if (!this.emptyEl) this.emptyEl = canvas.createDiv({ cls: "obmind-empty" });
+    this.emptyEl.setText(text);
+    this.emptyEl.show();
+  }
+
+  private clearEmpty(): void {
+    this.emptyEl?.hide();
+  }
+
+  /**
    * 把代码块 / 公式块交给 Obsidian 自己的 MarkdownRenderer 渲染。
    *
    * 为什么不自己渲染：
@@ -844,29 +948,44 @@ export class MindmapView extends ItemView {
   /**
    * 无动画地把内容缩放适配到窗口。
    *
-   * 只在「首次打开」「切换笔记」时调用：
-   * - 打开时用无动画版，避免画面先缩一下；
-   * - 换笔记时必须重新适配（autoFit 已关，否则新笔记可能整个在视口外）。
+   * 调用时机：首次打开、切换笔记、容器尺寸变化、点「适配」。
    * 打字编辑时不调用，用户当前缩放/位置保持不变。
+   *
+   * 这里比「调一次 mm.fit()」多做了三件事，都是为了治「打开偶现空白」：
+   *
+   * 1) **量 svg，不量 canvas**。markmap 的 fit 用的是
+   *    `svg.getBoundingClientRect()`，我们却拿 canvas 的 clientWidth 判就绪。
+   *    两者在 flex 布局里不是同一时刻就绪的（svg 是 100%/100% 的块级子元素，
+   *    要等父级定宽高之后才有尺寸），判据错位就会在 svg 还是 0 的时候去 fit，
+   *    算出 scale = 0，整张图缩成一个点 —— 屏幕上就是空白。
+   *
+   * 2) **等尺寸稳定**。侧栏滑出是 200ms 过渡，中途会读到 60px 这种中间值。
+   *    在中间值上 fit，scale 按 60px 算出来极小，等容器长到 400px 就再也没有
+   *    人去重算 —— 于是图一直是一个缩在角落的小点。要求连续两帧尺寸一致才动手。
+   *
+   * 3) **fit 完自检**。fit 之后读一次实际缩放比例，如果小到只剩个点
+   *    （说明那一刻 markmap 的包围盒还没算出来，或者视口又被改了），
+   *    就把 pendingFit 置回 true 再排一次重试，而不是把空白留在屏幕上。
    */
-  private async fitInstant(): Promise<void> {
+  private async fitInstant(tries = 0): Promise<void> {
     const mm = this.mm;
     const el = this.svgEl;
-    if (!mm || !el) return;
-
-    // 视图刚打开时右侧栏还在滑出，容器尺寸可能还是 0。
-    // markmap 的 fit 直接取 svg.getBoundingClientRect()，宽高为 0 时
-    // scale = Math.min(0/宽, 0/高) = 0，整张图缩成一个点 —— 画面上就是一片空白，
-    // 直到用户手动点「适配」。这正是之前「打开是空白，点适配才有内容」的原因。
-    // 所以尺寸没就绪就先挂起，交给 ResizeObserver 在真正有尺寸时补做。
-    if (el.clientWidth < 8 || el.clientHeight < 8) {
-      this.pendingFit = true;
+    if (!mm || !el) {
+      // 视图已经关掉：顺手把标记清干净，别留一个永远等不到补做的 pendingFit
+      this.pendingFit = false;
       return;
     }
 
-    // 让浏览器把这一帧的布局跑完，避免拿到过渡动画中途的中间尺寸
-    await this.nextFrame();
-    if (this.svgEl !== el || this.mm !== mm) return;
+    const token: number = ++this.fitToken;
+    const size = await this.stableViewport(el, mm, token);
+    // 等待期间视图被重建 / 有更新的适配请求：这一轮作废
+    if (this.mm !== mm || this.svgEl !== el || token !== this.fitToken) return;
+
+    if (!size) {
+      this.pendingFit = true;
+      this.scheduleFitRetry(tries);
+      return;
+    }
 
     this.pendingFit = false;
     const prev: number = mm.options.duration;
@@ -876,6 +995,73 @@ export class MindmapView extends ItemView {
     } finally {
       mm.setOptions({ duration: prev });
     }
+    if (this.mm !== mm || this.svgEl !== el) return;
+
+    // 自检：fit 之后确认「包围盒有效 + 缩放有效」。
+    // 判据不用「缩放比例够大」—— 上千节点的图在窄侧栏里 scale 本来就只有 0.02，
+    // 那是正确结果不是故障。真正的故障是这两种：
+    //   · markmap 的包围盒还是空的（rect 宽高为 0）：内容全堆在原点，看上去一片空白；
+    //   · 视口尺寸为 0 时 fit 出来的 scale = 0：整张图缩成一个点。
+    if (!this.fitHealthy()) {
+      if (tries < 4) {
+        this.pendingFit = true;
+        this.scheduleFitRetry(tries);
+      }
+      return;
+    }
+    this.fittedSize = size;
+  }
+
+  /** fit 之后的自检：包围盒非空、缩放比例是有效正数 */
+  private fitHealthy(): boolean {
+    const mm = this.mm;
+    if (!mm) return false;
+    const r = mm.state.rect;
+    if (!r) return false;
+    const w: number = r.x2 - r.x1;
+    const h: number = r.y2 - r.y1;
+    const k: number = this.zoomScale();
+    return w > MIN_CONTENT && h > MIN_CONTENT && Number.isFinite(k) && k > 0;
+  }
+
+  /**
+   * 等到视口尺寸「既够大、又稳定」再返回。
+   *
+   * 判定逻辑在 render/viewport.ts（纯函数，可在 Node 里穷举时序）。
+   * 这里只负责把它接到真实的 DOM 与 markmap 实例上。
+   *
+   * @returns 稳定后的尺寸；等不到（仍是 0 或一直抖）返回 null
+   */
+  private async stableViewport(
+    el: SVGSVGElement,
+    mm: Markmap,
+    token: number,
+  ): Promise<{ w: number; h: number } | null> {
+    return waitStableSize({
+      read: () => {
+        const r: DOMRect = el.getBoundingClientRect();
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      },
+      nextFrame: () => this.nextFrame(),
+      // 等待期间视图被重建、或来了更新的适配请求：这一轮作废
+      stale: () => this.mm !== mm || this.svgEl !== el || token !== this.fitToken,
+      min: MIN_VIEWPORT,
+    });
+  }
+
+  /** 尺寸一直不达标时，隔一小段时间再试（最多 6 次，约 0.8s） */
+  private scheduleFitRetry(tries: number): void {
+    if (tries >= 6) return;
+    window.setTimeout(() => {
+      if (this.pendingFit) void this.fitInstant(tries + 1);
+    }, 120);
+  }
+
+  /** 当前画布的缩放比例。d3-zoom 把 transform 存在 svg 节点的 __zoom 上 */
+  private zoomScale(): number {
+    const el = this.svgEl as (SVGSVGElement & { __zoom?: { k?: number } }) | null;
+    const z = el?.__zoom;
+    return z && typeof z.k === "number" ? z.k : Number.NaN;
   }
 
   private nextFrame(): Promise<void> {
@@ -901,8 +1087,15 @@ export class MindmapView extends ItemView {
   private async project(rev: number, knownContent?: string): Promise<void> {
     if (this.themeSelect) this.themeSelect.value = this.plugin.settings.theme;
 
+    if (!this.svgEl) return;
     const file = this.resolveTargetFile();
-    if (!file || !this.svgEl) return;
+    // 没有可显示的笔记时别留一张纯白的画布 —— 用户分不清是「没渲染」还是
+    // 「渲染了但内容在视口外」。给一句人话，比让他去点「适配」猜强。
+    if (!file) {
+      this.showEmpty("没有可显示的笔记 —— 先在主区打开一篇 Markdown 笔记");
+      return;
+    }
+    this.clearEmpty();
 
     const prev = this.snapshot;
     const filter: boolean = this.plugin.settings.filterFrontmatter;
@@ -1021,7 +1214,12 @@ export class MindmapView extends ItemView {
       await restructure();
       // 换了一篇笔记才重新适配；同一篇里改内容保持用户的缩放与位置。
       // 导航跳转（面包屑 / 双链）也保持视口 —— 想回全览点「适配」。
-      if (!sameFile && !keepViewport) await this.fitInstant();
+      if (!sameFile && !keepViewport) {
+        // 新笔记 = 新的视口语境：恢复「跟着容器尺寸自动适配」
+        this.userView = false;
+        this.fittedSize = null;
+        await this.fitInstant();
+      }
     }
 
     this.flushPendingEdit();
@@ -1828,6 +2026,14 @@ export class MindmapView extends ItemView {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.pendingFit = false;
+    // 作废排队中的适配：定时器和 fitToken 两道都要清，
+    // 否则关闭后仍会有一次 fitInstant 摸到已经 destroy 的 markmap
+    this.fitToken++;
+    if (this.autoFitTimer !== 0) {
+      window.clearTimeout(this.autoFitTimer);
+      this.autoFitTimer = 0;
+    }
+    this.fittedSize = null;
     this.frames.cancel();
     this.painter.reset();
     this.mm?.destroy();
@@ -1848,6 +2054,7 @@ export class MindmapView extends ItemView {
     this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;
+    this.emptyEl = null;
     this.themeSelect = null;
   }
 }

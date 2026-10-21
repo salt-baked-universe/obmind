@@ -43,18 +43,21 @@ export interface SrcRef {
 }
 
 /**
- * 整块渲染的节点：围栏代码块、`$$…$$` 公式块。
+ * 整块渲染的节点：围栏代码块、`$$…$$` 公式块、GFM 表格。
  *
  * 不做行内渲染，也不挂 src —— 它们跨多行，回写时改一行就会把块拆坏，
  * 所以是只读的：双击、拖动都不作用在它们身上。
+ *
+ * 表格之所以按「块」处理而不是一行一个节点：表格的语义在**行与列的对齐**里，
+ * 拆成节点之后只剩一堆带 `|` 的碎片，既看不懂也没法排版。
  */
 export interface BlockInfo {
-  kind: "code" | "math";
-  /** 代码块的语言标识（```js 里的 js）；公式块为空串 */
+  kind: "code" | "math" | "table";
+  /** 代码块的语言标识（```js 里的 js）；公式块 / 表格为空串 */
   lang: string;
-  /** 块原文（含围栏），原样交给 Obsidian 的 MarkdownRenderer 渲染 */
+  /** 块原文（代码块含围栏），原样交给 Obsidian 的 MarkdownRenderer 渲染 */
   raw: string;
-  /** 起始 / 结束行号（0 基，含围栏行） */
+  /** 起始 / 结束行号（0 基，含围栏行 / 表头行） */
   startLine: number;
   endLine: number;
   /** 内容行数，用于占位文案 */

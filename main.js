@@ -4527,6 +4527,31 @@ function isFenceEnd(line, info) {
   const m = /^[ \t]*(`{3,}|~{3,})\s*$/.exec(line);
   return !!m && m[1][0] === info.marker[0] && m[1].length >= info.marker.length;
 }
+function tableCells(line) {
+  let s = line.trim();
+  if (s.startsWith("|"))
+    s = s.slice(1);
+  if (s.endsWith("|"))
+    s = s.slice(0, -1);
+  return s.split("|");
+}
+function isTableDelim(line) {
+  if (!line.includes("-"))
+    return false;
+  const cells = tableCells(line);
+  if (cells.length === 0)
+    return false;
+  return cells.every((c) => /^\s*:?-+:?\s*$/.test(c));
+}
+function tableCols(head, delim) {
+  if (!head.includes("|"))
+    return 0;
+  if (!delim.includes("|"))
+    return 0;
+  if (!isTableDelim(delim))
+    return 0;
+  return tableCells(head).length;
+}
 function dedentBlock(text, prefix) {
   const width = prefix.length;
   if (width === 0)
@@ -4666,6 +4691,52 @@ function buildTree(content, fileName, options) {
           full: line,
           marker: "",
           indent: fence.indent,
+          checked: null,
+          text: label,
+          heading: false,
+          level: null,
+          depth: 0
+        }
+      });
+      idx = end;
+      continue;
+    }
+    const cols = idx + 1 < allLines.length ? tableCols(line, allLines[idx + 1]) : 0;
+    if (cols > 0) {
+      let end = idx + 1;
+      for (let j2 = idx + 2; j2 < allLines.length; j2++) {
+        const l = allLines[j2];
+        if (l.trim() === "")
+          break;
+        if (!l.includes("|"))
+          break;
+        if (/^[ \t]*(?:[-*+]\s+|\d{1,9}[.)]\s+|#{1,6}\s+)/.test(l))
+          break;
+        end = j2;
+      }
+      const indentMatch = /^[ \t]*/.exec(line);
+      const indent = indentMatch ? indentMatch[0] : "";
+      const rows = end - idx - 1;
+      const label = `\u8868\u683C \xB7 ${cols} \u5217${rows > 0 ? ` \xB7 ${rows} \u884C` : ""}`;
+      raws.push({
+        text: label,
+        headingLevel: null,
+        block: {
+          kind: "table",
+          lang: "",
+          // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
+          raw: dedentBlock(allLines.slice(idx, end + 1).join("\n"), indent),
+          startLine: idx,
+          endLine: end,
+          lines: rows + 1
+        },
+        src: {
+          line: idx,
+          bodyStart: indent.length,
+          bodyEnd: line.length,
+          full: line,
+          marker: "",
+          indent,
           checked: null,
           text: label,
           heading: false,
@@ -5587,6 +5658,34 @@ var FrameScheduler = class {
     this.paths.clear();
   }
 };
+
+// src/render/viewport.ts
+async function waitStableSize(opts) {
+  var _a;
+  const { read, nextFrame, stale, min: min3 } = opts;
+  const limit = (_a = opts.frames) != null ? _a : 8;
+  const big = (s) => s.w >= min3 && s.h >= min3;
+  let last = read();
+  for (let i = 0; i < limit; i++) {
+    if (stale())
+      return null;
+    if (big(last)) {
+      await nextFrame();
+      if (stale())
+        return null;
+      const now2 = read();
+      if (now2.w === last.w && now2.h === last.h && big(now2))
+        return now2;
+      last = now2;
+      continue;
+    }
+    await nextFrame();
+    if (stale())
+      return null;
+    last = read();
+  }
+  return big(last) ? last : null;
+}
 
 // src/edit/folds.ts
 function isFolded(node) {
@@ -6992,6 +7091,8 @@ function clip(text, max3 = 18) {
   const plain = text.replace(/\s+/g, " ").trim();
   return plain.length <= max3 ? plain : `${plain.slice(0, max3)}\u2026`;
 }
+var MIN_VIEWPORT = 40;
+var MIN_CONTENT = 1;
 var MindmapView = class extends import_obsidian3.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -7003,6 +7104,26 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.resizeObserver = null;
     /** 尺寸还没就绪时挂起的首次适配请求 */
     this.pendingFit = false;
+    /**
+     * 上一次「适配」时的视口尺寸。
+     *
+     * 有了它才能区分「尺寸变了」和「尺寸没变」：ResizeObserver 会因为
+     * 一个像素的变化反复回调，每次都重新 fit 会把用户的视口按住不放。
+     */
+    this.fittedSize = null;
+    /**
+     * 用户是否自己动过视口（滚轮缩放 / 拖动平移）。
+     *
+     * 动过之后就不再跟随容器尺寸自动适配 —— 用户已经摆好了位置，
+     * 我们再去 fit 一次等于把他刚调好的视角抢走。点「适配」按钮会把它清掉。
+     */
+    this.userView = false;
+    /** 适配请求的版本号：新的请求作废还在等尺寸的旧请求 */
+    this.fitToken = 0;
+    /** 自动适配的去抖定时器（0 表示没有排队） */
+    this.autoFitTimer = 0;
+    /** 画布空态提示（没有可显示的笔记时） */
+    this.emptyEl = null;
     this.painter = new NodePainter();
     this.currentSpec = null;
     // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
@@ -7218,6 +7339,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
       srcOf: (g) => this.srcOf(g),
       onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(srcLine, targetLine, mode)
     });
+    this.registerDomEvent(
+      canvas,
+      "wheel",
+      () => {
+        this.userView = true;
+      },
+      { capture: true, passive: true }
+    );
     this.renderBreadcrumb();
     this.registerDomEvent(document, "click", (e) => {
       if (!this.helpPanel || this.helpPanel.hasClass("is-hidden"))
@@ -7281,24 +7410,51 @@ var MindmapView = class extends import_obsidian3.ItemView {
   /**
    * 监听画布尺寸。
    *
-   * 首次适配完全依赖它：视图创建时右侧栏还在滑出，容器尺寸是 0，
-   * fitInstant 会挂起（pendingFit），等这里的尺寸真正就绪再补做，
-   * 否则就会「打开一片空白，点一下适配才出来」。
-   * 编辑框开着时尺寸变化要跟着重新对齐。
+   * 两个职责，以前只做了第一个：
+   * 1) 首帧适配的兜底：视图创建时右侧栏还在滑出、容器尺寸是 0，
+   *    fitInstant 会挂起（pendingFit），等这里尺寸真正就绪再补做；
+   * 2) **尺寸变化后跟随适配**：侧栏宽度被拖动、窗口缩放、编辑区关掉，
+   *    都会让可视区变小/变大。不重新适配的话，内容会整体偏到视口外 ——
+   *    看起来就是「打开是空白的」。用户自己缩放/平移过（userView）则不动他。
    */
   observeSize(el) {
     var _a;
     (_a = this.resizeObserver) == null ? void 0 : _a.disconnect();
     this.resizeObserver = new ResizeObserver(() => {
       var _a2;
+      const w = el.clientWidth;
+      const h2 = el.clientHeight;
+      if (w < MIN_VIEWPORT || h2 < MIN_VIEWPORT) {
+        this.pendingFit = true;
+        return;
+      }
       if (this.pendingFit) {
         void this.fitInstant();
         return;
       }
       if (this.rt.phase === "editing")
         (_a2 = this.editorHandle) == null ? void 0 : _a2.reposition();
+      if (!this.userView)
+        this.requestAutoFit(w, h2);
     });
     this.resizeObserver.observe(el);
+  }
+  /**
+   * 尺寸变化后安排一次适配（去抖）。
+   *
+   * 侧栏滑出/收起是 200ms 左右的过渡，ResizeObserver 会在过渡期间回调十几帧。
+   * 每帧都 fit 一遍纯属浪费，而且会把 markmap 的 zoom 反复重置。等它停下来再适配。
+   */
+  requestAutoFit(w, h2) {
+    const prev = this.fittedSize;
+    if (prev && Math.abs(prev.w - w) < 4 && Math.abs(prev.h - h2) < 4)
+      return;
+    if (this.autoFitTimer !== 0)
+      return;
+    this.autoFitTimer = window.setTimeout(() => {
+      this.autoFitTimer = 0;
+      void this.fitInstant();
+    }, 140);
   }
   /** 供插件在激活视图时指定要展示的笔记 */
   setTargetFile(file) {
@@ -7441,9 +7597,17 @@ var MindmapView = class extends import_obsidian3.ItemView {
     }
     void this.applyPlan(file, out.op);
   }
+  /**
+   * 「适配」按钮：无条件把内容缩放回可视区。
+   *
+   * 走 fitInstant 而不是 mm.fit()：
+   * - mm.fit() 带 180ms 过渡，点下去要等一下才到位；按钮的语义是「立刻归位」；
+   * - 顺带把 userView 清掉 —— 用户主动要求适配，就等于同意重新接受
+   *   「跟着容器尺寸自动适配」这件事。
+   */
   fitView() {
-    var _a;
-    void ((_a = this.mm) == null ? void 0 : _a.fit());
+    this.userView = false;
+    void this.fitInstant();
   }
   /**
    * 全部折叠 / 全部展开。
@@ -7574,6 +7738,25 @@ var MindmapView = class extends import_obsidian3.ItemView {
     return this.app.vault.read(file);
   }
   /**
+   * 画布空态提示。
+   *
+   * 只在「没有可显示的笔记」时出现。以前这种情况直接 return，画布是一片空白，
+   * 用户无法区分「没渲染」「渲染了但跑到视口外」「渲染器挂了」三种情况。
+   */
+  showEmpty(text) {
+    const canvas = this.canvasEl;
+    if (!canvas)
+      return;
+    if (!this.emptyEl)
+      this.emptyEl = canvas.createDiv({ cls: "obmind-empty" });
+    this.emptyEl.setText(text);
+    this.emptyEl.show();
+  }
+  clearEmpty() {
+    var _a;
+    (_a = this.emptyEl) == null ? void 0 : _a.hide();
+  }
+  /**
    * 把代码块 / 公式块交给 Obsidian 自己的 MarkdownRenderer 渲染。
    *
    * 为什么不自己渲染：
@@ -7666,23 +7849,41 @@ var MindmapView = class extends import_obsidian3.ItemView {
   /**
    * 无动画地把内容缩放适配到窗口。
    *
-   * 只在「首次打开」「切换笔记」时调用：
-   * - 打开时用无动画版，避免画面先缩一下；
-   * - 换笔记时必须重新适配（autoFit 已关，否则新笔记可能整个在视口外）。
+   * 调用时机：首次打开、切换笔记、容器尺寸变化、点「适配」。
    * 打字编辑时不调用，用户当前缩放/位置保持不变。
+   *
+   * 这里比「调一次 mm.fit()」多做了三件事，都是为了治「打开偶现空白」：
+   *
+   * 1) **量 svg，不量 canvas**。markmap 的 fit 用的是
+   *    `svg.getBoundingClientRect()`，我们却拿 canvas 的 clientWidth 判就绪。
+   *    两者在 flex 布局里不是同一时刻就绪的（svg 是 100%/100% 的块级子元素，
+   *    要等父级定宽高之后才有尺寸），判据错位就会在 svg 还是 0 的时候去 fit，
+   *    算出 scale = 0，整张图缩成一个点 —— 屏幕上就是空白。
+   *
+   * 2) **等尺寸稳定**。侧栏滑出是 200ms 过渡，中途会读到 60px 这种中间值。
+   *    在中间值上 fit，scale 按 60px 算出来极小，等容器长到 400px 就再也没有
+   *    人去重算 —— 于是图一直是一个缩在角落的小点。要求连续两帧尺寸一致才动手。
+   *
+   * 3) **fit 完自检**。fit 之后读一次实际缩放比例，如果小到只剩个点
+   *    （说明那一刻 markmap 的包围盒还没算出来，或者视口又被改了），
+   *    就把 pendingFit 置回 true 再排一次重试，而不是把空白留在屏幕上。
    */
-  async fitInstant() {
+  async fitInstant(tries = 0) {
     const mm = this.mm;
     const el = this.svgEl;
-    if (!mm || !el)
-      return;
-    if (el.clientWidth < 8 || el.clientHeight < 8) {
-      this.pendingFit = true;
+    if (!mm || !el) {
+      this.pendingFit = false;
       return;
     }
-    await this.nextFrame();
-    if (this.svgEl !== el || this.mm !== mm)
+    const token = ++this.fitToken;
+    const size = await this.stableViewport(el, mm, token);
+    if (this.mm !== mm || this.svgEl !== el || token !== this.fitToken)
       return;
+    if (!size) {
+      this.pendingFit = true;
+      this.scheduleFitRetry(tries);
+      return;
+    }
     this.pendingFit = false;
     const prev = mm.options.duration;
     mm.setOptions({ duration: 0 });
@@ -7691,6 +7892,64 @@ var MindmapView = class extends import_obsidian3.ItemView {
     } finally {
       mm.setOptions({ duration: prev });
     }
+    if (this.mm !== mm || this.svgEl !== el)
+      return;
+    if (!this.fitHealthy()) {
+      if (tries < 4) {
+        this.pendingFit = true;
+        this.scheduleFitRetry(tries);
+      }
+      return;
+    }
+    this.fittedSize = size;
+  }
+  /** fit 之后的自检：包围盒非空、缩放比例是有效正数 */
+  fitHealthy() {
+    const mm = this.mm;
+    if (!mm)
+      return false;
+    const r = mm.state.rect;
+    if (!r)
+      return false;
+    const w = r.x2 - r.x1;
+    const h2 = r.y2 - r.y1;
+    const k = this.zoomScale();
+    return w > MIN_CONTENT && h2 > MIN_CONTENT && Number.isFinite(k) && k > 0;
+  }
+  /**
+   * 等到视口尺寸「既够大、又稳定」再返回。
+   *
+   * 判定逻辑在 render/viewport.ts（纯函数，可在 Node 里穷举时序）。
+   * 这里只负责把它接到真实的 DOM 与 markmap 实例上。
+   *
+   * @returns 稳定后的尺寸；等不到（仍是 0 或一直抖）返回 null
+   */
+  async stableViewport(el, mm, token) {
+    return waitStableSize({
+      read: () => {
+        const r = el.getBoundingClientRect();
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      },
+      nextFrame: () => this.nextFrame(),
+      // 等待期间视图被重建、或来了更新的适配请求：这一轮作废
+      stale: () => this.mm !== mm || this.svgEl !== el || token !== this.fitToken,
+      min: MIN_VIEWPORT
+    });
+  }
+  /** 尺寸一直不达标时，隔一小段时间再试（最多 6 次，约 0.8s） */
+  scheduleFitRetry(tries) {
+    if (tries >= 6)
+      return;
+    window.setTimeout(() => {
+      if (this.pendingFit)
+        void this.fitInstant(tries + 1);
+    }, 120);
+  }
+  /** 当前画布的缩放比例。d3-zoom 把 transform 存在 svg 节点的 __zoom 上 */
+  zoomScale() {
+    const el = this.svgEl;
+    const z = el == null ? void 0 : el.__zoom;
+    return z && typeof z.k === "number" ? z.k : Number.NaN;
   }
   nextFrame() {
     return new Promise((resolve) => {
@@ -7713,9 +7972,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
     var _a, _b;
     if (this.themeSelect)
       this.themeSelect.value = this.plugin.settings.theme;
-    const file = this.resolveTargetFile();
-    if (!file || !this.svgEl)
+    if (!this.svgEl)
       return;
+    const file = this.resolveTargetFile();
+    if (!file) {
+      this.showEmpty("\u6CA1\u6709\u53EF\u663E\u793A\u7684\u7B14\u8BB0 \u2014\u2014 \u5148\u5728\u4E3B\u533A\u6253\u5F00\u4E00\u7BC7 Markdown \u7B14\u8BB0");
+      return;
+    }
+    this.clearEmpty();
     const prev = this.snapshot;
     const filter2 = this.plugin.settings.filterFrontmatter;
     const doc = knownContent === void 0 ? await this.query.load(file.path, file.basename, { filterFrontmatter: filter2 }) : this.query.parse(knownContent, file.basename, { filterFrontmatter: filter2 });
@@ -7797,8 +8061,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
         filterFrontmatter: filter2
       };
       await restructure();
-      if (!sameFile && !keepViewport)
+      if (!sameFile && !keepViewport) {
+        this.userView = false;
+        this.fittedSize = null;
         await this.fitInstant();
+      }
     }
     this.flushPendingEdit();
   }
@@ -8504,6 +8771,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
     (_c = this.resizeObserver) == null ? void 0 : _c.disconnect();
     this.resizeObserver = null;
     this.pendingFit = false;
+    this.fitToken++;
+    if (this.autoFitTimer !== 0) {
+      window.clearTimeout(this.autoFitTimer);
+      this.autoFitTimer = 0;
+    }
+    this.fittedSize = null;
     this.frames.cancel();
     this.painter.reset();
     (_d = this.mm) == null ? void 0 : _d.destroy();
@@ -8524,6 +8797,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;
+    this.emptyEl = null;
     this.themeSelect = null;
   }
 };

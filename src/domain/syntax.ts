@@ -56,6 +56,38 @@ function isFenceEnd(line: string, info: FenceInfo): boolean {
   return !!m && m[1][0] === info.marker[0] && m[1].length >= info.marker.length;
 }
 
+/** 把一行表格按竖线切开，去掉首尾可选的外框竖线 */
+function tableCells(line: string): string[] {
+  let s: string = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|");
+}
+
+/** 表格的分隔行：`| --- | :--: |`，每段只能是 `:?-+:?` */
+function isTableDelim(line: string): boolean {
+  if (!line.includes("-")) return false;
+  const cells: string[] = tableCells(line);
+  if (cells.length === 0) return false;
+  return cells.every((c: string) => /^\s*:?-+:?\s*$/.test(c));
+}
+
+/**
+ * 判断某一行是否是 GFM 表格的表头行（下一行必须是分隔行），返回列数。
+ *
+ * 为什么要多看一眼分隔行：正文里带竖线的行非常常见（`a | b`、
+ * `x || y`），只看本行会把它们误当成表格，整段正文就变成一张单行表格。
+ * 反过来，像 `a | b` 后面紧跟 `---` 这种「裸管道 + 分隔线」的写法，
+ * 与「正文 + 分隔线」在字面上无法区分，因此要求分隔行自身带竖线
+ * （`--- | ---` / `| --- |`）才认成表格。
+ */
+function tableCols(head: string, delim: string): number {
+  if (!head.includes("|")) return 0;
+  if (!delim.includes("|")) return 0;
+  if (!isTableDelim(delim)) return 0;
+  return tableCells(head).length;
+}
+
 /**
  * 去掉块整体的缩进。
  *
@@ -278,6 +310,59 @@ export function buildTree(
           full: line,
           marker: "",
           indent: fence.indent,
+          checked: null,
+          text: label,
+          heading: false,
+          level: null,
+          depth: 0,
+        },
+      });
+
+      idx = end;
+      continue;
+    }
+
+    // GFM 表格：头行 + 分隔行，整块收成一个只读节点。
+    // 表格的信息在「行与列的对齐」里，拆成一行一个节点之后只剩一堆带竖线的碎片，
+    // 既看不出关系、也没法排版，所以和代码块一样按块交给 MarkdownRenderer。
+    const cols: number =
+      idx + 1 < allLines.length ? tableCols(line, allLines[idx + 1]) : 0;
+    if (cols > 0) {
+      // 表格到空行、或不再含竖线的行为止；顺手挡住列表项 / 标题，
+      // 否则紧跟着表格的 `- 说明` 会被吸进最后一行单元格。
+      let end: number = idx + 1;
+      for (let j = idx + 2; j < allLines.length; j++) {
+        const l: string = allLines[j];
+        if (l.trim() === "") break;
+        if (!l.includes("|")) break;
+        if (/^[ \t]*(?:[-*+]\s+|\d{1,9}[.)]\s+|#{1,6}\s+)/.test(l)) break;
+        end = j;
+      }
+
+      const indentMatch: RegExpMatchArray | null = /^[ \t]*/.exec(line);
+      const indent: string = indentMatch ? indentMatch[0] : "";
+      const rows: number = end - idx - 1;
+      const label: string = `表格 · ${cols} 列${rows > 0 ? ` · ${rows} 行` : ""}`;
+
+      raws.push({
+        text: label,
+        headingLevel: null,
+        block: {
+          kind: "table",
+          lang: "",
+          // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
+          raw: dedentBlock(allLines.slice(idx, end + 1).join("\n"), indent),
+          startLine: idx,
+          endLine: end,
+          lines: rows + 1,
+        },
+        src: {
+          line: idx,
+          bodyStart: indent.length,
+          bodyEnd: line.length,
+          full: line,
+          marker: "",
+          indent,
           checked: null,
           text: label,
           heading: false,
