@@ -11,6 +11,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "markmap-common": "^0.18.0",
     "markmap-lib": "^0.18.0",
     "markmap-view": "^0.18.0",
     "obsidian": "^1.4.0"

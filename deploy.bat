@@ -16,6 +16,7 @@ if not exist "%DST%" mkdir "%DST%"
 
 copy /Y "%SRC%\manifest.json" "%DST%" >nul && echo [ok] manifest.json
 copy /Y "%SRC%\main.js" "%DST%" >nul && echo [ok] main.js
+copy /Y "%SRC%\styles.css" "%DST%" >nul && echo [ok] styles.css
 
 echo.
 echo Deployed to: %DST%

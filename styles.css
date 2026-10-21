@@ -1,0 +1,85 @@
+/* obmind: 思维导图视图 */
+
+.obmind-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+
+.obmind-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+
+.obmind-toolbar select.dropdown {
+  min-width: 110px;
+  height: 26px;
+}
+
+.obmind-toolbar .obmind-refresh {
+  height: 26px;
+  padding: 0 10px;
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.obmind-canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  transition: background-color 0.18s ease;
+}
+
+.obmind-canvas .markmap {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* 节点卡片：由 JS 在每个节点的 <g> 里插入一个 <rect> 绘制。
+   放在 <g> 内用局部坐标，自动跟随节点的位移/缩放，不依赖 markmap 内部的 DOM 结构。 */
+.obmind-canvas .obmind-node-card {
+  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.18));
+  transition: fill 0.18s ease, opacity 0.18s ease;
+}
+
+.markmap-dark .obmind-node-card {
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+}
+
+/* markmap 自带的连线接在节点底边（像"线贴在卡片下面"），且无法通过选项改成
+   连到垂直中心，因此隐藏它，改由 JS 在每个节点 g 内自绘 XMind 风格的曲线。 */
+.obmind-canvas path.markmap-link {
+  display: none !important;
+}
+
+/* markmap 还会给每个节点画一条下划线（就是最初"线托着文字"的那条）：
+   位置在内容底部，正好横在卡片内部。现在有卡片了，必须隐藏。 */
+.obmind-canvas g.markmap-node > line {
+  display: none !important;
+}
+
+/* 自绘连线：从父卡片右边缘中点弯到子卡片左边缘中点 */
+.obmind-canvas .obmind-node-link {
+  stroke-width: var(--obmind-link-width, 2);
+  transition: stroke 0.18s ease;
+  pointer-events: none;
+}
+
+/* 双链 / 外链：跟随节点文字色，避免实色卡片上蓝色链接看不清 */
+.obmind-canvas .markmap-foreign a {
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
+  opacity: 0.95;
+}
+
+.obmind-canvas .markmap-foreign a:hover {
+  opacity: 1;
+  text-decoration-thickness: 2px;
+}
