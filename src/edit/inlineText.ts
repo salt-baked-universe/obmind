@@ -6,8 +6,9 @@
  * 往里塞任何输入元素都会把布局撑歪；而且它每次 render 都会重建 foreignObject
  * 的内部 DOM，contenteditable 会连同光标一起被冲掉。
  *
- * 所以编辑框挂在画布 div 上（absolute 定位），位置从 foreignObject 的屏幕矩形换算，
- * 再用 transform: scale(k) 抵消画布缩放——字号、行高、换行位置都和卡片里完全一致。
+ * 所以编辑框挂在画布 div 上（absolute 定位），位置与大小从**卡片外框**的屏幕矩形换算
+ * （卡片左右内边距大，只盖文字盒会露出两层边），再用 transform: scale(k) 抵消画布缩放——
+ * 字号、行高、换行位置都和卡片里完全一致。
  */
 
 import type { ThemeSpec } from "../theme";
@@ -29,6 +30,23 @@ export interface InlineEditorHandle {
   close: () => void;
   /** 画布缩放/尺寸变化后重新对齐 */
   reposition: () => void;
+}
+
+/**
+ * 卡片在文字盒四周的内边距（节点局部单位）。
+ * 卡片以文字盒为中心对称外扩，所以直接用宽高差的一半，不必去读 x/y 属性。
+ * 属性缺失（例如卡片还没画出来）时退回 0，编辑框就只盖文字，行为与旧版一致。
+ */
+function cardPad(
+  fo: SVGForeignObjectElement,
+  card: SVGRectElement | null,
+): { x: number; y: number } {
+  const fw: number = Number.parseFloat(fo.getAttribute("width") ?? "0");
+  const fh: number = Number.parseFloat(fo.getAttribute("height") ?? "0");
+  const cw: number = Number.parseFloat(card?.getAttribute("width") ?? "0");
+  const ch: number = Number.parseFloat(card?.getAttribute("height") ?? "0");
+  if (!(cw > fw) || !(ch > fh)) return { x: 0, y: 0 };
+  return { x: (cw - fw) / 2, y: (ch - fh) / 2 };
 }
 
 export function openInlineEditor(options: InlineEditorOptions): InlineEditorHandle | null {
@@ -83,17 +101,23 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     const rawH: number = Number.parseFloat(fo.getAttribute("height") ?? "") || rect.height;
     const scale: number = rawW > 0 ? rect.width / rawW : 1;
 
-    ta.style.left = `${rect.left - base.left}px`;
-    ta.style.top = `${rect.top - base.top}px`;
+    // 编辑框要盖住**整张卡片**，而不只是文字盒——卡片左右各有十几像素内边距，
+    // 只盖文字的话，一进编辑态卡片左右两侧会露出原色，像「框套框」。
+    // 内边距按卡片与文字盒的差值算，文字位置与卡片里逐像素对齐。
+    const pad = cardPad(fo, card);
+
+    ta.style.left = `${rect.left - base.left - pad.x * scale}px`;
+    ta.style.top = `${rect.top - base.top - pad.y * scale}px`;
     // +2 的容差：markmap 的节点宽是 scrollWidth 取整后的值，
     // 真实文字宽度可能多零点几像素。宽度卡得太死，textarea 会多折一行，
-    // 编辑框就比卡片高一截。
-    ta.style.width = `${rawW + 2}px`;
+    // 编辑框就比卡片高一截。（加在内边距之外，不影响换行位置）
+    ta.style.width = `${rawW + pad.x * 2 + 2}px`;
+    ta.style.padding = `${pad.y}px ${pad.x}px`;
     ta.style.transform = `scale(${scale})`;
 
     // 高度按内容自适应，但不小于原来的卡片高度，避免一打开就矮一截
     ta.style.height = "1px";
-    const needed: number = Math.max(rawH, ta.scrollHeight);
+    const needed: number = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
   };
 

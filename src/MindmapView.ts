@@ -73,6 +73,8 @@ export class MindmapView extends ItemView {
   private editing = false;
   private editorHandle: InlineEditorHandle | null = null;
   private pendingRefresh = false;
+  // 重建导图期间暂停绘制：这段时间的 DOM 是半成品，画出来的线必然错
+  private rebuilding = false;
   // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
   private indentStep = 2;
   private indentUnit = "  ";
@@ -257,6 +259,10 @@ export class MindmapView extends ItemView {
 
   /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
   private requestPaint(mode: "all" | "links", paths?: Set<string>): void {
+    // 重建导图期间不画：此刻 DOM 是半成品（新节点的 g 可能还没拿到 transform，
+    // 卡片/连线还挂在被复用的旧 g 上），画出来必然是错的。重建结束后统一同步全量画一次。
+    if (this.rebuilding) return;
+
     if (mode === "all") {
       this.paintMode = "all";
       this.paintPaths.clear();
@@ -283,6 +289,88 @@ export class MindmapView extends ItemView {
       this.paintMode = "links";
       this.paintPaths.clear();
     });
+  }
+
+  /**
+   * 立刻同步画一遍，不等 rAF。
+   *
+   * 重建之后必须抢在浏览器绘制这一帧之前把卡片和连线摆正，否则会先画出一帧
+   * 「新位置的节点 + 旧父节点的连线」，看起来就是线闪一下。
+   */
+  private paintAllSync(): void {
+    const svg = this.svgEl;
+    const spec = this.currentSpec;
+    if (this.paintFrame) {
+      window.cancelAnimationFrame(this.paintFrame);
+      this.paintFrame = 0;
+    }
+    this.paintMode = "links";
+    this.paintPaths.clear();
+    if (!svg || !spec) return;
+    this.painter.paintAll(svg, spec);
+  }
+
+  /**
+   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
+   *
+   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
+   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
+   *    过渡期间旧连线是从「错的父节点」出发的；
+   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
+   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
+   *
+   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
+   * 紧跟着同步重绘一次（paintAllSync），整个过程在一帧内结束，不会播出中间态。
+   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
+   * 这里只临时改了本次 setData 的 duration。
+   */
+  private async applyTree(tree: IPureNode): Promise<void> {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg) return;
+
+    this.rebuilding = true;
+    const prev: number = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.setData(tree);
+      // 旧节点是走 transition 移除的，即使 duration=0 也要等一个 tick。
+      // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
+      // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
+      this.dropDetached();
+      // 结构变了，缓存的 g/元素引用可能已经对应到别的节点上，全部作废重来
+      this.painter.reset();
+      this.paintAllSync();
+    } finally {
+      mm.setOptions({ duration: prev });
+      this.rebuilding = false;
+    }
+  }
+
+  /**
+   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
+   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
+   *
+   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
+   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
+   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
+   */
+  private dropDetached(): void {
+    const svg = this.svgEl;
+    const root = this.mm?.state.data;
+    if (!svg || !root) return;
+
+    const alive = new Set<unknown>();
+    const walk = (n: INode): void => {
+      alive.add(n);
+      for (const c of n.children ?? []) walk(c);
+    };
+    walk(root);
+
+    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+      const data: unknown = (g as SVGGElement & { __data__?: unknown }).__data__;
+      if (!data || !alive.has(data)) g.remove();
+    }
   }
 
   /** 供插件在激活视图时指定要展示的笔记 */
@@ -487,19 +575,16 @@ export class MindmapView extends ItemView {
         // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
         this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
         this.appliedThemeKey = themeKey;
-        await this.mm.setData(tree);
-        this.painter.reset();
-        this.requestPaint("all");
+        await this.applyTree(tree);
         await this.fitInstant();
       } else {
-        // setOptions 只在主题变化时调用：它会触发一次重新渲染，没必要每次都做
+        // 主题变了才需要换一整套绘制选项（线宽、字号、maxWidth）。
+        // setOptions 只合并选项、不渲染，但会重绑一次 zoom 手势，没必要每次重建都调。
         if (themeKey !== this.appliedThemeKey) {
           this.mm.setOptions(this.buildOptions(spec));
           this.appliedThemeKey = themeKey;
         }
-        await this.mm.setData(tree);
-        this.painter.reset();
-        this.requestPaint("all");
+        await this.applyTree(tree);
         // 换了一篇笔记才重新适配；同一篇里改内容保持用户的缩放与位置
         if (fileChanged) await this.fitInstant();
       }

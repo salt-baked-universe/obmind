@@ -103,8 +103,10 @@ export function readNodeBox(g: SVGGElement): NodeBox | null {
     oy: origin.y,
     w,
     h,
-    // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）
-    padX: depth === 0 ? 12 : 9,
+    // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）。
+    // 左右留得比上下宽：中文节点在 XMind 里就是左右宽松、上下紧凑，
+    // 文字贴边会显得局促，也让人误以为卡片只是「文字外面套了个框」。
+    padX: depth === 0 ? 20 : 16,
     padY: depth === 0 ? 7 : 5,
   };
 }

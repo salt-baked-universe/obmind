@@ -4975,8 +4975,10 @@ function readNodeBox(g) {
     oy: origin.y,
     w,
     h: h2,
-    // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）
-    padX: depth === 0 ? 12 : 9,
+    // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）。
+    // 左右留得比上下宽：中文节点在 XMind 里就是左右宽松、上下紧凑，
+    // 文字贴边会显得局促，也让人误以为卡片只是「文字外面套了个框」。
+    padX: depth === 0 ? 20 : 16,
     padY: depth === 0 ? 7 : 5
   };
 }
@@ -5286,6 +5288,16 @@ function applyFolds(root2, folded) {
 }
 
 // src/edit/inlineText.ts
+function cardPad(fo, card) {
+  var _a, _b, _c, _d;
+  const fw = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "0");
+  const fh = Number.parseFloat((_b = fo.getAttribute("height")) != null ? _b : "0");
+  const cw = Number.parseFloat((_c = card == null ? void 0 : card.getAttribute("width")) != null ? _c : "0");
+  const ch = Number.parseFloat((_d = card == null ? void 0 : card.getAttribute("height")) != null ? _d : "0");
+  if (!(cw > fw) || !(ch > fh))
+    return { x: 0, y: 0 };
+  return { x: (cw - fw) / 2, y: (ch - fh) / 2 };
+}
 function openInlineEditor(options) {
   var _a, _b;
   const { container, target, spec } = options;
@@ -5330,12 +5342,14 @@ function openInlineEditor(options) {
     const rawW = Number.parseFloat((_a2 = fo.getAttribute("width")) != null ? _a2 : "") || rect.width;
     const rawH = Number.parseFloat((_b2 = fo.getAttribute("height")) != null ? _b2 : "") || rect.height;
     const scale = rawW > 0 ? rect.width / rawW : 1;
-    ta.style.left = `${rect.left - base.left}px`;
-    ta.style.top = `${rect.top - base.top}px`;
-    ta.style.width = `${rawW + 2}px`;
+    const pad = cardPad(fo, card);
+    ta.style.left = `${rect.left - base.left - pad.x * scale}px`;
+    ta.style.top = `${rect.top - base.top - pad.y * scale}px`;
+    ta.style.width = `${rawW + pad.x * 2 + 2}px`;
+    ta.style.padding = `${pad.y}px ${pad.x}px`;
     ta.style.transform = `scale(${scale})`;
     ta.style.height = "1px";
-    const needed = Math.max(rawH, ta.scrollHeight);
+    const needed = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
   };
   let frame2 = 0;
@@ -5633,15 +5647,29 @@ var DragController = class {
   nodeAt(el) {
     return el.closest("g.markmap-node");
   }
+  /**
+   * 目标节点的**卡片外框**（屏幕坐标）。
+   *
+   * 判定必须用卡片而不是 foreignObject：foreignObject 只是文字盒，卡片左右还各有
+   * 16px 内边距，按文字盒判定的话这些区域点上去毫无反应，「拖不准」就是这么来的。
+   * 卡片是节点 g 内的自绘 rect，getBoundingClientRect 已经把画布缩放与平移算进去了。
+   */
+  cardBoxOf(g) {
+    var _a;
+    const card = g.querySelector(":scope > rect.obmind-node-card");
+    const el = (_a = card != null ? card : g.querySelector("foreignObject")) != null ? _a : g;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0)
+      return null;
+    return r;
+  }
   /** 找鼠标下方的目标节点，并按纵向位置决定「子节点 / 前面 / 后面」 */
   hitTest(x2, y2) {
-    var _a;
     let best = null;
     let bestArea = Infinity;
     for (const g of this.candidates) {
-      const fo = (_a = g.querySelector("foreignObject")) != null ? _a : g;
-      const r = fo.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0)
+      const r = this.cardBoxOf(g);
+      if (!r)
         continue;
       if (x2 < r.left || x2 > r.right || y2 < r.top || y2 > r.bottom)
         continue;
@@ -5671,7 +5699,6 @@ var DragController = class {
     this.line = line;
   }
   renderHint() {
-    var _a;
     const box = this.box;
     const line = this.line;
     if (!box || !line)
@@ -5681,25 +5708,29 @@ var DragController = class {
       line.style.display = "none";
       return;
     }
-    const fo = (_a = this.target.g.querySelector("foreignObject")) != null ? _a : this.target.g;
-    const r = fo.getBoundingClientRect();
+    const r = this.cardBoxOf(this.target.g);
+    if (!r) {
+      box.style.display = "none";
+      line.style.display = "none";
+      return;
+    }
     const base = this.container.getBoundingClientRect();
     const left = r.left - base.left;
     const top = r.top - base.top;
     if (this.target.mode === "child") {
       box.style.display = "block";
-      box.style.left = `${left - 3}px`;
-      box.style.top = `${top - 3}px`;
-      box.style.width = `${r.width + 6}px`;
-      box.style.height = `${r.height + 6}px`;
+      box.style.left = `${left - 2}px`;
+      box.style.top = `${top - 2}px`;
+      box.style.width = `${r.width + 4}px`;
+      box.style.height = `${r.height + 4}px`;
       line.style.display = "none";
       return;
     }
     box.style.display = "none";
     line.style.display = "block";
-    line.style.left = `${left - 3}px`;
-    line.style.width = `${r.width + 6}px`;
-    line.style.top = `${this.target.mode === "before" ? top - 2 : top + r.height}px`;
+    line.style.left = `${left}px`;
+    line.style.width = `${r.width}px`;
+    line.style.top = `${this.target.mode === "before" ? top - 4 : top + r.height + 1}px`;
   }
   reset() {
     var _a;
@@ -5959,6 +5990,8 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.editing = false;
     this.editorHandle = null;
     this.pendingRefresh = false;
+    // 重建导图期间暂停绘制：这段时间的 DOM 是半成品，画出来的线必然错
+    this.rebuilding = false;
     // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
     this.indentStep = 2;
     this.indentUnit = "  ";
@@ -6114,6 +6147,8 @@ var MindmapView = class extends import_obsidian2.ItemView {
   }
   /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
   requestPaint(mode, paths) {
+    if (this.rebuilding)
+      return;
     if (mode === "all") {
       this.paintMode = "all";
       this.paintPaths.clear();
@@ -6141,6 +6176,85 @@ var MindmapView = class extends import_obsidian2.ItemView {
       this.paintMode = "links";
       this.paintPaths.clear();
     });
+  }
+  /**
+   * 立刻同步画一遍，不等 rAF。
+   *
+   * 重建之后必须抢在浏览器绘制这一帧之前把卡片和连线摆正，否则会先画出一帧
+   * 「新位置的节点 + 旧父节点的连线」，看起来就是线闪一下。
+   */
+  paintAllSync() {
+    const svg = this.svgEl;
+    const spec = this.currentSpec;
+    if (this.paintFrame) {
+      window.cancelAnimationFrame(this.paintFrame);
+      this.paintFrame = 0;
+    }
+    this.paintMode = "links";
+    this.paintPaths.clear();
+    if (!svg || !spec)
+      return;
+    this.painter.paintAll(svg, spec);
+  }
+  /**
+   * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
+   *
+   * 结构变化（拖动改层级、增删节点）**绝不能带位置过渡**：
+   * 1. 节点的孩子索引路径（"0.2.1"）会整篇重编，g 元素按索引被复用到别的节点上，
+   *    过渡期间旧连线是从「错的父节点」出发的；
+   * 2. 过渡要 180ms，这期间 MutationObserver 每帧都在按半路位置重算连线，
+   *    两边叠加就是「线乱飞」。这就是拖动后 view 更新时闪一下的原因。
+   *
+   * 改成 duration=0 瞬间到位后，位置在第一次 tick 就落定，
+   * 紧跟着同步重绘一次（paintAllSync），整个过程在一帧内结束，不会播出中间态。
+   * 折叠/展开的 180ms 动画不受影响：那是 markmap 自己 toggleNode 触发的，
+   * 这里只临时改了本次 setData 的 duration。
+   */
+  async applyTree(tree) {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg)
+      return;
+    this.rebuilding = true;
+    const prev = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.setData(tree);
+      this.dropDetached();
+      this.painter.reset();
+      this.paintAllSync();
+    } finally {
+      mm.setOptions({ duration: prev });
+      this.rebuilding = false;
+    }
+  }
+  /**
+   * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
+   * 正常情况下就是「已被 markmap 标记为退出、还在等 transition 收尾」的那几个。
+   *
+   * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
+   * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
+   * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
+   */
+  dropDetached() {
+    var _a;
+    const svg = this.svgEl;
+    const root2 = (_a = this.mm) == null ? void 0 : _a.state.data;
+    if (!svg || !root2)
+      return;
+    const alive = /* @__PURE__ */ new Set();
+    const walk = (n) => {
+      var _a2;
+      alive.add(n);
+      for (const c of (_a2 = n.children) != null ? _a2 : [])
+        walk(c);
+    };
+    walk(root2);
+    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      const data = g.__data__;
+      if (!data || !alive.has(data))
+        g.remove();
+    }
   }
   /** 供插件在激活视图时指定要展示的笔记 */
   setTargetFile(file) {
@@ -6312,18 +6426,14 @@ var MindmapView = class extends import_obsidian2.ItemView {
       if (!this.mm) {
         this.mm = it.create(this.svgEl, this.buildOptions(spec));
         this.appliedThemeKey = themeKey;
-        await this.mm.setData(tree);
-        this.painter.reset();
-        this.requestPaint("all");
+        await this.applyTree(tree);
         await this.fitInstant();
       } else {
         if (themeKey !== this.appliedThemeKey) {
           this.mm.setOptions(this.buildOptions(spec));
           this.appliedThemeKey = themeKey;
         }
-        await this.mm.setData(tree);
-        this.painter.reset();
-        this.requestPaint("all");
+        await this.applyTree(tree);
         if (fileChanged)
           await this.fitInstant();
       }

@@ -160,15 +160,29 @@ export class DragController {
     return el.closest("g.markmap-node") as SVGGElement | null;
   }
 
+  /**
+   * 目标节点的**卡片外框**（屏幕坐标）。
+   *
+   * 判定必须用卡片而不是 foreignObject：foreignObject 只是文字盒，卡片左右还各有
+   * 16px 内边距，按文字盒判定的话这些区域点上去毫无反应，「拖不准」就是这么来的。
+   * 卡片是节点 g 内的自绘 rect，getBoundingClientRect 已经把画布缩放与平移算进去了。
+   */
+  private cardBoxOf(g: SVGGElement): DOMRect | null {
+    const card = g.querySelector<SVGRectElement>(":scope > rect.obmind-node-card");
+    const el: Element = card ?? g.querySelector("foreignObject") ?? g;
+    const r: DOMRect = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    return r;
+  }
+
   /** 找鼠标下方的目标节点，并按纵向位置决定「子节点 / 前面 / 后面」 */
   private hitTest(x: number, y: number): Target | null {
     let best: Target | null = null;
     let bestArea = Infinity;
 
     for (const g of this.candidates) {
-      const fo = g.querySelector("foreignObject") ?? g;
-      const r = fo.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
+      const r = this.cardBoxOf(g);
+      if (!r) continue;
       if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
 
       // 多个节点矩形重叠时取面积最小的（通常是真正压在鼠标下的那个）
@@ -211,27 +225,33 @@ export class DragController {
       return;
     }
 
-    const fo = this.target.g.querySelector("foreignObject") ?? this.target.g;
-    const r = fo.getBoundingClientRect();
+    const r = this.cardBoxOf(this.target.g);
+    if (!r) {
+      box.style.display = "none";
+      line.style.display = "none";
+      return;
+    }
     const base = this.container.getBoundingClientRect();
     const left = r.left - base.left;
     const top = r.top - base.top;
 
     if (this.target.mode === "child") {
+      // 描边框正好压在卡片外沿：box 从外扩 2px 起算，与 2px 的 border 严丝合缝
       box.style.display = "block";
-      box.style.left = `${left - 3}px`;
-      box.style.top = `${top - 3}px`;
-      box.style.width = `${r.width + 6}px`;
-      box.style.height = `${r.height + 6}px`;
+      box.style.left = `${left - 2}px`;
+      box.style.top = `${top - 2}px`;
+      box.style.width = `${r.width + 4}px`;
+      box.style.height = `${r.height + 4}px`;
       line.style.display = "none";
       return;
     }
 
+    // 前后插入：横线贴在卡片上下沿的外侧（落在兄弟间的空隙里，读起来就是"插在这"）
     box.style.display = "none";
     line.style.display = "block";
-    line.style.left = `${left - 3}px`;
-    line.style.width = `${r.width + 6}px`;
-    line.style.top = `${this.target.mode === "before" ? top - 2 : top + r.height}px`;
+    line.style.left = `${left}px`;
+    line.style.width = `${r.width}px`;
+    line.style.top = `${this.target.mode === "before" ? top - 4 : top + r.height + 1}px`;
   }
 
   private reset(): void {
