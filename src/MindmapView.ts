@@ -35,6 +35,10 @@ import {
 } from "./app/NavPolicy";
 import type { ForwardTarget, NavSyncMode } from "./app/NavPolicy";
 import { QueryService } from "./app/QueryService";
+import { canRedo, canUndo, EMPTY_HISTORY, record, redo, undo } from "./app/History";
+import type { HistoryState } from "./app/History";
+import { buildToolbar } from "./ui/toolbar";
+import type { ToolbarActionId, ToolbarHandle } from "./ui/toolbar";
 import { ViewRuntime } from "./app/runtime";
 import { planProjection } from "./app/plan";
 import type MindmapPlugin from "./main";
@@ -45,6 +49,27 @@ import type MindmapPlugin from "./main";
 export const MINDMAP_VIEW_TYPE = "obmind-view";
 
 type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
+
+/** 快捷键说明面板的内容。改一处就够，不必再维护标记里的长 tooltip。 */
+const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
+  ["单击", "选中节点（之后可用下面的按键）"],
+  ["双击 / F2", "原地编辑"],
+  ["Tab / Enter", "新建子级 / 新建同级"],
+  ["Shift+Tab", "提升一级"],
+  ["Delete", "删除节点及其全部子节点"],
+  ["拖动节点", "按住左键拖到别的卡片上改变父子关系"],
+  ["Ctrl/⌘+单击", "按节点文字打开同名笔记"],
+  ["Ctrl+Z / ⇧Ctrl+Z", "撤销 / 重做"],
+  ["编辑框 Tab", "缩进 / Shift+Tab 反缩进"],
+  ["编辑框 Ctrl+↵", "提交并新建同级"],
+  ["Esc", "取消编辑或取消选中"],
+];
+
+/** 节点文字截断：状态栏只有一行，长标题会把按钮挤走 */
+function clip(text: string, max = 18): string {
+  const plain: string = text.replace(/\s+/g, " ").trim();
+  return plain.length <= max ? plain : `${plain.slice(0, max)}…`;
+}
 
 /**
  * 上一次投影的快照。下一次刷新拿它做 diff，决定走哪条绘制通道。
@@ -124,6 +149,18 @@ export class MindmapView extends ItemView {
   private leafSeq = 0;
   private readonly leafById = new Map<number, WorkspaceLeaf>();
   private drag: DragController | null = null;
+  /** 操作栏（图标按钮 + 主题下拉 + 状态文字）。构建细节在 ui/toolbar.ts */
+  private toolbar: ToolbarHandle | null = null;
+  /** 快捷键说明面板（点「?」浮出） */
+  private helpPanel: HTMLElement | null = null;
+  /**
+   * 撤销/重做栈。
+   *
+   * 存的是「整篇快照」而不是反向操作：写路径产出的是行区间
+   * （改哪几行、插在第几行之后），而每次写入都会让行号整体位移 ——
+   * 反向计算锚点比直接存全文更容易错，而一篇纯文本才几十 KB。
+   */
+  private history: HistoryState = EMPTY_HISTORY;
   /** 块级渲染（代码块/公式块）用到的组件，下次重建前统一释放 */
   private blockParts: Component[] = [];
   /**
@@ -177,16 +214,19 @@ export class MindmapView extends ItemView {
     container.classList.add("obmind-container");
 
     // 顶部（上→下）：
-    // 1) 工具条 —— 「我能做什么」：主题、刷新、适配、操作说明
+    // 1) 操作栏 —— 「我能做什么」：两行，第一行作用于整张图，第二行作用于选中节点
     // 2) 面包屑 —— 「我在哪」：导图内的跳转路径
     // 两者语义不同，各占一行。挤在一行时路径一长就会把按钮顶出可视区，
     // 而且面包屑出现/消失会让工具条高度跳动。
     const header = container.createDiv({ cls: "obmind-header" });
-    const toolbar = header.createDiv({ cls: "obmind-toolbar" });
-    const select = toolbar.createEl("select", { cls: "dropdown" });
+
+    const select = document.createElement("select");
+    select.className = "dropdown";
     for (const opt of THEME_OPTIONS) {
-      const optionEl = select.createEl("option", { text: opt.label });
+      const optionEl = document.createElement("option");
       optionEl.value = opt.value;
+      optionEl.textContent = opt.label;
+      select.appendChild(optionEl);
     }
     select.value = this.plugin.settings.theme;
     select.addEventListener("change", () => {
@@ -194,43 +234,75 @@ export class MindmapView extends ItemView {
     });
     this.themeSelect = select;
 
-    const refreshBtn = toolbar.createEl("button", {
-      cls: "obmind-refresh",
-      text: "刷新",
-    });
-    refreshBtn.addEventListener("click", () => {
-      // 手点刷新 = 明确要求忽略缓存，直接作废快照强制重建
-      this.snapshot = null;
-      this.refresh();
+    this.toolbar = buildToolbar(header, {
+      leading: select,
+      rows: [
+        {
+          groups: [
+            {
+              buttons: [
+                { id: "undo", icon: "undo-2", label: "撤销", key: "Ctrl+Z", fallback: "撤" },
+                { id: "redo", icon: "redo-2", label: "重做", key: "Ctrl+Shift+Z", fallback: "重" },
+              ],
+            },
+            {
+              buttons: [
+                {
+                  id: "collapseAll",
+                  icon: "chevrons-down-up",
+                  label: "折叠全部",
+                  fallback: "折",
+                },
+                {
+                  id: "expandAll",
+                  icon: "chevrons-up-down",
+                  label: "展开全部",
+                  fallback: "展",
+                },
+                { id: "fit", icon: "maximize", label: "缩放到适合窗口", fallback: "适" },
+                { id: "refresh", icon: "refresh-cw", label: "重新读取笔记", fallback: "刷" },
+              ],
+            },
+            {
+              pin: true,
+              buttons: [
+                { id: "help", icon: "help-circle", label: "操作与快捷键", fallback: "?" },
+              ],
+            },
+          ],
+        },
+        {
+          status: true,
+          groups: [
+            {
+              buttons: [
+                { id: "edit", icon: "pencil", label: "编辑节点", key: "F2 / 双击", fallback: "改" },
+                {
+                  id: "child",
+                  icon: "corner-down-right",
+                  label: "新建子级",
+                  key: "Tab",
+                  fallback: "子",
+                },
+                { id: "sibling", icon: "plus", label: "新建同级", key: "Enter", fallback: "同" },
+                {
+                  id: "outdent",
+                  icon: "corner-up-left",
+                  label: "提升一级",
+                  key: "Shift+Tab",
+                  fallback: "提",
+                },
+                { id: "delete", icon: "trash-2", label: "删除节点", key: "Delete", fallback: "删" },
+              ],
+            },
+          ],
+        },
+      ],
+      onAction: (id: ToolbarActionId) => this.onToolbar(id),
     });
 
-    // 手动适配：折叠/展开不再自动缩放，想回到全览时点这里
-    const fitBtn = toolbar.createEl("button", {
-      cls: "obmind-fit",
-      text: "适配",
-      attr: { title: "缩放到适合窗口" },
-    });
-    fitBtn.addEventListener("click", () => {
-      void this.mm?.fit();
-    });
-
-    // 双击编辑没有任何可见入口，给个悬浮说明，否则没人会发现
-    toolbar.createSpan({
-      cls: "obmind-hint",
-      text: "?",
-      attr: {
-        title: [
-          "左键单击：选中节点，之后 Tab 建子级 / Enter 建同级",
-          "选中后 Delete / Backspace：删除该节点及其全部子节点",
-          "右键拖动节点：改变父子关系（左键不再拖动）",
-          "双击节点 / F2：原地编辑",
-          "编辑框内：Enter 完成 · Esc 取消 · Ctrl+Enter 新建同级",
-          "编辑框内：Tab 缩进 · Shift+Tab 反缩进 · 清空后退格删除该节点",
-          "Ctrl/⌘ + 单击节点：打开同名笔记",
-          "点双链 / 面包屑：笔记窗口是否跟随，见设置里的「面包屑与笔记视图联动」",
-        ].join("\n"),
-      },
-    });
+    this.helpPanel = this.toolbar.el.createDiv({ cls: "obmind-help-panel is-hidden" });
+    this.buildHelpPanel();
 
     // 面包屑独占一行：横向可滚动，路径再长也不会挤压上面的按钮
     this.breadcrumbEl = header.createDiv({ cls: "obmind-breadcrumb" });
@@ -298,6 +370,17 @@ export class MindmapView extends ItemView {
 
     // 初始没有导航，先置成隐藏，免得空容器占位
     this.renderBreadcrumb();
+
+    // 点面板外面就收起快捷键说明。
+    // 忽略工具栏内的点击，否则点「?」的同一个事件会立刻把它关掉。
+    this.registerDomEvent(document, "click", (e: MouseEvent) => {
+      if (!this.helpPanel || this.helpPanel.hasClass("is-hidden")) return;
+      const target = e.target as Element | null;
+      if (target?.closest(".obmind-help-panel") || target?.closest(".obmind-toolbar")) return;
+      this.helpPanel.addClass("is-hidden");
+    });
+
+    this.syncToolbar();
   }
 
   /**
@@ -405,6 +488,214 @@ export class MindmapView extends ItemView {
     this.plugin.settings.theme = theme;
     await this.plugin.saveSettings();
     this.refresh();
+  }
+
+  // -------------------------------------------------------------------------
+  // 操作栏
+  // -------------------------------------------------------------------------
+
+  /** 操作栏的唯一分发点：按钮只报 id，具体做什么集中在这里 */
+  private onToolbar(id: ToolbarActionId): void {
+    switch (id) {
+      case "undo":
+        void this.stepHistory("undo");
+        break;
+      case "redo":
+        void this.stepHistory("redo");
+        break;
+      case "collapseAll":
+        this.setAllFolds(true);
+        break;
+      case "expandAll":
+        this.setAllFolds(false);
+        break;
+      case "fit":
+        this.fitView();
+        break;
+      case "refresh":
+        // 手点刷新 = 明确要求忽略缓存，作废快照强制重建
+        this.snapshot = null;
+        this.refresh();
+        break;
+      case "edit":
+        this.editSelected();
+        break;
+      case "child":
+      case "sibling":
+        this.createNode(id);
+        break;
+      case "outdent":
+        this.outdentSelected();
+        break;
+      case "delete":
+        this.removeNode();
+        break;
+      case "help":
+        this.toggleHelp();
+        break;
+    }
+  }
+
+  /**
+   * 同步按钮可用态与状态文字。
+   *
+   * 集中在这一处而不是散在各操作里：按钮该不该点亮只取决于「有没有选中节点」
+   * 「能不能撤销」这两三个状态，散着写必然出现「删完了删除键还是亮的」这类不同步。
+   */
+  private syncToolbar(): void {
+    const t = this.toolbar;
+    if (!t) return;
+
+    const src: SrcRef | null = this.nodeAt(this.selectedLine);
+    // 根节点就是文件名本身：改不了、删不了、也无所谓缩进
+    const onNode: boolean = src !== null && src.depth > 0;
+    t.setEnabled("edit", onNode);
+    t.setEnabled("child", src !== null);
+    t.setEnabled("sibling", src !== null);
+    t.setEnabled("outdent", onNode);
+    t.setEnabled("delete", onNode);
+
+    t.setEnabled("undo", canUndo(this.history));
+    t.setEnabled("redo", canRedo(this.history));
+
+    const ready: boolean = this.mm !== null;
+    t.setEnabled("fit", ready);
+    t.setEnabled("collapseAll", ready);
+    t.setEnabled("expandAll", ready);
+
+    t.setStatus(onNode && src ? `已选中：${clip(src.text)}` : "");
+  }
+
+  /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
+  private nodeAt(line: number): SrcRef | null {
+    if (line < 0) return null;
+    const nodes = this.snapshot?.nodes;
+    if (!nodes) return null;
+    return nodes.find((n) => n.line === line) ?? null;
+  }
+
+  /** 编辑选中节点（操作栏的铅笔按钮） */
+  private editSelected(): void {
+    const node = this.findNodeByLine(this.selectedLine);
+    if (node) this.startEdit(node, false);
+  }
+
+  /**
+   * 提升一级（Shift+Tab / 操作栏）。
+   *
+   * 复用 EditService 的 outdent：它已经在用例里覆盖了「已在最外层」
+   * 「制表符与空格的缩进单位」这些边界，画布上没必要再写一遍。
+   */
+  private outdentSelected(): void {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    const src = this.nodeAt(this.selectedLine);
+    if (!file || !snap || !src) {
+      this.syncToolbar();
+      return;
+    }
+
+    const out = this.editSvc.commit({
+      snap,
+      src,
+      action: "outdent",
+      value: this.editorValueOf(src),
+    });
+    if (out.kind === "error" || out.kind === "none") {
+      // 明确点了按钮就得有反馈：没反应最难判断
+      new Notice(`obmind：${out.reason}`);
+      return;
+    }
+    void this.applyPlan(file, out.op);
+  }
+
+  fitView(): void {
+    void this.mm?.fit();
+  }
+
+  /**
+   * 全部折叠 / 全部展开。
+   *
+   * 只改 payload.fold 再把同一棵树灌回 markmap，不重新解析笔记 ——
+   * 折叠是纯视图状态，没有理由去碰文件。
+   *
+   * applyTree 内部 duration=0：两千个节点同时折叠时若带过渡，
+   * 会看到几百条线一起飞，反而看不出结构变化。
+   */
+  setAllFolds(fold: boolean): void {
+    const tree = this.snapshot?.tree;
+    if (!tree || !this.mm) return;
+
+    let changed = false;
+    const walk = (node: IPureNode): void => {
+      const kids: IPureNode[] = node.children ?? [];
+      if (kids.length === 0) return;
+      const folded: boolean =
+        typeof node.payload?.fold === "number" && (node.payload.fold as number) > 0;
+      if (folded !== fold) {
+        node.payload = { ...node.payload, fold: fold ? 1 : 0 };
+        changed = true;
+      }
+      for (const kid of kids) walk(kid);
+    };
+    walk(tree);
+    if (!changed) return;
+
+    void this.applyTree(tree).then(() => {
+      this.paintSelection();
+      this.syncToolbar();
+    });
+  }
+
+  /**
+   * 撤销 / 重做一步。
+   *
+   * 写入用「整篇替换」：历史里存的就是某一时刻的完整内容。
+   * expect 用当前快照内容 —— 若用户在编辑器里改过，锚点对不上就整体放弃，
+   * 绝不会把别处的改动覆盖掉。
+   */
+  private async stepHistory(kind: "undo" | "redo"): Promise<void> {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
+
+    const step = kind === "undo" ? undo(this.history, snap.content) : redo(this.history, snap.content);
+    if (!step) {
+      this.syncToolbar();
+      return;
+    }
+
+    const res = await this.runWrite(
+      file,
+      { kind: "whole", content: step.write, expect: snap.content },
+      false,
+    );
+    if (!res.ok) {
+      this.syncToolbar();
+      return;
+    }
+    this.history = step.state;
+    // 撤销后行号整体位移，原来的选中已无意义：清掉，免得下一次 Delete 删错节点
+    this.selectedLine = -1;
+    this.refresh(step.write);
+    this.syncToolbar();
+  }
+
+  private buildHelpPanel(): void {
+    const el = this.helpPanel;
+    if (!el) return;
+    el.createDiv({ cls: "obmind-help-title", text: "操作与快捷键" });
+    for (const [keys, text] of HELP_ROWS) {
+      const row = el.createDiv({ cls: "obmind-help-row" });
+      row.createSpan({ cls: "obmind-help-key", text: keys });
+      row.createSpan({ text });
+    }
+  }
+
+  private toggleHelp(): void {
+    const el = this.helpPanel;
+    if (!el) return;
+    el.toggleClass("is-hidden", !el.hasClass("is-hidden"));
   }
 
   /**
@@ -1145,6 +1436,8 @@ export class MindmapView extends ItemView {
     if (this.selectedLine === line) return;
     this.selectedLine = line;
     this.paintSelection();
+    // 选中态决定第二行按钮能不能点，状态一变就得同步
+    this.syncToolbar();
   }
 
   /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
@@ -1168,11 +1461,23 @@ export class MindmapView extends ItemView {
     if (e.target !== this.canvasEl) return;
     if (e.isComposing) return;
 
+    // 撤销 / 重做：与编辑器保持一致的手感（Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y）。
+    // 只在画布自身持有焦点时生效 —— 否则会和编辑器里的撤销打架。
+    if (e.ctrlKey || e.metaKey) {
+      const key: string = e.key.toLowerCase();
+      if (key === "z" || key === "y") {
+        e.preventDefault();
+        e.stopPropagation();
+        void this.stepHistory(key === "y" || e.shiftKey ? "redo" : "undo");
+        return;
+      }
+    }
+
     if (e.key === "Tab") {
       e.preventDefault();
       e.stopPropagation();
-      // Shift+Tab 不建节点：反缩进是编辑框里的语义，画布上先不抢这个键
-      if (!e.shiftKey) this.createNode("child");
+      if (e.shiftKey) this.outdentSelected();
+      else this.createNode("child");
       return;
     }
 
@@ -1184,6 +1489,11 @@ export class MindmapView extends ItemView {
     }
 
     if (e.key === "Escape") {
+      // 帮助面板开着时，Esc 先收面板（它盖住了画布，先关它更符合直觉）
+      if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+        this.helpPanel.addClass("is-hidden");
+        return;
+      }
       this.setSelectedLine(-1);
       return;
     }
@@ -1366,8 +1676,7 @@ export class MindmapView extends ItemView {
 
     const spec: ThemeSpec =
       this.currentSpec ?? resolveTheme(this.plugin.settings.theme, false);
-    const value: string =
-      src.checked === null ? src.text : `${src.checked ? "☑" : "☐"} ${src.text}`;
+    const value: string = this.editorValueOf(src);
 
     this.rt.setPhase("editing");
     const handle = openInlineEditor({
@@ -1440,14 +1749,29 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 节点在编辑框里的初始文本。
+   *
+   * 任务列表带勾选框：编辑时要能看见并改它，所以把勾选状态拼成 ☑/☐ 前缀，
+   * 提交时由 parseEditorValue 再解析回去。画布上「提升一级」也走这条路 ——
+   * 否则会把任务项改写成普通列表项。
+   */
+  private editorValueOf(src: SrcRef): string {
+    return src.checked === null ? src.text : `${src.checked ? "☑" : "☐"} ${src.text}`;
+  }
+
+  /**
    * 执行一次写入计划。
    *
    * 这里是视图与文件 IO 的唯一接触点：计划怎么写由 writer 决定
    * （有编辑器走 transaction 保留 Ctrl+Z，没有才退回 vault.process）。
+   *
+   * @param remember 是否记入撤销历史。撤销/重做本身不能再记，
+   *                 否则「撤销」会把自己也压进 past，点两下就原地打转。
    */
   private async runWrite(
     file: TFile,
     op: WriteOp,
+    remember = true,
   ): Promise<{ ok: boolean; next?: string }> {
     const res = await applyOp(this.app, file, op);
     if (!res.ok) {
@@ -1457,6 +1781,13 @@ export class MindmapView extends ItemView {
     }
     // writer 顺手把写入后的内容算出来了，直接用 —— 不再读一次文件。
     // 少的那次 IO 正是「按了 Delete/Enter 之后画面要停顿一下才更新」的原因。
+    if (remember) {
+      const before: string = this.snapshot?.content ?? "";
+      if (res.next !== undefined && res.next !== before) {
+        this.history = record(this.history, before);
+      }
+    }
+    this.syncToolbar();
     return { ok: true, next: res.next };
   }
 
@@ -1464,6 +1795,8 @@ export class MindmapView extends ItemView {
   private flushPendingEdit(): void {
     // 重建后 g 元素全换了，选中态要按行号重新挂上
     this.paintSelection();
+    // 快照换了，节点是否还存在于新树里要重新判定（比如撤销后选中的节点没了）
+    this.syncToolbar();
 
     const line: number = this.pendingEditLine;
     if (line < 0) return;
@@ -1510,6 +1843,9 @@ export class MindmapView extends ItemView {
     this.leafById.clear();
     this.breadcrumbEl = null;
     this.selectedLine = -1;
+    this.history = EMPTY_HISTORY;
+    this.toolbar = null;
+    this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;

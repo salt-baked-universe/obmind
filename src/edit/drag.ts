@@ -2,6 +2,8 @@
  * 节点拖拽：把节点拖到别处改变父子关系（XMind 式）。
  *
  * 交互约定（对齐 XMind 的手感）：
+ * - **左键按住节点拖动** → 改变父子关系；按下不动就是「选中」，位移超过阈值才算拖
+ * - **右键留给菜单**，这里不碰 contextmenu
  * - 拖到目标卡片**中部** → 成为目标的子节点
  * - 拖到目标卡片**上沿** → 排在目标前面（兄弟）
  * - 拖到目标卡片**下沿** → 排在目标后面（兄弟）
@@ -11,7 +13,8 @@
  *    在节点上按下会变成拖画布。所以命中节点时要拦掉 mousedown 的冒泡。
  * 2. **不能拖进自己的子树**。用 markmap 自带的孩子索引路径（"0.2.1"）判断，
  *    后代路径一定以 `源路径 + "."` 开头，比算几何范围可靠。
- * 3. **拖拽结束不能触发 click / dblclick**，否则松手就顺带进了编辑态。
+ * 3. **拖拽结束不能触发 click / dblclick**，否则松手会顺带选中
+ *    （行号已经变了，选中的是错的节点）或直接进了编辑态。
  */
 
 import type { SrcRef } from "../types";
@@ -56,19 +59,23 @@ export class DragController {
 
     svg.addEventListener("mousedown", this.blockOnNode, true);
     svg.addEventListener("pointerdown", this.onPointerDown, true);
-    svg.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("pointermove", this.onPointerMove, true);
     window.addEventListener("pointerup", this.onPointerUp, true);
     window.addEventListener("keydown", this.onKeyDown, true);
+    // 兜底收尾：窗口失焦、指针被系统打断（拖到窗口外松手）时收不到 pointerup，
+    // 而按下时锁了选区 —— 不收拾的话整页文字会一直不可选。
+    window.addEventListener("blur", this.onAbort);
+    window.addEventListener("pointercancel", this.onAbort);
   }
 
   destroy(): void {
     this.svg.removeEventListener("mousedown", this.blockOnNode, true);
     this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
-    this.svg.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("pointermove", this.onPointerMove, true);
     window.removeEventListener("pointerup", this.onPointerUp, true);
     window.removeEventListener("keydown", this.onKeyDown, true);
+    window.removeEventListener("blur", this.onAbort);
+    window.removeEventListener("pointercancel", this.onAbort);
     this.reset();
     this.layer?.remove();
     this.layer = null;
@@ -76,27 +83,19 @@ export class DragController {
 
   // -------------------------------------------------------------------------
 
+  private onAbort = (): void => {
+    if (this.origin) this.reset();
+  };
+
   /** 命中节点时掐断 mousedown，否则 d3-zoom 会把它当成「拖画布」 */
   private blockOnNode = (e: MouseEvent): void => {
     const g = this.nodeAt(e.target as Element);
     if (g) e.stopPropagation();
   };
 
-  /**
-   * 右键在导图里是「拖动改层级」，不是菜单。
-   *
-   * 必须显式拦掉 contextmenu：pointerdown 拦不住它。不拦的话，
-   * 每次右键松手（哪怕只是右键点了一下）都会弹出系统菜单压住画布。
-   * 空白处仍然保留菜单 —— 那是画布自己的。
-   */
-  private onContextMenu = (e: MouseEvent): void => {
-    if (this.nodeAt(e.target as Element)) e.preventDefault();
-  };
-
   private onPointerDown = (e: PointerEvent): void => {
-    // 2 = 右键。左键留给「选中 / 双击编辑 / 点链接」，
-    // 左右分工之后，框选与拖拽不会再互相误触。
-    if (e.button !== 2) return;
+    // 0 = 左键。右键留给菜单（不拦 contextmenu），中键留给画布自己的行为。
+    if (e.button !== 0) return;
     const el = e.target as Element;
     // 链接、折叠圆点各有自己的用途
     if (el.closest("a") || el.closest("circle")) return;
@@ -115,6 +114,11 @@ export class DragController {
     this.startY = e.clientY;
     this.active = false;
     this.target = null;
+
+    // 按下就锁选区：否则拖出 5px 阈值之前，浏览器已经开始选文字了，
+    // 松手时页面上留着一片蓝色高亮。单击（没拖动）也会在 reset 里立刻恢复。
+    document.body.style.userSelect = "none";
+    document.body.style.webkitUserSelect = "none";
 
     const srcPath = pathOf(g);
     this.candidates = Array.from(
@@ -159,6 +163,10 @@ export class DragController {
     // 拖拽结束后别让这次松手变成 click / dblclick
     e.preventDefault();
     e.stopPropagation();
+    // pointerup 上的 preventDefault 拦不住 click（click 由 down+up 合成），
+    // 而拖动之后触发的 click 会按**旧行号**去选中节点 —— 位置已经变了，
+    // 选中的就是错的节点。这里显式吞掉紧跟其后的那一次 click。
+    swallowNextClick();
 
     const tgtSrc = this.cb.srcOf(target.g);
     if (!tgtSrc) return;
@@ -272,6 +280,7 @@ export class DragController {
   private reset(): void {
     this.origin?.classList.remove("obmind-dragging");
     document.body.style.userSelect = "";
+    document.body.style.webkitUserSelect = "";
     this.origin = null;
     this.originSrc = null;
     this.active = false;
@@ -280,6 +289,21 @@ export class DragController {
     if (this.box) this.box.style.display = "none";
     if (this.line) this.line.style.display = "none";
   }
+}
+
+/**
+ * 吞掉紧接着派发的那个 click。
+ *
+ * 用 capture 拦一次最省事；setTimeout(0) 兜底移除 ——
+ * 万一浏览器这次没派发 click，也不会把用户的下一次点击一起吃掉。
+ */
+function swallowNextClick(): void {
+  const swallow = (e: MouseEvent): void => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  document.addEventListener("click", swallow, true);
+  window.setTimeout(() => document.removeEventListener("click", swallow, true), 0);
 }
 
 /** markmap 给每个节点挂的孩子索引路径，如 "0.2.1" */

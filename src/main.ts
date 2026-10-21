@@ -55,6 +55,32 @@ export default class MindmapPlugin extends Plugin {
           this.refreshMindmap();
         },
       });
+
+      // 操作栏上的按钮同样能在命令面板里找到 ——
+      // 键盘用户不必为了「全部折叠」去够鼠标，也让这些动作可以被快捷键绑定。
+      this.addCommand({
+        id: "mindmap-collapse-all",
+        name: "折叠全部节点",
+        callback: () => this.withMindmap((view) => view.setAllFolds(true)),
+      });
+
+      this.addCommand({
+        id: "mindmap-expand-all",
+        name: "展开全部节点",
+        callback: () => this.withMindmap((view) => view.setAllFolds(false)),
+      });
+
+      this.addCommand({
+        id: "mindmap-fit",
+        name: "缩放导图到适合窗口",
+        callback: () => this.withMindmap((view) => view.fitView()),
+      });
+
+      this.addCommand({
+        id: "mindmap-reread",
+        name: "重新读取笔记并重绘导图",
+        callback: () => this.withMindmap((view) => void view.refresh()),
+      });
     });
 
     this.safely("添加设置页", () => {
@@ -115,6 +141,24 @@ export default class MindmapPlugin extends Plugin {
         void view.refresh();
       }
     }
+  }
+
+  /**
+   * 对「当前打开的那个导图」执行一个动作。
+   *
+   * 命令面板不区分焦点在哪个面板，所以这里统一取第一个导图视图；
+   * 没有打开时给一句明确提示，而不是静默什么都不发生 ——
+   * 静默失败是最难排查的一类问题。
+   */
+  private withMindmap(action: (view: MindmapView) => void): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(MINDMAP_VIEW_TYPE)) {
+      const view = leaf.view;
+      if (view instanceof MindmapView) {
+        action(view);
+        return;
+      }
+    }
+    new Notice("obmind：先打开思维导图（左侧图标，或命令「打开当前笔记思维导图」）");
   }
 
   async loadSettings() {

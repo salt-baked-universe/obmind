@@ -4,16 +4,17 @@
 依赖单向向下，`domain` 永不 import obsidian、不碰 DOM：
 `types`(L0) → `domain` 纯函数(L1) → `render`/`ui`(L2) → `infra` Obsidian 适配(L3) → `app` 用例+会话状态(L4) → `view`(L5)。
 
-进度（1.6.0）：
+进度（1.8.0）：
 - L0 `src/types.ts`：SrcRef / BlockInfo / Span / WriteOp / EditorAction / DropMode。
 - L1 `src/domain/syntax.ts`：buildTree、缩进度量。**行内渲染改为注入 `render` 参数**，
   domain 不认识 HTML，能在 Node 直接跑用例。
-- L2 `src/render/inlineHtml.ts`（renderInline）、`render/frame.ts`、`render/painter.ts`。
-- L3 `src/edit/writer.ts`（applyOp 是唯一写入出口）、`edit/inlineText.ts`。
+- L2 `src/render/`：inlineHtml、frame（rAF 合并）、painter（卡片/连线/收放点）、geometry。
+  `src/ui/toolbar.ts`：操作栏（按钮声明成数据表 + setEnabled/setStatus）。
+- L3 `src/edit/writer.ts`（applyOp 是唯一写入出口）、`edit/inlineText.ts`、`edit/drag.ts`。
 - L4 `src/app/`：runtime（phase+rev）、plan（投影判定）、EditService（写用例）、
   QueryService（读用例）、NavStack（跳转栈，条目可带 leafId）、
-  **NavPolicy（面包屑↔笔记窗口四档联动，纯决策）**。
-- L5 `MindmapView`：1448 行，只做事件翻译 + 投影 + 面板渲染。
+  NavPolicy（面包屑↔笔记窗口四档联动，纯决策）、**History（撤销/重做，整篇快照）**。
+- L5 `MindmapView`：约 1600 行，只做事件翻译 + 投影 + 面板渲染 + 操作分发。
 - `parser.ts` 退化为组装层：注入 renderInline + re-export，不再含实现。
 
 待办：View 还持有块渲染（MarkdownRenderer 缓存）与投影细节，可再抽 `BlockRenderer`。
@@ -33,8 +34,10 @@
    父节点有孩子时下一行是它的第一个孩子，插那里会被缩进规则判成孩子。
 8. 层级有两套体系：标题（`#` 级数）与正文（缩进）。新增节点按目标节点所属体系生成，
    不能混用。正文缩进用 `indentOfCols(cols + step, unit)`，不要拼字符串（tab 会被塞成空格）。
-9. **左键选中、右键拖动**。选中态存源行号（`selectedLine`）不存 DOM 引用，重建后按行号重挂。
-   `contextmenu` 必须在节点上 preventDefault，否则右键松手会弹系统菜单。
+9. **左键选中 + 左键拖动，右键留给菜单**。选中态存源行号（`selectedLine`）不存 DOM 引用。
+   左键按下即锁 `body.userSelect`（拖出阈值前浏览器已在选文字），`blur`/`pointercancel` 兜底恢复。
+   拖动松手后紧跟的 click 必须用一次性捕获监听吞掉（pointerup 的 preventDefault 拦不住 click），
+   否则会按旧行号选中错节点。
 10. **导航两步走：先定「导图看哪篇」，再动 Obsidian 的 leaf**。
     `openDoc` 必须先 `targetFile = file` + 压栈，才能 `openFile` —— 否则
     `file-open` / `active-leaf-change` 会把这次自触发误判成「用户切了文件」而清栈、并闪一帧旧笔记。
@@ -52,6 +55,17 @@
     用户主动切笔记/首次打开才 fit。
 14. 节点操作：`Delete`/`Backspace` 删**整棵子树**（不是一行），删完选中挪到父节点。
     写入的 `applyOp` 会顺带返回新全文，**不要再读一次文件**（多一次 IO 就是一次可感知的停顿）。
+15. **markmap 的收放点有两个坑**：①节点失去全部孩子后它既不删 `<circle>` 也不把 `r` 归零
+    （仍是 6）→ 必须按 `__data__.children` 判显示，不能看 `r`；②缩小用
+    `transform: translate() scale(0.7)`，但 `transform-box/transform-origin` **必须 JS 写内联**
+    （SVG 默认 origin 是 0 0，只靠样式表没匹配上就会把圆点拽偏）。
+16. **不要给「是否隐藏某元素」缓存布尔**：`painter.reset()` 后同一个 DOM 会带着旧的
+    inline 状态回来，缓存与实际不符就永远不恢复。直接读 `el.style.display`。
+17. **@container 不提升优先级**，同优先级靠书写顺序 —— 容器查询必须放在基础规则之后。
+    操作栏用 `container-type: inline-size`，260px 窄侧栏仍能一行放下（图标 24、分隔线隐藏、
+    下拉收缩；图标按钮绝不缩，缩了就点不中）。
+18. 撤销/重做存**整篇快照**（`app/History.ts`，纯函数，上限 40），不存反向操作；
+    `runWrite(..., remember=false)` 给撤销自身用，否则「撤销」会把自己压进 past 原地打转。
 
 ## 构建与验证
 - `node esbuild.config.mjs production`（Windows 沙箱内可能 EBUSY，需 `dangerouslyDisableSandbox`）。

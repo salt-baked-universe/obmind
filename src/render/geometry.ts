@@ -42,6 +42,13 @@ export interface NodeBox {
   /** 卡片相对内容向外扩展的内边距 */
   padX: number;
   padY: number;
+  /**
+   * 该节点是否有孩子 —— 决定收放点该不该显示。
+   *
+   * 读的是节点数据而不是 DOM 里的 `r` 属性：markmap 在节点失去全部孩子后
+   * 既不删那个 `<circle>`，也不把 `r` 归零，DOM 上完全看不出它已经是叶子。
+   */
+  hasChildren: boolean;
 }
 
 /** 取 g 的 translate 位移；解析不了就返回 null（宁可少画，也不读布局） */
@@ -94,6 +101,7 @@ export function readNodeBox(g: SVGGElement): NodeBox | null {
   if (!origin) return null;
 
   const depth = depthOf(path);
+  const data = (g as SVGGElement & { __data__?: { children?: unknown[] } }).__data__;
   return {
     g,
     fo,
@@ -103,6 +111,7 @@ export function readNodeBox(g: SVGGElement): NodeBox | null {
     oy: origin.y,
     w,
     h,
+    hasChildren: Array.isArray(data?.children) && data.children.length > 0,
     // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）。
     // 左右留得比上下宽：中文节点在 XMind 里就是左右宽松、上下紧凑，
     // 文字贴边会显得局促，也让人误以为卡片只是「文字外面套了个框」。

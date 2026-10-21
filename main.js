@@ -26,10 +26,10 @@ __export(main_exports, {
   default: () => MindmapPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 
 // src/MindmapView.ts
-var import_obsidian2 = require("obsidian");
+var import_obsidian3 = require("obsidian");
 
 // node_modules/markmap-common/dist/index.mjs
 var testPath = "npm2url/dist/index.cjs";
@@ -5179,6 +5179,7 @@ function readNodeBox(g) {
   if (!origin)
     return null;
   const depth = depthOf(path2);
+  const data = g.__data__;
   return {
     g,
     fo,
@@ -5188,6 +5189,7 @@ function readNodeBox(g) {
     oy: origin.y,
     w,
     h: h2,
+    hasChildren: Array.isArray(data == null ? void 0 : data.children) && data.children.length > 0,
     // 卡片在内容四周各外扩一点，模拟内边距（不参与布局，绝不会挤压文字）。
     // 左右留得比上下宽：中文节点在 XMind 里就是左右宽松、上下紧凑，
     // 文字贴边会显得局促，也让人误以为卡片只是「文字外面套了个框」。
@@ -5233,6 +5235,7 @@ function linkPath(child, parent) {
 var CLS_SHADOW = "obmind-node-shadow";
 var CLS_LINK = "obmind-node-link";
 var CLS_CARD = "obmind-node-card";
+var FOLD_SCALE = 0.7;
 var NodePainter = class {
   constructor() {
     this.entries = /* @__PURE__ */ new Map();
@@ -5448,11 +5451,15 @@ var NodePainter = class {
     }
   }
   /**
-   * 折叠圆点：用 CSS transform 平移到卡片右边缘的垂直中点。
+   * 折叠圆点：移到卡片右边缘中点，并按 FOLD_SCALE 缩小。
    *
-   * 不改 cx/cy —— markmap 每次重渲染都会把这两个属性重置回内容右下角，
-   * 两边抢写同一个属性正是之前「收放点抖动」的根源。
-   * transform 与属性是叠加关系，各写各的，互不覆盖。
+   * 两件事都靠 CSS transform 完成，不改 cx/cy/r —— markmap 每次重渲染都会把
+   * 这些属性重写一遍，两边抢写同一个属性就会互相打架。
+   *
+   * 另外这里顺手补上 markmap 的一个缺口：**节点失去全部孩子后，它既不删掉
+   * 那个 `<circle>`，也不把 r 归零**（实测 r 仍然是 6）。于是叶子节点右侧会挂
+   * 着一个永远点不出东西的收放点 —— 就是「刚操作过的卡片旁边多出一个小圆点」。
+   * 判据必须用节点数据里的 children，不能看 DOM 上的 r。
    */
   applyCircle(box, entry) {
     var _a, _b;
@@ -5462,9 +5469,21 @@ var NodePainter = class {
       entry.circle = circle;
       entry.circleX = Number.NaN;
       entry.circleY = Number.NaN;
+      if (circle) {
+        circle.style.setProperty("transform-box", "fill-box");
+        circle.style.setProperty("transform-origin", "center");
+      }
     }
     if (!circle)
       return;
+    const hidden = circle.style.display === "none";
+    if (!box.hasChildren) {
+      if (!hidden)
+        circle.style.display = "none";
+      return;
+    }
+    if (hidden)
+      circle.style.display = "";
     const nativeCx = Number.parseFloat((_a = circle.getAttribute("cx")) != null ? _a : "");
     const nativeCy = Number.parseFloat((_b = circle.getAttribute("cy")) != null ? _b : "");
     if (!Number.isFinite(nativeCx) || !Number.isFinite(nativeCy))
@@ -5474,7 +5493,7 @@ var NodePainter = class {
       return;
     entry.circleX = offset.x;
     entry.circleY = offset.y;
-    circle.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
+    circle.style.transform = `translate(${offset.x}px, ${offset.y}px) scale(${FOLD_SCALE})`;
   }
   /** 自绘连线：父卡片右边缘中点 → 子卡片左边缘中点 */
   applyLink(box, parent, entry, spec) {
@@ -5904,25 +5923,18 @@ var DragController = class {
     /** 本次拖拽的候选目标，按下时算一次，避免每帧 querySelectorAll */
     this.candidates = [];
     // -------------------------------------------------------------------------
+    this.onAbort = () => {
+      if (this.origin)
+        this.reset();
+    };
     /** 命中节点时掐断 mousedown，否则 d3-zoom 会把它当成「拖画布」 */
     this.blockOnNode = (e) => {
       const g = this.nodeAt(e.target);
       if (g)
         e.stopPropagation();
     };
-    /**
-     * 右键在导图里是「拖动改层级」，不是菜单。
-     *
-     * 必须显式拦掉 contextmenu：pointerdown 拦不住它。不拦的话，
-     * 每次右键松手（哪怕只是右键点了一下）都会弹出系统菜单压住画布。
-     * 空白处仍然保留菜单 —— 那是画布自己的。
-     */
-    this.onContextMenu = (e) => {
-      if (this.nodeAt(e.target))
-        e.preventDefault();
-    };
     this.onPointerDown = (e) => {
-      if (e.button !== 2)
+      if (e.button !== 0)
         return;
       const el = e.target;
       if (el.closest("a") || el.closest("circle"))
@@ -5940,6 +5952,8 @@ var DragController = class {
       this.startY = e.clientY;
       this.active = false;
       this.target = null;
+      document.body.style.userSelect = "none";
+      document.body.style.webkitUserSelect = "none";
       const srcPath = pathOf(g);
       this.candidates = Array.from(
         this.svg.querySelectorAll("g.markmap-node")
@@ -5976,6 +5990,7 @@ var DragController = class {
         return;
       e.preventDefault();
       e.stopPropagation();
+      swallowNextClick();
       const tgtSrc = this.cb.srcOf(target.g);
       if (!tgtSrc)
         return;
@@ -5990,19 +6005,21 @@ var DragController = class {
     this.cb = cb;
     svg.addEventListener("mousedown", this.blockOnNode, true);
     svg.addEventListener("pointerdown", this.onPointerDown, true);
-    svg.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("pointermove", this.onPointerMove, true);
     window.addEventListener("pointerup", this.onPointerUp, true);
     window.addEventListener("keydown", this.onKeyDown, true);
+    window.addEventListener("blur", this.onAbort);
+    window.addEventListener("pointercancel", this.onAbort);
   }
   destroy() {
     var _a;
     this.svg.removeEventListener("mousedown", this.blockOnNode, true);
     this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
-    this.svg.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("pointermove", this.onPointerMove, true);
     window.removeEventListener("pointerup", this.onPointerUp, true);
     window.removeEventListener("keydown", this.onKeyDown, true);
+    window.removeEventListener("blur", this.onAbort);
+    window.removeEventListener("pointercancel", this.onAbort);
     this.reset();
     (_a = this.layer) == null ? void 0 : _a.remove();
     this.layer = null;
@@ -6100,6 +6117,7 @@ var DragController = class {
     var _a;
     (_a = this.origin) == null ? void 0 : _a.classList.remove("obmind-dragging");
     document.body.style.userSelect = "";
+    document.body.style.webkitUserSelect = "";
     this.origin = null;
     this.originSrc = null;
     this.active = false;
@@ -6111,6 +6129,14 @@ var DragController = class {
       this.line.style.display = "none";
   }
 };
+function swallowNextClick() {
+  const swallow = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  document.addEventListener("click", swallow, true);
+  window.setTimeout(() => document.removeEventListener("click", swallow, true), 0);
+}
 function pathOf(g) {
   var _a;
   const data = g.__data__;
@@ -6703,6 +6729,114 @@ var QueryService = class {
   }
 };
 
+// src/app/History.ts
+var HISTORY_LIMIT = 40;
+var EMPTY_HISTORY = { past: [], future: [] };
+function canUndo(h2) {
+  return h2.past.length > 0;
+}
+function canRedo(h2) {
+  return h2.future.length > 0;
+}
+function record(h2, before) {
+  const past = [...h2.past, before];
+  return {
+    past: past.length > HISTORY_LIMIT ? past.slice(past.length - HISTORY_LIMIT) : past,
+    future: []
+  };
+}
+function undo(h2, current) {
+  if (h2.past.length === 0)
+    return null;
+  const write = h2.past[h2.past.length - 1];
+  return {
+    write,
+    state: {
+      past: h2.past.slice(0, -1),
+      future: [current, ...h2.future].slice(0, HISTORY_LIMIT)
+    }
+  };
+}
+function redo(h2, current) {
+  if (h2.future.length === 0)
+    return null;
+  const write = h2.future[0];
+  const past = [...h2.past, current];
+  return {
+    write,
+    state: {
+      past: past.length > HISTORY_LIMIT ? past.slice(past.length - HISTORY_LIMIT) : past,
+      future: h2.future.slice(1)
+    }
+  };
+}
+
+// src/ui/toolbar.ts
+var import_obsidian2 = require("obsidian");
+function iconButton(parent, spec, onAction) {
+  var _a;
+  const btn = parent.createEl("button", { cls: "clickable-icon" });
+  (0, import_obsidian2.setIcon)(btn, spec.icon);
+  if (btn.childElementCount === 0 && ((_a = btn.textContent) != null ? _a : "").trim() === "" && spec.fallback) {
+    btn.setText(spec.fallback);
+    btn.addClass("obmind-icon-fallback");
+  }
+  btn.setAttribute("aria-label", spec.key ? `${spec.label}\uFF08${spec.key}\uFF09` : spec.label);
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    if (btn.disabled)
+      return;
+    onAction(spec.id);
+  });
+  return btn;
+}
+function buildToolbar(parent, spec) {
+  const el = parent.createDiv({ cls: "obmind-toolbars" });
+  const buttons = /* @__PURE__ */ new Map();
+  let statusEl = null;
+  spec.rows.forEach((row, index) => {
+    const rowEl = el.createDiv({
+      cls: index === 0 ? "obmind-toolbar" : "obmind-toolbar is-sub"
+    });
+    if (index === 0 && spec.leading)
+      rowEl.appendChild(spec.leading);
+    let firstGroup = true;
+    for (const group of row.groups) {
+      if (group.pin) {
+        rowEl.createDiv({ cls: "obmind-toolbar-spacer" });
+        firstGroup = true;
+      } else if (!firstGroup) {
+        rowEl.createSpan({ cls: "obmind-toolbar-sep" });
+      }
+      for (const item of group.buttons) {
+        buttons.set(item.id, iconButton(rowEl, item, spec.onAction));
+      }
+      firstGroup = false;
+    }
+    if (row.status) {
+      rowEl.createDiv({ cls: "obmind-toolbar-spacer" });
+      statusEl = rowEl.createSpan({ cls: "obmind-status" });
+    }
+  });
+  return {
+    el,
+    setEnabled(id2, on) {
+      const btn = buttons.get(id2);
+      if (!btn)
+        return;
+      if (btn.disabled === !on)
+        return;
+      btn.disabled = !on;
+    },
+    setStatus(text) {
+      if (!statusEl)
+        return;
+      statusEl.setText(text);
+      statusEl.toggleClass("is-empty", text === "");
+    }
+  };
+}
+
 // src/app/runtime.ts
 var ViewRuntime = class {
   constructor(onError) {
@@ -6841,7 +6975,24 @@ function planProjection(input) {
 
 // src/MindmapView.ts
 var MINDMAP_VIEW_TYPE = "obmind-view";
-var MindmapView = class extends import_obsidian2.ItemView {
+var HELP_ROWS = [
+  ["\u5355\u51FB", "\u9009\u4E2D\u8282\u70B9\uFF08\u4E4B\u540E\u53EF\u7528\u4E0B\u9762\u7684\u6309\u952E\uFF09"],
+  ["\u53CC\u51FB / F2", "\u539F\u5730\u7F16\u8F91"],
+  ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
+  ["Shift+Tab", "\u63D0\u5347\u4E00\u7EA7"],
+  ["Delete", "\u5220\u9664\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9"],
+  ["\u62D6\u52A8\u8282\u70B9", "\u6309\u4F4F\u5DE6\u952E\u62D6\u5230\u522B\u7684\u5361\u7247\u4E0A\u6539\u53D8\u7236\u5B50\u5173\u7CFB"],
+  ["Ctrl/\u2318+\u5355\u51FB", "\u6309\u8282\u70B9\u6587\u5B57\u6253\u5F00\u540C\u540D\u7B14\u8BB0"],
+  ["Ctrl+Z / \u21E7Ctrl+Z", "\u64A4\u9500 / \u91CD\u505A"],
+  ["\u7F16\u8F91\u6846 Tab", "\u7F29\u8FDB / Shift+Tab \u53CD\u7F29\u8FDB"],
+  ["\u7F16\u8F91\u6846 Ctrl+\u21B5", "\u63D0\u4EA4\u5E76\u65B0\u5EFA\u540C\u7EA7"],
+  ["Esc", "\u53D6\u6D88\u7F16\u8F91\u6216\u53D6\u6D88\u9009\u4E2D"]
+];
+function clip(text, max3 = 18) {
+  const plain = text.replace(/\s+/g, " ").trim();
+  return plain.length <= max3 ? plain : `${plain.slice(0, max3)}\u2026`;
+}
+var MindmapView = class extends import_obsidian3.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.mm = null;
@@ -6891,6 +7042,18 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.leafSeq = 0;
     this.leafById = /* @__PURE__ */ new Map();
     this.drag = null;
+    /** 操作栏（图标按钮 + 主题下拉 + 状态文字）。构建细节在 ui/toolbar.ts */
+    this.toolbar = null;
+    /** 快捷键说明面板（点「?」浮出） */
+    this.helpPanel = null;
+    /**
+     * 撤销/重做栈。
+     *
+     * 存的是「整篇快照」而不是反向操作：写路径产出的是行区间
+     * （改哪几行、插在第几行之后），而每次写入都会让行号整体位移 ——
+     * 反向计算锚点比直接存全文更容易错，而一篇纯文本才几十 KB。
+     */
+    this.history = EMPTY_HISTORY;
     /** 块级渲染（代码块/公式块）用到的组件，下次重建前统一释放 */
     this.blockParts = [];
     /**
@@ -6905,7 +7068,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     /** 读路径：内容 → 只读快照（解析 + 节点坐标 + 缩进检测） */
     this.query = new QueryService(async (path2) => {
       const file = this.app.vault.getAbstractFileByPath(path2);
-      return file instanceof import_obsidian2.TFile ? this.readContent(file) : "";
+      return file instanceof import_obsidian3.TFile ? this.readContent(file) : "";
     });
     this.plugin = plugin;
     this.rt = new ViewRuntime((err) => {
@@ -6933,50 +7096,87 @@ var MindmapView = class extends import_obsidian2.ItemView {
     container.empty();
     container.classList.add("obmind-container");
     const header = container.createDiv({ cls: "obmind-header" });
-    const toolbar = header.createDiv({ cls: "obmind-toolbar" });
-    const select = toolbar.createEl("select", { cls: "dropdown" });
+    const select = document.createElement("select");
+    select.className = "dropdown";
     for (const opt of THEME_OPTIONS) {
-      const optionEl = select.createEl("option", { text: opt.label });
+      const optionEl = document.createElement("option");
       optionEl.value = opt.value;
+      optionEl.textContent = opt.label;
+      select.appendChild(optionEl);
     }
     select.value = this.plugin.settings.theme;
     select.addEventListener("change", () => {
       void this.onThemeChange(select.value);
     });
     this.themeSelect = select;
-    const refreshBtn = toolbar.createEl("button", {
-      cls: "obmind-refresh",
-      text: "\u5237\u65B0"
+    this.toolbar = buildToolbar(header, {
+      leading: select,
+      rows: [
+        {
+          groups: [
+            {
+              buttons: [
+                { id: "undo", icon: "undo-2", label: "\u64A4\u9500", key: "Ctrl+Z", fallback: "\u64A4" },
+                { id: "redo", icon: "redo-2", label: "\u91CD\u505A", key: "Ctrl+Shift+Z", fallback: "\u91CD" }
+              ]
+            },
+            {
+              buttons: [
+                {
+                  id: "collapseAll",
+                  icon: "chevrons-down-up",
+                  label: "\u6298\u53E0\u5168\u90E8",
+                  fallback: "\u6298"
+                },
+                {
+                  id: "expandAll",
+                  icon: "chevrons-up-down",
+                  label: "\u5C55\u5F00\u5168\u90E8",
+                  fallback: "\u5C55"
+                },
+                { id: "fit", icon: "maximize", label: "\u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3", fallback: "\u9002" },
+                { id: "refresh", icon: "refresh-cw", label: "\u91CD\u65B0\u8BFB\u53D6\u7B14\u8BB0", fallback: "\u5237" }
+              ]
+            },
+            {
+              pin: true,
+              buttons: [
+                { id: "help", icon: "help-circle", label: "\u64CD\u4F5C\u4E0E\u5FEB\u6377\u952E", fallback: "?" }
+              ]
+            }
+          ]
+        },
+        {
+          status: true,
+          groups: [
+            {
+              buttons: [
+                { id: "edit", icon: "pencil", label: "\u7F16\u8F91\u8282\u70B9", key: "F2 / \u53CC\u51FB", fallback: "\u6539" },
+                {
+                  id: "child",
+                  icon: "corner-down-right",
+                  label: "\u65B0\u5EFA\u5B50\u7EA7",
+                  key: "Tab",
+                  fallback: "\u5B50"
+                },
+                { id: "sibling", icon: "plus", label: "\u65B0\u5EFA\u540C\u7EA7", key: "Enter", fallback: "\u540C" },
+                {
+                  id: "outdent",
+                  icon: "corner-up-left",
+                  label: "\u63D0\u5347\u4E00\u7EA7",
+                  key: "Shift+Tab",
+                  fallback: "\u63D0"
+                },
+                { id: "delete", icon: "trash-2", label: "\u5220\u9664\u8282\u70B9", key: "Delete", fallback: "\u5220" }
+              ]
+            }
+          ]
+        }
+      ],
+      onAction: (id2) => this.onToolbar(id2)
     });
-    refreshBtn.addEventListener("click", () => {
-      this.snapshot = null;
-      this.refresh();
-    });
-    const fitBtn = toolbar.createEl("button", {
-      cls: "obmind-fit",
-      text: "\u9002\u914D",
-      attr: { title: "\u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3" }
-    });
-    fitBtn.addEventListener("click", () => {
-      var _a;
-      void ((_a = this.mm) == null ? void 0 : _a.fit());
-    });
-    toolbar.createSpan({
-      cls: "obmind-hint",
-      text: "?",
-      attr: {
-        title: [
-          "\u5DE6\u952E\u5355\u51FB\uFF1A\u9009\u4E2D\u8282\u70B9\uFF0C\u4E4B\u540E Tab \u5EFA\u5B50\u7EA7 / Enter \u5EFA\u540C\u7EA7",
-          "\u9009\u4E2D\u540E Delete / Backspace\uFF1A\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9",
-          "\u53F3\u952E\u62D6\u52A8\u8282\u70B9\uFF1A\u6539\u53D8\u7236\u5B50\u5173\u7CFB\uFF08\u5DE6\u952E\u4E0D\u518D\u62D6\u52A8\uFF09",
-          "\u53CC\u51FB\u8282\u70B9 / F2\uFF1A\u539F\u5730\u7F16\u8F91",
-          "\u7F16\u8F91\u6846\u5185\uFF1AEnter \u5B8C\u6210 \xB7 Esc \u53D6\u6D88 \xB7 Ctrl+Enter \u65B0\u5EFA\u540C\u7EA7",
-          "\u7F16\u8F91\u6846\u5185\uFF1ATab \u7F29\u8FDB \xB7 Shift+Tab \u53CD\u7F29\u8FDB \xB7 \u6E05\u7A7A\u540E\u9000\u683C\u5220\u9664\u8BE5\u8282\u70B9",
-          "Ctrl/\u2318 + \u5355\u51FB\u8282\u70B9\uFF1A\u6253\u5F00\u540C\u540D\u7B14\u8BB0",
-          "\u70B9\u53CC\u94FE / \u9762\u5305\u5C51\uFF1A\u7B14\u8BB0\u7A97\u53E3\u662F\u5426\u8DDF\u968F\uFF0C\u89C1\u8BBE\u7F6E\u91CC\u7684\u300C\u9762\u5305\u5C51\u4E0E\u7B14\u8BB0\u89C6\u56FE\u8054\u52A8\u300D"
-        ].join("\n")
-      }
-    });
+    this.helpPanel = this.toolbar.el.createDiv({ cls: "obmind-help-panel is-hidden" });
+    this.buildHelpPanel();
     this.breadcrumbEl = header.createDiv({ cls: "obmind-breadcrumb" });
     this.breadcrumbEl.addClass("is-hidden");
     const canvas = container.createDiv({ cls: "obmind-canvas" });
@@ -6994,7 +7194,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.registerEvent(
       this.app.workspace.on(
         "editor-change",
-        (0, import_obsidian2.debounce)(() => this.refresh(), 300, true)
+        (0, import_obsidian3.debounce)(() => this.refresh(), 300, true)
       )
     );
     this.registerEvent(
@@ -7019,6 +7219,15 @@ var MindmapView = class extends import_obsidian2.ItemView {
       onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(srcLine, targetLine, mode)
     });
     this.renderBreadcrumb();
+    this.registerDomEvent(document, "click", (e) => {
+      if (!this.helpPanel || this.helpPanel.hasClass("is-hidden"))
+        return;
+      const target = e.target;
+      if ((target == null ? void 0 : target.closest(".obmind-help-panel")) || (target == null ? void 0 : target.closest(".obmind-toolbar")))
+        return;
+      this.helpPanel.addClass("is-hidden");
+    });
+    this.syncToolbar();
   }
   /**
    * 监听导图的布局变化，并按变化类型分流。
@@ -7122,6 +7331,204 @@ var MindmapView = class extends import_obsidian2.ItemView {
     await this.plugin.saveSettings();
     this.refresh();
   }
+  // -------------------------------------------------------------------------
+  // 操作栏
+  // -------------------------------------------------------------------------
+  /** 操作栏的唯一分发点：按钮只报 id，具体做什么集中在这里 */
+  onToolbar(id2) {
+    switch (id2) {
+      case "undo":
+        void this.stepHistory("undo");
+        break;
+      case "redo":
+        void this.stepHistory("redo");
+        break;
+      case "collapseAll":
+        this.setAllFolds(true);
+        break;
+      case "expandAll":
+        this.setAllFolds(false);
+        break;
+      case "fit":
+        this.fitView();
+        break;
+      case "refresh":
+        this.snapshot = null;
+        this.refresh();
+        break;
+      case "edit":
+        this.editSelected();
+        break;
+      case "child":
+      case "sibling":
+        this.createNode(id2);
+        break;
+      case "outdent":
+        this.outdentSelected();
+        break;
+      case "delete":
+        this.removeNode();
+        break;
+      case "help":
+        this.toggleHelp();
+        break;
+    }
+  }
+  /**
+   * 同步按钮可用态与状态文字。
+   *
+   * 集中在这一处而不是散在各操作里：按钮该不该点亮只取决于「有没有选中节点」
+   * 「能不能撤销」这两三个状态，散着写必然出现「删完了删除键还是亮的」这类不同步。
+   */
+  syncToolbar() {
+    const t = this.toolbar;
+    if (!t)
+      return;
+    const src = this.nodeAt(this.selectedLine);
+    const onNode = src !== null && src.depth > 0;
+    t.setEnabled("edit", onNode);
+    t.setEnabled("child", src !== null);
+    t.setEnabled("sibling", src !== null);
+    t.setEnabled("outdent", onNode);
+    t.setEnabled("delete", onNode);
+    t.setEnabled("undo", canUndo(this.history));
+    t.setEnabled("redo", canRedo(this.history));
+    const ready = this.mm !== null;
+    t.setEnabled("fit", ready);
+    t.setEnabled("collapseAll", ready);
+    t.setEnabled("expandAll", ready);
+    t.setStatus(onNode && src ? `\u5DF2\u9009\u4E2D\uFF1A${clip(src.text)}` : "");
+  }
+  /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
+  nodeAt(line) {
+    var _a, _b;
+    if (line < 0)
+      return null;
+    const nodes = (_a = this.snapshot) == null ? void 0 : _a.nodes;
+    if (!nodes)
+      return null;
+    return (_b = nodes.find((n) => n.line === line)) != null ? _b : null;
+  }
+  /** 编辑选中节点（操作栏的铅笔按钮） */
+  editSelected() {
+    const node = this.findNodeByLine(this.selectedLine);
+    if (node)
+      this.startEdit(node, false);
+  }
+  /**
+   * 提升一级（Shift+Tab / 操作栏）。
+   *
+   * 复用 EditService 的 outdent：它已经在用例里覆盖了「已在最外层」
+   * 「制表符与空格的缩进单位」这些边界，画布上没必要再写一遍。
+   */
+  outdentSelected() {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    const src = this.nodeAt(this.selectedLine);
+    if (!file || !snap || !src) {
+      this.syncToolbar();
+      return;
+    }
+    const out = this.editSvc.commit({
+      snap,
+      src,
+      action: "outdent",
+      value: this.editorValueOf(src)
+    });
+    if (out.kind === "error" || out.kind === "none") {
+      new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
+      return;
+    }
+    void this.applyPlan(file, out.op);
+  }
+  fitView() {
+    var _a;
+    void ((_a = this.mm) == null ? void 0 : _a.fit());
+  }
+  /**
+   * 全部折叠 / 全部展开。
+   *
+   * 只改 payload.fold 再把同一棵树灌回 markmap，不重新解析笔记 ——
+   * 折叠是纯视图状态，没有理由去碰文件。
+   *
+   * applyTree 内部 duration=0：两千个节点同时折叠时若带过渡，
+   * 会看到几百条线一起飞，反而看不出结构变化。
+   */
+  setAllFolds(fold) {
+    var _a;
+    const tree = (_a = this.snapshot) == null ? void 0 : _a.tree;
+    if (!tree || !this.mm)
+      return;
+    let changed = false;
+    const walk = (node) => {
+      var _a2, _b;
+      const kids = (_a2 = node.children) != null ? _a2 : [];
+      if (kids.length === 0)
+        return;
+      const folded = typeof ((_b = node.payload) == null ? void 0 : _b.fold) === "number" && node.payload.fold > 0;
+      if (folded !== fold) {
+        node.payload = { ...node.payload, fold: fold ? 1 : 0 };
+        changed = true;
+      }
+      for (const kid of kids)
+        walk(kid);
+    };
+    walk(tree);
+    if (!changed)
+      return;
+    void this.applyTree(tree).then(() => {
+      this.paintSelection();
+      this.syncToolbar();
+    });
+  }
+  /**
+   * 撤销 / 重做一步。
+   *
+   * 写入用「整篇替换」：历史里存的就是某一时刻的完整内容。
+   * expect 用当前快照内容 —— 若用户在编辑器里改过，锚点对不上就整体放弃，
+   * 绝不会把别处的改动覆盖掉。
+   */
+  async stepHistory(kind) {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap)
+      return;
+    const step = kind === "undo" ? undo(this.history, snap.content) : redo(this.history, snap.content);
+    if (!step) {
+      this.syncToolbar();
+      return;
+    }
+    const res = await this.runWrite(
+      file,
+      { kind: "whole", content: step.write, expect: snap.content },
+      false
+    );
+    if (!res.ok) {
+      this.syncToolbar();
+      return;
+    }
+    this.history = step.state;
+    this.selectedLine = -1;
+    this.refresh(step.write);
+    this.syncToolbar();
+  }
+  buildHelpPanel() {
+    const el = this.helpPanel;
+    if (!el)
+      return;
+    el.createDiv({ cls: "obmind-help-title", text: "\u64CD\u4F5C\u4E0E\u5FEB\u6377\u952E" });
+    for (const [keys, text] of HELP_ROWS) {
+      const row = el.createDiv({ cls: "obmind-help-row" });
+      row.createSpan({ cls: "obmind-help-key", text: keys });
+      row.createSpan({ text });
+    }
+  }
+  toggleHelp() {
+    const el = this.helpPanel;
+    if (!el)
+      return;
+    el.toggleClass("is-hidden", !el.hasClass("is-hidden"));
+  }
   /**
    * 解析当前应该渲染哪篇笔记。
    * 不能只依赖 getActiveViewOfType(MarkdownView)——用户点导图视图里的下拉框时，
@@ -7143,7 +7550,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     }
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (view instanceof import_obsidian2.MarkdownView && view.file) {
+      if (view instanceof import_obsidian3.MarkdownView && view.file) {
         this.targetFile = view.file;
         return view.file;
       }
@@ -7193,11 +7600,11 @@ var MindmapView = class extends import_obsidian2.ItemView {
           return;
         }
         const holder = document.createElement("div");
-        const part = new import_obsidian2.Component();
+        const part = new import_obsidian3.Component();
         part.load();
         this.blockParts.push(part);
         try {
-          await import_obsidian2.MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
+          await import_obsidian3.MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
           const html = holder.innerHTML.trim();
           if (html !== "") {
             node.content = html;
@@ -7509,7 +7916,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
         href,
         (_d = (_c = this.targetFile) == null ? void 0 : _c.path) != null ? _d : ""
       );
-      if (dest instanceof import_obsidian2.TFile) {
+      if (dest instanceof import_obsidian3.TFile) {
         this.openDoc(dest);
       }
       return;
@@ -7527,7 +7934,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
         text,
         (_g = (_f = this.targetFile) == null ? void 0 : _f.path) != null ? _g : ""
       );
-      if (dest instanceof import_obsidian2.TFile)
+      if (dest instanceof import_obsidian3.TFile)
         this.openDoc(dest);
       return;
     }
@@ -7589,7 +7996,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     if (target === "none")
       return void 0;
     if (target === "current") {
-      const leaf2 = (_c = (_b = this.leafShowing(previous)) != null ? _b : (_a = this.app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView)) == null ? void 0 : _a.leaf) != null ? _c : null;
+      const leaf2 = (_c = (_b = this.leafShowing(previous)) != null ? _b : (_a = this.app.workspace.getActiveViewOfType(import_obsidian3.MarkdownView)) == null ? void 0 : _a.leaf) != null ? _c : null;
       if (leaf2) {
         this.openInLeaf(leaf2, file);
         return void 0;
@@ -7637,7 +8044,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return null;
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (view instanceof import_obsidian2.MarkdownView && ((_a = view.file) == null ? void 0 : _a.path) === file.path)
+      if (view instanceof import_obsidian3.MarkdownView && ((_a = view.file) == null ? void 0 : _a.path) === file.path)
         return leaf;
     }
     return null;
@@ -7671,7 +8078,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     if (!top)
       return null;
     const file = this.app.vault.getAbstractFileByPath(top.path);
-    if (file instanceof import_obsidian2.TFile)
+    if (file instanceof import_obsidian3.TFile)
       return file;
     this.resetNav();
     return null;
@@ -7682,7 +8089,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     if (!entry)
       return;
     const target = this.app.vault.getAbstractFileByPath(entry.path);
-    if (!(target instanceof import_obsidian2.TFile)) {
+    if (!(target instanceof import_obsidian3.TFile)) {
       this.resetNav();
       this.refresh();
       return;
@@ -7746,6 +8153,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     this.selectedLine = line;
     this.paintSelection();
+    this.syncToolbar();
   }
   /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
   paintSelection() {
@@ -7770,10 +8178,21 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     if (e.isComposing)
       return;
+    if (e.ctrlKey || e.metaKey) {
+      const key = e.key.toLowerCase();
+      if (key === "z" || key === "y") {
+        e.preventDefault();
+        e.stopPropagation();
+        void this.stepHistory(key === "y" || e.shiftKey ? "redo" : "undo");
+        return;
+      }
+    }
     if (e.key === "Tab") {
       e.preventDefault();
       e.stopPropagation();
-      if (!e.shiftKey)
+      if (e.shiftKey)
+        this.outdentSelected();
+      else
         this.createNode("child");
       return;
     }
@@ -7784,6 +8203,10 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     }
     if (e.key === "Escape") {
+      if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+        this.helpPanel.addClass("is-hidden");
+        return;
+      }
       this.setSelectedLine(-1);
       return;
     }
@@ -7807,7 +8230,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
   createNode(mode) {
     const line = this.selectedLine;
     if (line < 0) {
-      new import_obsidian2.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
+      new import_obsidian3.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
       return;
     }
     const file = this.targetFile;
@@ -7816,7 +8239,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     const out = this.editSvc.create({ snap, line, mode });
     if (out.kind === "error") {
-      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -7845,7 +8268,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     const parentLine = this.editSvc.parentLineOf(snap, line);
     const out = this.editSvc.remove({ snap, line });
     if (out.kind === "error") {
-      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -7854,7 +8277,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.selectedLine = parentLine;
     void this.applyPlan(file, out.op);
     if (size > 1) {
-      new import_obsidian2.Notice(`obmind\uFF1A\u5DF2\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176 ${size - 1} \u4E2A\u5B50\u8282\u70B9`);
+      new import_obsidian3.Notice(`obmind\uFF1A\u5DF2\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176 ${size - 1} \u4E2A\u5B50\u8282\u70B9`);
     }
   }
   /** 双击节点进入原地编辑 */
@@ -7891,7 +8314,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       return;
     const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
     if (out.kind === "error") {
-      new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -7906,7 +8329,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
         this.refresh(res.next);
     } catch (err) {
       console.error("[obmind] \u5199\u5165\u5931\u8D25", err);
-      new import_obsidian2.Notice("\u5199\u5165\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
+      new import_obsidian3.Notice("\u5199\u5165\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
     }
   }
   /** 从节点的绑定数据里取源行坐标 */
@@ -7951,7 +8374,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     if (!src || ((_b = data == null ? void 0 : data.state) == null ? void 0 : _b.depth) === 0)
       return;
     const spec = (_c = this.currentSpec) != null ? _c : resolveTheme(this.plugin.settings.theme, false);
-    const value = src.checked === null ? src.text : `${src.checked ? "\u2611" : "\u2610"} ${src.text}`;
+    const value = this.editorValueOf(src);
     this.rt.setPhase("editing");
     const handle = openInlineEditor({
       container: this.canvasEl,
@@ -7988,7 +8411,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
       const out = this.editSvc.commit({ snap, src, action, value });
       if (out.kind === "error") {
         this.pendingEditLine = -1;
-        new import_obsidian2.Notice(`obmind\uFF1A${out.reason}`);
+        new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
         return;
       }
       if (out.kind === "none")
@@ -8000,7 +8423,7 @@ var MindmapView = class extends import_obsidian2.ItemView {
     } catch (err) {
       this.pendingEditLine = -1;
       console.error("[obmind] \u5199\u56DE\u7B14\u8BB0\u5931\u8D25", err);
-      new import_obsidian2.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
+      new import_obsidian3.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
     } finally {
       this.editorHandle = null;
       this.rt.setPhase("idle");
@@ -8015,23 +8438,45 @@ var MindmapView = class extends import_obsidian2.ItemView {
     return { content: s.content, nodes: s.nodes, step: this.indentStep, unit: this.indentUnit };
   }
   /**
+   * 节点在编辑框里的初始文本。
+   *
+   * 任务列表带勾选框：编辑时要能看见并改它，所以把勾选状态拼成 ☑/☐ 前缀，
+   * 提交时由 parseEditorValue 再解析回去。画布上「提升一级」也走这条路 ——
+   * 否则会把任务项改写成普通列表项。
+   */
+  editorValueOf(src) {
+    return src.checked === null ? src.text : `${src.checked ? "\u2611" : "\u2610"} ${src.text}`;
+  }
+  /**
    * 执行一次写入计划。
    *
    * 这里是视图与文件 IO 的唯一接触点：计划怎么写由 writer 决定
    * （有编辑器走 transaction 保留 Ctrl+Z，没有才退回 vault.process）。
+   *
+   * @param remember 是否记入撤销历史。撤销/重做本身不能再记，
+   *                 否则「撤销」会把自己也压进 past，点两下就原地打转。
    */
-  async runWrite(file, op) {
+  async runWrite(file, op, remember = true) {
+    var _a, _b;
     const res = await applyOp(this.app, file, op);
     if (!res.ok) {
       this.pendingEditLine = -1;
-      new import_obsidian2.Notice(`obmind\uFF1A${res.reason}`);
+      new import_obsidian3.Notice(`obmind\uFF1A${res.reason}`);
       return { ok: false };
     }
+    if (remember) {
+      const before = (_b = (_a = this.snapshot) == null ? void 0 : _a.content) != null ? _b : "";
+      if (res.next !== void 0 && res.next !== before) {
+        this.history = record(this.history, before);
+      }
+    }
+    this.syncToolbar();
     return { ok: true, next: res.next };
   }
   /** 重建完成后，把编辑框落到新建的那一行上 */
   flushPendingEdit() {
     this.paintSelection();
+    this.syncToolbar();
     const line = this.pendingEditLine;
     if (line < 0)
       return;
@@ -8074,6 +8519,9 @@ var MindmapView = class extends import_obsidian2.ItemView {
     this.leafById.clear();
     this.breadcrumbEl = null;
     this.selectedLine = -1;
+    this.history = EMPTY_HISTORY;
+    this.toolbar = null;
+    this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;
     this.themeSelect = null;
@@ -8081,13 +8529,13 @@ var MindmapView = class extends import_obsidian2.ItemView {
 };
 
 // src/settings.ts
-var import_obsidian3 = require("obsidian");
+var import_obsidian4 = require("obsidian");
 var DEFAULT_SETTINGS = {
   theme: "follow",
   filterFrontmatter: true,
   navSync: DEFAULT_NAV_SYNC
 };
-var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
+var ObmindSettingTab = class extends import_obsidian4.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -8095,7 +8543,7 @@ var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian3.Setting(containerEl).setName("\u8FC7\u6EE4\u7B14\u8BB0\u5C5E\u6027").setDesc("\u751F\u6210\u5BFC\u56FE\u65F6\u8DF3\u8FC7\u7B14\u8BB0\u9876\u90E8\u7684 YAML frontmatter\uFF08\u5C5E\u6027\u533A\uFF09\u3002\u4E3B\u9898\u8BF7\u5728\u601D\u7EF4\u5BFC\u56FE\u89C6\u56FE\u9876\u90E8\u5207\u6362\u3002").addToggle((toggle) => {
+    new import_obsidian4.Setting(containerEl).setName("\u8FC7\u6EE4\u7B14\u8BB0\u5C5E\u6027").setDesc("\u751F\u6210\u5BFC\u56FE\u65F6\u8DF3\u8FC7\u7B14\u8BB0\u9876\u90E8\u7684 YAML frontmatter\uFF08\u5C5E\u6027\u533A\uFF09\u3002\u4E3B\u9898\u8BF7\u5728\u601D\u7EF4\u5BFC\u56FE\u89C6\u56FE\u9876\u90E8\u5207\u6362\u3002").addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.filterFrontmatter);
       toggle.onChange(async (value) => {
         this.plugin.settings.filterFrontmatter = value;
@@ -8110,7 +8558,7 @@ var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
       );
       hint.setText(hit ? hit.desc : "");
     };
-    new import_obsidian3.Setting(containerEl).setName("\u9762\u5305\u5C51\u4E0E\u7B14\u8BB0\u89C6\u56FE\u8054\u52A8").setDesc("\u5728\u5BFC\u56FE\u91CC\u70B9\u53CC\u94FE\u3001\u6216\u7528\u9762\u5305\u5C51\u56DE\u9000\u65F6\uFF0C\u7B14\u8BB0\u7A97\u53E3\u600E\u4E48\u8DDF\u968F\u3002").addDropdown((dd) => {
+    new import_obsidian4.Setting(containerEl).setName("\u9762\u5305\u5C51\u4E0E\u7B14\u8BB0\u89C6\u56FE\u8054\u52A8").setDesc("\u5728\u5BFC\u56FE\u91CC\u70B9\u53CC\u94FE\u3001\u6216\u7528\u9762\u5305\u5C51\u56DE\u9000\u65F6\uFF0C\u7B14\u8BB0\u7A97\u53E3\u600E\u4E48\u8DDF\u968F\u3002").addDropdown((dd) => {
       for (const opt of NAV_SYNC_OPTIONS)
         dd.addOption(opt.value, opt.label);
       const current = normalizeNavSync(this.plugin.settings.navSync);
@@ -8128,7 +8576,7 @@ var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
 
 // src/main.ts
 var THEME_CYCLE = ["follow", ...THEMES.map((t) => t.id)];
-var MindmapPlugin = class extends import_obsidian4.Plugin {
+var MindmapPlugin = class extends import_obsidian5.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -8169,6 +8617,26 @@ var MindmapPlugin = class extends import_obsidian4.Plugin {
           this.refreshMindmap();
         }
       });
+      this.addCommand({
+        id: "mindmap-collapse-all",
+        name: "\u6298\u53E0\u5168\u90E8\u8282\u70B9",
+        callback: () => this.withMindmap((view) => view.setAllFolds(true))
+      });
+      this.addCommand({
+        id: "mindmap-expand-all",
+        name: "\u5C55\u5F00\u5168\u90E8\u8282\u70B9",
+        callback: () => this.withMindmap((view) => view.setAllFolds(false))
+      });
+      this.addCommand({
+        id: "mindmap-fit",
+        name: "\u7F29\u653E\u5BFC\u56FE\u5230\u9002\u5408\u7A97\u53E3",
+        callback: () => this.withMindmap((view) => view.fitView())
+      });
+      this.addCommand({
+        id: "mindmap-reread",
+        name: "\u91CD\u65B0\u8BFB\u53D6\u7B14\u8BB0\u5E76\u91CD\u7ED8\u5BFC\u56FE",
+        callback: () => this.withMindmap((view) => void view.refresh())
+      });
     });
     this.safely("\u6DFB\u52A0\u8BBE\u7F6E\u9875", () => {
       this.addSettingTab(new ObmindSettingTab(this.app, this));
@@ -8191,7 +8659,7 @@ var MindmapPlugin = class extends import_obsidian4.Plugin {
         return;
       }
       console.error(`[obmind] ${step}\u5931\u8D25`, err);
-      new import_obsidian4.Notice(`obmind ${step}\u5931\u8D25\uFF1A${detail}`, 15e3);
+      new import_obsidian5.Notice(`obmind ${step}\u5931\u8D25\uFF1A${detail}`, 15e3);
     }
   }
   async activateView() {
@@ -8207,7 +8675,7 @@ var MindmapPlugin = class extends import_obsidian4.Plugin {
     }
     const view = leaf.view;
     if (view instanceof MindmapView) {
-      view.setTargetFile(activeFile instanceof import_obsidian4.TFile ? activeFile : null);
+      view.setTargetFile(activeFile instanceof import_obsidian5.TFile ? activeFile : null);
       void view.refresh();
     }
     workspace.revealLeaf(leaf);
@@ -8220,6 +8688,23 @@ var MindmapPlugin = class extends import_obsidian4.Plugin {
         void view.refresh();
       }
     }
+  }
+  /**
+   * 对「当前打开的那个导图」执行一个动作。
+   *
+   * 命令面板不区分焦点在哪个面板，所以这里统一取第一个导图视图；
+   * 没有打开时给一句明确提示，而不是静默什么都不发生 ——
+   * 静默失败是最难排查的一类问题。
+   */
+  withMindmap(action) {
+    for (const leaf of this.app.workspace.getLeavesOfType(MINDMAP_VIEW_TYPE)) {
+      const view = leaf.view;
+      if (view instanceof MindmapView) {
+        action(view);
+        return;
+      }
+    }
+    new import_obsidian5.Notice("obmind\uFF1A\u5148\u6253\u5F00\u601D\u7EF4\u5BFC\u56FE\uFF08\u5DE6\u4FA7\u56FE\u6807\uFF0C\u6216\u547D\u4EE4\u300C\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE\u300D\uFF09");
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());

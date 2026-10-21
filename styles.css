@@ -19,25 +19,189 @@
   min-width: 0;
 }
 
+/* 操作栏：两行。
+   第一行是「对整张图」的动作（撤销 / 折叠 / 适配 / 刷新），
+   第二行是「对选中节点」的动作（编辑 / 新建 / 提升 / 删除）。
+   分成两行而不是堆一行：侧栏通常只有 300px 宽，一行塞十个图标必然溢出；
+   按语义分行之后，用户扫一眼就知道哪排作用于什么。 */
+.obmind-toolbars {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-width: 0;
+  position: relative;
+  border-bottom: 1px solid var(--background-modifier-border);
+  /* 让下面那条 @container 能按「操作栏自身宽度」生效：
+     侧栏被拖窄时靠它把图标和间距一起收紧，而不是把最后一个按钮切掉。 */
+  container-type: inline-size;
+}
+
 .obmind-toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--background-modifier-border);
+  /* 刻意**不换行**：工具栏高度必须稳定，换行会让画布在点击时上下跳。
+     宽度不够时由主题下拉收缩让位（它是这一行唯一缩了还能用的控件）。 */
+  flex-wrap: nowrap;
+  gap: 2px;
+  padding: 4px 6px 3px;
+  min-width: 0;
   flex: 0 0 auto;
 }
 
-.obmind-toolbar select.dropdown {
-  min-width: 110px;
-  height: 26px;
+/* 第二行贴着第一行：两排图标之间不要留出一道空隙，否则像两个独立工具条 */
+.obmind-toolbar.is-sub {
+  padding-top: 0;
+  padding-bottom: 5px;
 }
 
-.obmind-toolbar .obmind-refresh,
-.obmind-toolbar .obmind-fit {
+/* 主题下拉：宽度紧的时候允许收缩（min-width:0 才能真的缩），
+   图标按钮缩了就没法点，所以让下拉承担全部压缩量。 */
+.obmind-toolbar select.dropdown {
+  width: 92px;
+  min-width: 54px;
   height: 26px;
-  padding: 0 10px;
+  margin-right: 6px;
+  flex: 0 1 auto;
+}
+
+.obmind-toolbar .clickable-icon {
+  height: 26px;
+  width: 26px;
+  padding: 4px;
+  flex: 0 0 auto;
+}
+
+/* 禁用态：保留图标与 tooltip，只是变淡。
+   直接隐藏会让用户以为「没有这个功能」，变淡才是「现在用不了」。 */
+.obmind-toolbar .clickable-icon:disabled {
+  opacity: 0.35;
+  cursor: default;
+  background: transparent;
+}
+
+/* 图标缺失时的文字兜底按钮 */
+.obmind-toolbar .clickable-icon.obmind-icon-fallback {
+  width: auto;
+  min-width: 26px;
+  padding: 0 6px;
   font-size: var(--font-ui-smaller, 12px);
+  line-height: 26px;
+}
+
+.obmind-toolbar-sep {
+  width: 1px;
+  height: 15px;
+  margin: 0 5px;
+  background: var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+
+.obmind-toolbar-spacer {
+  flex: 1 1 auto;
+  min-width: 4px;
+}
+
+/* 状态文字：说明第二行为什么可以（或不可以）点。
+   没有它，没选中节点时那一排灰按钮看起来就像坏了。
+   单行省略，绝不换行 —— 工具条高度必须稳定。 */
+.obmind-toolbar .obmind-status {
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 允许收缩 + min-width:0：省略号才会真正生效，
+     否则 flex 项的最小内容宽度会把这一行顶出可视区 */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  padding-left: 6px;
+}
+
+.obmind-toolbar .obmind-status.is-empty {
+  display: none;
+}
+
+/* 快捷键面板：点「?」浮出。
+   比 hover tooltip 实用——组合键是要边看边试的，鼠标一移开就消失的提示
+   等于没有。位置相对操作栏定位，面包屑出现/消失都不会让它错位。 */
+.obmind-help-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 6px;
+  z-index: 30;
+  min-width: 230px;
+  max-width: min(340px, 94%);
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  font-size: var(--font-ui-smaller, 12px);
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+.obmind-help-panel.is-hidden {
+  display: none;
+}
+
+.obmind-help-panel .obmind-help-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.obmind-help-panel .obmind-help-key {
+  flex: 0 0 auto;
+  min-width: 78px;
+  color: var(--text-normal);
+  font-family: var(--font-monospace, ui-monospace, monospace);
+  font-size: 11px;
+}
+
+.obmind-help-panel .obmind-help-title {
+  margin-bottom: 6px;
+  color: var(--text-normal);
+  font-weight: var(--font-semibold, 600);
+}
+
+/* 下面两条容器查询必须放在基础规则**之后**：
+   @container 不提升优先级，同优先级下靠书写顺序取胜，
+   放在前面会被后面的 .obmind-toolbar 规则原样覆盖回去。 */
+/* 窄侧栏（Obsidian 允许拖到 260px 上下）：
+   图标 26 → 24、分隔线留白减半、下拉再让一点，实测 260px 仍能一行放下。 */
+@container (max-width: 310px) {
+  .obmind-toolbar .clickable-icon {
+    width: 24px;
+    height: 24px;
+    padding: 3px;
+  }
+
+  .obmind-toolbar-sep {
+    margin: 0 3px;
+  }
+
+  .obmind-toolbar select.dropdown {
+    width: 84px;
+    margin-right: 4px;
+  }
+}
+
+/* 极窄（用户把侧栏拖到底）：分组竖线先让位 —— 它们的间隙就是最后这十几个像素。
+   按钮靠颜色与间距已经能看出成组，竖线只是锦上添花。 */
+@container (max-width: 280px) {
+  .obmind-toolbar {
+    gap: 1px;
+  }
+
+  .obmind-toolbar-sep {
+    display: none;
+  }
+
+  .obmind-toolbar select.dropdown {
+    width: 70px;
+  }
 }
 
 /* 面包屑：导图内双链跳转的路径。点前面任意一级 = 退回那篇笔记。
@@ -138,6 +302,16 @@
   stroke-width: 2;
 }
 
+/* 光标提示：卡片上按左键可以拖动改层级 —— 不给抓手光标的话，
+   用户根本不知道这个能力存在（拖动是唯一没有按钮的交互）。 */
+.obmind-canvas g.markmap-node .obmind-node-card {
+  cursor: grab;
+}
+
+.obmind-canvas g.markmap-node.obmind-dragging .obmind-node-card {
+  cursor: grabbing;
+}
+
 /* markmap 自带的连线接在节点底边（像"线贴在卡片下面"），且无法通过选项改成
    连到垂直中心，因此隐藏它，改由 JS 在每个节点 g 内自绘 XMind 风格的曲线。 */
 .obmind-canvas path.markmap-link {
@@ -155,12 +329,16 @@
   pointer-events: none;
 }
 
-/* 折叠圆点：位置由 JS 用 transform 平移（不改 cx/cy，避免与 markmap 抢写）。
-   transform-box 用 view-box，保证平移量按 SVG 用户单位计算；
-   transition 让圆点在节点高度变化时平滑跟随，不跳。 */
+/* 折叠圆点：位置与大小都由 JS 用 transform 写（不改 cx/cy/r，避免与 markmap 抢写）。
+   transform-box 用 fill-box + origin center，缩放才会绕圆点自身中心进行：
+   translate 分量按用户单位生效，scale(0.7) 后直径 12 → 8.4，圆心仍精确落在
+   卡片右沿（实测，见 .tmp 探针）。用 view-box 的话原点在图左上角，
+   缩放会把圆点整体拽向原点，位置就全错了。 */
 .obmind-canvas .markmap-node > circle {
-  transform-box: view-box;
+  transform-box: fill-box;
+  transform-origin: center;
   transition: transform 0.12s ease-out;
+  cursor: pointer;
 }
 
 /* 双链 / 外链：跟随节点文字色，避免实色卡片上蓝色链接看不清 */

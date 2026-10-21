@@ -33,6 +33,18 @@ const CLS_SHADOW = "obmind-node-shadow";
 const CLS_LINK = "obmind-node-link";
 const CLS_CARD = "obmind-node-card";
 
+/**
+ * 收放点的缩放系数。
+ *
+ * markmap 原生 r=6、描边 1.5，视觉直径约 13px —— 比卡片里的文字还抢眼。
+ * 缩到 0.7（直径约 9px）既点得中，又不压住内容。
+ *
+ * 用 scale 而不是改 `r` 属性：r 由 markmap 的 transition 一路写（0→6），
+ * 两边抢写同一个属性正是之前「收放点抖动」的根源；transform 与属性是叠加关系，
+ * 各写各的，互不覆盖。
+ */
+const FOLD_SCALE = 0.7;
+
 /** 每个节点的绘制缓存：元素引用 + 各维度上次写入的值 */
 interface Entry {
   g: SVGGElement;
@@ -303,11 +315,15 @@ export class NodePainter {
   }
 
   /**
-   * 折叠圆点：用 CSS transform 平移到卡片右边缘的垂直中点。
+   * 折叠圆点：移到卡片右边缘中点，并按 FOLD_SCALE 缩小。
    *
-   * 不改 cx/cy —— markmap 每次重渲染都会把这两个属性重置回内容右下角，
-   * 两边抢写同一个属性正是之前「收放点抖动」的根源。
-   * transform 与属性是叠加关系，各写各的，互不覆盖。
+   * 两件事都靠 CSS transform 完成，不改 cx/cy/r —— markmap 每次重渲染都会把
+   * 这些属性重写一遍，两边抢写同一个属性就会互相打架。
+   *
+   * 另外这里顺手补上 markmap 的一个缺口：**节点失去全部孩子后，它既不删掉
+   * 那个 `<circle>`，也不把 r 归零**（实测 r 仍然是 6）。于是叶子节点右侧会挂
+   * 着一个永远点不出东西的收放点 —— 就是「刚操作过的卡片旁边多出一个小圆点」。
+   * 判据必须用节点数据里的 children，不能看 DOM 上的 r。
    */
   private applyCircle(box: NodeBox, entry: Entry): void {
     let circle = entry.circle;
@@ -316,8 +332,29 @@ export class NodePainter {
       entry.circle = circle;
       entry.circleX = Number.NaN;
       entry.circleY = Number.NaN;
+      if (circle) {
+        // 缩放要绕圆点自身中心，否则会绕着 SVG 原点缩放、整个点飞出去。
+        // 写内联样式而不是只靠 styles.css：SVG 元素的 transform-origin 默认是
+        // 0 0（不是 CSS 那套 50% 50%），样式表一旦没匹配上，位置就会错得很离谱；
+        // 内联样式优先级最高，主题改不动它。
+        circle.style.setProperty("transform-box", "fill-box");
+        circle.style.setProperty("transform-origin", "center");
+      }
     }
     if (!circle) return;
+
+    // 判据是节点数据里的 children，不是 DOM 上的 r：
+    // markmap 在节点失去全部孩子后既不删 circle、也不把 r 归零（实测仍是 6），
+    // 只按 r 判断会把它当成「还有孩子」，叶子卡片右侧就挂着一个点不动的残留点。
+    //
+    // 这里直接读 style.display 而不是缓存一个布尔：缓存会和 reset() 之后
+    // 重新拿到的旧 DOM 对不上（实测过，隐藏了就再也不会显回来）。
+    const hidden: boolean = circle.style.display === "none";
+    if (!box.hasChildren) {
+      if (!hidden) circle.style.display = "none";
+      return;
+    }
+    if (hidden) circle.style.display = "";
 
     const nativeCx = Number.parseFloat(circle.getAttribute("cx") ?? "");
     const nativeCy = Number.parseFloat(circle.getAttribute("cy") ?? "");
@@ -328,7 +365,9 @@ export class NodePainter {
     entry.circleX = offset.x;
     entry.circleY = offset.y;
 
-    circle.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
+    // 变换原点在圆点自身中心，所以 translate 之后再做 scale 只改大小、不改位置：
+    // 直径 12 → 8.4，圆心仍精确落在卡片右沿（实测，见 .tmp 的 paint 用例）。
+    circle.style.transform = `translate(${offset.x}px, ${offset.y}px) scale(${FOLD_SCALE})`;
   }
 
   /** 自绘连线：父卡片右边缘中点 → 子卡片左边缘中点 */
