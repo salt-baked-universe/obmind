@@ -5,6 +5,37 @@ export interface ParseOptions {
   filterFrontmatter?: boolean;
 }
 
+/**
+ * 节点在源文件里的落点，双向编辑的地基。
+ *
+ * 有了它，导图上的每次修改都能精确定位到「某一行的一小段字符」，
+ * 而不是重排整篇笔记——这是安全回写的前提。
+ */
+export interface SrcRef {
+  /** 原文行号（0 基，含 frontmatter 之前的行） */
+  line: number;
+  /** 正文首字符在整行中的列号 */
+  bodyStart: number;
+  /** 正文末字符（不含）在整行中的列号，行尾空白不纳入 */
+  bodyEnd: number;
+  /** 该行完整原文，写回前用它做冲突校验 */
+  full: string;
+  /** 列表 / 标题标记，如 "- "、"1. "、"## "；正文行可能为空串 */
+  marker: string;
+  /** 行首缩进（空格或制表符），新建同级节点时复用 */
+  indent: string;
+  /** 任务列表勾选状态；null 表示不是任务列表 */
+  checked: boolean | null;
+  /** 正文原文（已去掉 marker 与勾选框） */
+  text: string;
+  /** 是否为标题行 */
+  heading: boolean;
+  /** 标题级别（1-6）；非标题行为 null。拖动改层级时要用 */
+  level: number | null;
+  /** 在树里的深度，根为 0。拖动时用来算子树范围和缩进增量 */
+  depth: number;
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, "&amp;")
@@ -88,14 +119,95 @@ export function renderInline(raw: string): string {
 interface RawLine {
   text: string;
   headingLevel: number | null;
-  indentTabs: number;
-  indentSpaces: number;
+  src: SrcRef;
+}
+
+/** 制表符按 4 列计。只是把缩进折算成一个可比较的数值，不代表层级语义 */
+const TAB_COLS = 4;
+
+/**
+ * 一段缩进（空格 / 制表符混合）折算成列数。
+ *
+ * 必须统一度量：早先解析按「tab 算 1 层」、写回按「tab 算 4 空格」，
+ * 于是制表符缩进的笔记被拖动一次，深度就翻倍 —— 这就是「拖动后多空格、层级错乱」。
+ */
+export function colsOfIndent(ws: string): number {
+  const tabs: number = (ws.match(/\t/g) ?? []).length;
+  return tabs * TAB_COLS + (ws.length - tabs);
+}
+
+function gcd(a: number, b: number): number {
+  return b === 0 ? a : gcd(b, a % b);
+}
+
+/**
+ * 检测缩进步长与缩进单位（实际的空白字符串，可能是制表符）。
+ *
+ * 不能用「最小正缩进」：笔记里只要有一行手误缩进 1 个空格，整篇步长就变成 1，
+ * 之后缩进 2 空格会被算成第 2 层，整张导图立刻错乱（库里有 47 篇命中）。
+ * 也不能简单取 GCD：混进一个奇数缩进就退化成 1。
+ *
+ * 这里取「能整除最多行的最小候选值」，且要求它至少解释 85% 的缩进行；
+ * 都不满足时才退回 GCD。缩进单位取一行宽度正好等于步长的原文，
+ * 这样回写时能沿用原文的写法（制表符继续用制表符），而不是硬塞空格。
+ */
+function detectIndent(indents: string[]): { step: number; unit: string } {
+  const items = indents
+    .map((ws: string) => ({ ws, cols: colsOfIndent(ws) }))
+    .filter((it) => it.cols > 0);
+  if (items.length === 0) return { step: 2, unit: "  " };
+
+  const distinct: number[] = Array.from(new Set(items.map((it) => it.cols))).sort(
+    (a: number, b: number) => a - b,
+  );
+
+  let step = 0;
+  for (const c of distinct) {
+    if (c < 2) continue;
+    let hit = 0;
+    for (const it of items) if (it.cols % c === 0) hit++;
+    if (hit / items.length >= 0.85) {
+      step = c;
+      break;
+    }
+  }
+  if (step === 0) step = distinct.reduce((a: number, b: number) => gcd(a, b));
+  if (step < 1) step = 1;
+
+  // 缩进单位：宽度正好等于步长的那些行里，出现次数最多的写法
+  const exact = new Map<string, number>();
+  for (const it of items) {
+    if (it.cols === step) exact.set(it.ws, (exact.get(it.ws) ?? 0) + 1);
+  }
+  let unit = "";
+  let best = 0;
+  for (const [ws, count] of exact) {
+    if (count > best) {
+      best = count;
+      unit = ws;
+    }
+  }
+  if (unit === "") unit = " ".repeat(step);
+  return { step, unit };
 }
 
 /** 无序列表标记（含任务列表）与有序列表标记 */
 const LIST_PREFIX = /^(?:[-*+]\s+(?:\[([ xX])\]\s+)?|\d{1,9}[.)]\s+)/;
 /** 分隔线：--- / *** / ___ */
 const RULE_LINE = /^([-*_])(?:\s*\1){2,}$/;
+/** 标题标记 */
+const HEADING_PREFIX = /^(#{1,6})\s+/;
+
+/**
+ * 把一段正文文本规整成「正文起点 / 终点」两个列号。
+ * 头部空白推到 bodyStart 之后，这样重写该行时缩进不会被吃掉。
+ */
+function measure(text: string, base: number): { text: string; start: number; end: number } {
+  const lead: number = text.length - text.trimStart().length;
+  const trimmed: string = text.trim();
+  const start: number = base + lead;
+  return { text: trimmed, start, end: start + trimmed.length };
+}
 
 /**
  * 把笔记内容直接构建成 markmap 的节点树（IPureNode），不经过 markdown 缩进解析。
@@ -109,6 +221,9 @@ const RULE_LINE = /^([-*_])(?:\s*\1){2,}$/;
  * - 任务列表的 [ ] / [x] 转成 ☐ / ☑
  * - 行内语法（双链、链接、粗体、行内代码等）渲染成 HTML
  * - 层级深度做「最多 +1」钳制，避免跳级（如 0 空格直接到 4 空格）导致结构错乱
+ *
+ * 每个非根节点还会挂 `payload.src`（源行坐标），供双向编辑回写使用。
+ * 根节点挂 `payload.step`（检测到的缩进步长）。
  */
 export function buildTree(
   content: string,
@@ -118,23 +233,26 @@ export function buildTree(
   const filterFrontmatter: boolean = options.filterFrontmatter !== false;
   const rootName: string = fileName.endsWith(".md") ? fileName.slice(0, -3) : fileName;
 
-  let lines: string[] = content.split("\n");
+  const allLines: string[] = content.split("\n");
+  let lineOffset = 0;
 
   // 1. 跳过笔记顶部的 YAML frontmatter
   if (filterFrontmatter) {
     let i = 0;
-    while (i < lines.length && lines[i].trim() === "") i++;
-    if (i < lines.length && /^---\s*$/.test(lines[i])) {
+    while (i < allLines.length && allLines[i].trim() === "") i++;
+    if (i < allLines.length && /^---\s*$/.test(allLines[i])) {
       let j = i + 1;
-      while (j < lines.length && !/^---\s*$/.test(lines[j])) j++;
-      if (j < lines.length) lines = lines.slice(j + 1);
+      while (j < allLines.length && !/^---\s*$/.test(allLines[j])) j++;
+      if (j < allLines.length) lineOffset = j + 1;
     }
   }
 
   // 2. 收集有效行（跳过空行、围栏代码块、分隔线）
   const raws: RawLine[] = [];
   let inCodeBlock = false;
-  for (const line of lines) {
+
+  for (let idx = lineOffset; idx < allLines.length; idx++) {
+    const line: string = allLines[idx];
     if (line.trim() === "") continue;
     if (/^\s*```/.test(line)) {
       inCodeBlock = !inCodeBlock;
@@ -142,72 +260,88 @@ export function buildTree(
     }
     if (inCodeBlock) continue;
 
-    // 引用前缀（可能多层）去掉，只保留正文
+    // 引用前缀（可能多层）去掉，只保留正文；同时记住剥掉了多少字符
     let body: string = line;
     while (/^\s*>/.test(body)) body = body.replace(/^\s*>\s?/, "");
+    const quoteLen: number = line.length - body.length;
 
     const wsMatch: RegExpMatchArray | null = body.match(/^[ \t]*/);
     const ws: string = wsMatch ? wsMatch[0] : "";
-    let text: string = body.slice(ws.length);
 
-    const indentTabs: number = (ws.match(/\t/g) ?? []).length;
-    const indentSpaces: number = ws.length - indentTabs;
+    let marker: string = "";
+    let checked: boolean | null = null;
+    let heading = false;
+    let rest: string = body.slice(ws.length);
+    let restStart: number = quoteLen + ws.length;
 
     // 标题行
-    const heading: RegExpMatchArray | null = text.match(/^(#{1,6})\s+(.*)$/);
-    if (heading) {
-      const headingText: string = heading[2].trim();
-      if (headingText !== "") {
-        raws.push({
-          text: headingText,
-          headingLevel: heading[1].length,
-          indentTabs: 0,
-          indentSpaces: 0,
-        });
+    const headingMatch: RegExpMatchArray | null = rest.match(HEADING_PREFIX);
+    if (headingMatch) {
+      marker = headingMatch[0];
+      heading = true;
+      rest = rest.slice(marker.length);
+      restStart += marker.length;
+    } else {
+      // 正文分隔线
+      if (RULE_LINE.test(rest.trim())) continue;
+
+      // 剥离列表标记；任务列表的勾选框单独记下来
+      const listMatch: RegExpMatchArray | null = rest.match(LIST_PREFIX);
+      if (listMatch) {
+        const checkbox: string | undefined = listMatch[1];
+        const whole: string = listMatch[0];
+        if (checkbox !== undefined) {
+          checked = checkbox !== " ";
+          marker = whole.replace(/\[[ xX]\]\s+$/, "");
+        } else {
+          marker = whole;
+        }
+        rest = rest.slice(whole.length);
+        restStart += whole.length;
       }
-      continue;
     }
 
-    // 正文分隔线
-    if (RULE_LINE.test(text.trim())) continue;
-
-    // 剥离列表标记，任务列表转成勾选框
-    const listMatch: RegExpMatchArray | null = text.match(LIST_PREFIX);
-    if (listMatch) {
-      const checkbox: string | undefined = listMatch[1];
-      text = text.slice(listMatch[0].length);
-      if (checkbox !== undefined) {
-        text = (checkbox === " " ? "☐ " : "☑ ") + text;
-      }
-    }
-
-    text = text.trim();
-    if (text === "") continue;
+    const m = measure(rest, restStart);
+    if (m.text === "") continue;
 
     raws.push({
-      text,
-      headingLevel: null,
-      indentTabs,
-      indentSpaces,
+      text: m.text,
+      headingLevel: headingMatch ? headingMatch[1].length : null,
+      src: {
+        line: idx,
+        bodyStart: m.start,
+        bodyEnd: m.end,
+        full: line,
+        marker,
+        indent: ws,
+        checked,
+        text: m.text,
+        heading,
+        level: headingMatch ? headingMatch[1].length : null,
+        depth: 0,
+      },
     });
   }
 
   const hasHeadings: boolean = raws.some((r) => r.headingLevel !== null);
 
-  // 3. 检测缩进步长（正文行里最小的正空格数）
-  let step = 2;
-  let minSpaces = Infinity;
-  for (const r of raws) {
-    if (r.headingLevel === null && r.indentSpaces > 0 && r.indentSpaces < minSpaces) {
-      minSpaces = r.indentSpaces;
-    }
-  }
-  if (minSpaces !== Infinity) step = minSpaces;
+  // 3. 检测缩进步长与缩进单位（只用正文行，标题不吃缩进）
+  const { step, unit } = detectIndent(
+    raws.filter((r) => r.headingLevel === null).map((r) => r.src.indent),
+  );
 
   // 4. 计算每一行的深度（根为 0，第一层子节点为 1）
-  const nodes: { depth: number; text: string }[] = [];
-  let prevDepth = 0;
+  //
+  // 层级用「缩进栈」推导，而不是 floor(列数 / 步长)：
+  // 后者假设缩进严格是步长的整数倍，笔记里只要有一行手误缩进 1 个空格（库里 47 篇命中），
+  // 整篇层级就全错。缩进栈只看「比栈顶深就下一层、比栈顶浅就弹回去」，
+  // 天然容忍不规则缩进，而且同一缩进永远算出同一深度（旧版「相对上一行最多深 1 层」
+  // 的钳制会让同缩进的兄弟深度不同，拖动时整块子树的范围就会算错）。
+  //
+  // 缩进量只存在，不需要知道步长；step 仍然检测出来，供拖动兜底与 Tab 缩进使用。
+  const nodes: { depth: number; raw: RawLine }[] = [];
   const headingStack: number[] = [];
+  const indentStack: number[] = [0];
 
   for (const r of raws) {
     let depth: number;
@@ -218,27 +352,47 @@ export function buildTree(
       }
       headingStack.push(level);
       depth = headingStack.length;
+      // 进入新小节，正文缩进重新从 0 起算
+      indentStack.length = 1;
+      indentStack[0] = 0;
     } else {
-      const indentLevel: number = r.indentTabs + Math.floor(r.indentSpaces / step);
+      const cols: number = colsOfIndent(r.src.indent);
+      while (indentStack.length > 1 && cols < indentStack[indentStack.length - 1]) {
+        indentStack.pop();
+      }
+      if (cols > indentStack[indentStack.length - 1]) indentStack.push(cols);
       const base: number = hasHeadings ? headingStack.length : 0;
-      depth = base + 1 + indentLevel;
+      depth = base + indentStack.length;
     }
-    // 钳制：至少 1 层；相对上一行最多深 1 层
     if (depth < 1) depth = 1;
-    if (depth > prevDepth + 1) depth = prevDepth + 1;
 
-    nodes.push({ depth, text: r.text });
-    prevDepth = depth;
+    r.src.depth = depth;
+    nodes.push({ depth, raw: r });
   }
 
   // 5. 按深度装配成树
-  const root: IPureNode = { content: escapeHtml(rootName), children: [] };
+  const root: IPureNode = {
+    content: escapeHtml(rootName),
+    children: [],
+    // step / unit 供双向编辑与拖动复用，与解析规则保持一致
+    payload: { step, indentUnit: unit },
+  };
   const stack: IPureNode[] = [root];
 
   for (const n of nodes) {
-    const parent: IPureNode = stack[n.depth - 1] ?? root;
-    const node: IPureNode = { content: renderInline(n.text), children: [] };
-    parent.children.push(node);
+    // 缩进跳级时中间层级并不存在（stack[depth-1] 为空），挂到最近的已存在祖先上。
+    // 直接回退到根节点会让深层节点蹦到最外层，这是之前「结构错乱」的另一半原因。
+    let parent: IPureNode | undefined = stack[n.depth - 1];
+    for (let d = n.depth - 2; !parent && d >= 0; d--) parent = stack[d];
+    const r: RawLine = n.raw;
+    const shown: string =
+      r.src.checked === null ? r.src.text : (r.src.checked ? "☑ " : "☐ ") + r.src.text;
+    const node: IPureNode = {
+      content: renderInline(shown),
+      children: [],
+      payload: { src: r.src },
+    };
+    (parent ?? root).children.push(node);
     stack[n.depth] = node;
     stack.length = n.depth + 1;
   }

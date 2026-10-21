@@ -26,10 +26,10 @@ __export(main_exports, {
   default: () => MindmapPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian3 = require("obsidian");
+var import_obsidian4 = require("obsidian");
 
 // src/MindmapView.ts
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 
 // node_modules/markmap-common/dist/index.mjs
 var testPath = "npm2url/dist/index.cjs";
@@ -4558,28 +4558,87 @@ function renderInline(raw) {
   });
   return s;
 }
+var TAB_COLS = 4;
+function colsOfIndent(ws) {
+  var _a;
+  const tabs = ((_a = ws.match(/\t/g)) != null ? _a : []).length;
+  return tabs * TAB_COLS + (ws.length - tabs);
+}
+function gcd(a, b) {
+  return b === 0 ? a : gcd(b, a % b);
+}
+function detectIndent(indents) {
+  var _a;
+  const items = indents.map((ws) => ({ ws, cols: colsOfIndent(ws) })).filter((it2) => it2.cols > 0);
+  if (items.length === 0)
+    return { step: 2, unit: "  " };
+  const distinct = Array.from(new Set(items.map((it2) => it2.cols))).sort(
+    (a, b) => a - b
+  );
+  let step = 0;
+  for (const c of distinct) {
+    if (c < 2)
+      continue;
+    let hit = 0;
+    for (const it2 of items)
+      if (it2.cols % c === 0)
+        hit++;
+    if (hit / items.length >= 0.85) {
+      step = c;
+      break;
+    }
+  }
+  if (step === 0)
+    step = distinct.reduce((a, b) => gcd(a, b));
+  if (step < 1)
+    step = 1;
+  const exact = /* @__PURE__ */ new Map();
+  for (const it2 of items) {
+    if (it2.cols === step)
+      exact.set(it2.ws, ((_a = exact.get(it2.ws)) != null ? _a : 0) + 1);
+  }
+  let unit = "";
+  let best = 0;
+  for (const [ws, count] of exact) {
+    if (count > best) {
+      best = count;
+      unit = ws;
+    }
+  }
+  if (unit === "")
+    unit = " ".repeat(step);
+  return { step, unit };
+}
 var LIST_PREFIX = /^(?:[-*+]\s+(?:\[([ xX])\]\s+)?|\d{1,9}[.)]\s+)/;
 var RULE_LINE = /^([-*_])(?:\s*\1){2,}$/;
+var HEADING_PREFIX = /^(#{1,6})\s+/;
+function measure(text, base) {
+  const lead = text.length - text.trimStart().length;
+  const trimmed = text.trim();
+  const start2 = base + lead;
+  return { text: trimmed, start: start2, end: start2 + trimmed.length };
+}
 function buildTree(content, fileName, options = {}) {
-  var _a, _b;
   const filterFrontmatter = options.filterFrontmatter !== false;
   const rootName = fileName.endsWith(".md") ? fileName.slice(0, -3) : fileName;
-  let lines = content.split("\n");
+  const allLines = content.split("\n");
+  let lineOffset = 0;
   if (filterFrontmatter) {
     let i = 0;
-    while (i < lines.length && lines[i].trim() === "")
+    while (i < allLines.length && allLines[i].trim() === "")
       i++;
-    if (i < lines.length && /^---\s*$/.test(lines[i])) {
+    if (i < allLines.length && /^---\s*$/.test(allLines[i])) {
       let j2 = i + 1;
-      while (j2 < lines.length && !/^---\s*$/.test(lines[j2]))
+      while (j2 < allLines.length && !/^---\s*$/.test(allLines[j2]))
         j2++;
-      if (j2 < lines.length)
-        lines = lines.slice(j2 + 1);
+      if (j2 < allLines.length)
+        lineOffset = j2 + 1;
     }
   }
   const raws = [];
   let inCodeBlock = false;
-  for (const line of lines) {
+  for (let idx = lineOffset; idx < allLines.length; idx++) {
+    const line = allLines[idx];
     if (line.trim() === "")
       continue;
     if (/^\s*```/.test(line)) {
@@ -4591,57 +4650,65 @@ function buildTree(content, fileName, options = {}) {
     let body = line;
     while (/^\s*>/.test(body))
       body = body.replace(/^\s*>\s?/, "");
+    const quoteLen = line.length - body.length;
     const wsMatch = body.match(/^[ \t]*/);
     const ws = wsMatch ? wsMatch[0] : "";
-    let text = body.slice(ws.length);
-    const indentTabs = ((_a = ws.match(/\t/g)) != null ? _a : []).length;
-    const indentSpaces = ws.length - indentTabs;
-    const heading = text.match(/^(#{1,6})\s+(.*)$/);
-    if (heading) {
-      const headingText = heading[2].trim();
-      if (headingText !== "") {
-        raws.push({
-          text: headingText,
-          headingLevel: heading[1].length,
-          indentTabs: 0,
-          indentSpaces: 0
-        });
+    let marker = "";
+    let checked = null;
+    let heading = false;
+    let rest = body.slice(ws.length);
+    let restStart = quoteLen + ws.length;
+    const headingMatch = rest.match(HEADING_PREFIX);
+    if (headingMatch) {
+      marker = headingMatch[0];
+      heading = true;
+      rest = rest.slice(marker.length);
+      restStart += marker.length;
+    } else {
+      if (RULE_LINE.test(rest.trim()))
+        continue;
+      const listMatch = rest.match(LIST_PREFIX);
+      if (listMatch) {
+        const checkbox = listMatch[1];
+        const whole = listMatch[0];
+        if (checkbox !== void 0) {
+          checked = checkbox !== " ";
+          marker = whole.replace(/\[[ xX]\]\s+$/, "");
+        } else {
+          marker = whole;
+        }
+        rest = rest.slice(whole.length);
+        restStart += whole.length;
       }
-      continue;
     }
-    if (RULE_LINE.test(text.trim()))
-      continue;
-    const listMatch = text.match(LIST_PREFIX);
-    if (listMatch) {
-      const checkbox = listMatch[1];
-      text = text.slice(listMatch[0].length);
-      if (checkbox !== void 0) {
-        text = (checkbox === " " ? "\u2610 " : "\u2611 ") + text;
-      }
-    }
-    text = text.trim();
-    if (text === "")
+    const m = measure(rest, restStart);
+    if (m.text === "")
       continue;
     raws.push({
-      text,
-      headingLevel: null,
-      indentTabs,
-      indentSpaces
+      text: m.text,
+      headingLevel: headingMatch ? headingMatch[1].length : null,
+      src: {
+        line: idx,
+        bodyStart: m.start,
+        bodyEnd: m.end,
+        full: line,
+        marker,
+        indent: ws,
+        checked,
+        text: m.text,
+        heading,
+        level: headingMatch ? headingMatch[1].length : null,
+        depth: 0
+      }
     });
   }
   const hasHeadings = raws.some((r) => r.headingLevel !== null);
-  let step = 2;
-  let minSpaces = Infinity;
-  for (const r of raws) {
-    if (r.headingLevel === null && r.indentSpaces > 0 && r.indentSpaces < minSpaces) {
-      minSpaces = r.indentSpaces;
-    }
-  }
-  if (minSpaces !== Infinity)
-    step = minSpaces;
+  const { step, unit } = detectIndent(
+    raws.filter((r) => r.headingLevel === null).map((r) => r.src.indent)
+  );
   const nodes = [];
-  let prevDepth = 0;
   const headingStack = [];
+  const indentStack = [0];
   for (const r of raws) {
     let depth;
     if (hasHeadings && r.headingLevel !== null) {
@@ -4651,24 +4718,42 @@ function buildTree(content, fileName, options = {}) {
       }
       headingStack.push(level);
       depth = headingStack.length;
+      indentStack.length = 1;
+      indentStack[0] = 0;
     } else {
-      const indentLevel = r.indentTabs + Math.floor(r.indentSpaces / step);
+      const cols = colsOfIndent(r.src.indent);
+      while (indentStack.length > 1 && cols < indentStack[indentStack.length - 1]) {
+        indentStack.pop();
+      }
+      if (cols > indentStack[indentStack.length - 1])
+        indentStack.push(cols);
       const base = hasHeadings ? headingStack.length : 0;
-      depth = base + 1 + indentLevel;
+      depth = base + indentStack.length;
     }
     if (depth < 1)
       depth = 1;
-    if (depth > prevDepth + 1)
-      depth = prevDepth + 1;
-    nodes.push({ depth, text: r.text });
-    prevDepth = depth;
+    r.src.depth = depth;
+    nodes.push({ depth, raw: r });
   }
-  const root2 = { content: escapeHtml(rootName), children: [] };
+  const root2 = {
+    content: escapeHtml(rootName),
+    children: [],
+    // step / unit 供双向编辑与拖动复用，与解析规则保持一致
+    payload: { step, indentUnit: unit }
+  };
   const stack = [root2];
   for (const n of nodes) {
-    const parent = (_b = stack[n.depth - 1]) != null ? _b : root2;
-    const node = { content: renderInline(n.text), children: [] };
-    parent.children.push(node);
+    let parent = stack[n.depth - 1];
+    for (let d = n.depth - 2; !parent && d >= 0; d--)
+      parent = stack[d];
+    const r = n.raw;
+    const shown = r.src.checked === null ? r.src.text : (r.src.checked ? "\u2611 " : "\u2610 ") + r.src.text;
+    const node = {
+      content: renderInline(shown),
+      children: [],
+      payload: { src: r.src }
+    };
+    (parent != null ? parent : root2).children.push(node);
     stack[n.depth] = node;
     stack.length = n.depth + 1;
   }
@@ -5163,9 +5248,685 @@ var NodePainter = class {
   }
 };
 
+// src/edit/folds.ts
+function isFolded(node) {
+  var _a;
+  const fold = (_a = node.payload) == null ? void 0 : _a.fold;
+  return typeof fold === "number" && fold > 0;
+}
+function collectFolds(root2) {
+  const out = /* @__PURE__ */ new Set();
+  if (!root2)
+    return out;
+  const walk = (node, path2) => {
+    var _a;
+    if (isFolded(node))
+      out.add(path2);
+    const children2 = (_a = node.children) != null ? _a : [];
+    for (let i = 0; i < children2.length; i++) {
+      walk(children2[i], path2 ? `${path2}/${i}` : String(i));
+    }
+  };
+  walk(root2, "");
+  return out;
+}
+function applyFolds(root2, folded) {
+  if (folded.size === 0)
+    return;
+  const walk = (node, path2) => {
+    var _a;
+    if (folded.has(path2))
+      node.payload = { ...node.payload, fold: 1 };
+    const children2 = (_a = node.children) != null ? _a : [];
+    for (let i = 0; i < children2.length; i++) {
+      walk(children2[i], path2 ? `${path2}/${i}` : String(i));
+    }
+  };
+  walk(root2, "");
+}
+
+// src/edit/inlineText.ts
+function openInlineEditor(options) {
+  var _a, _b;
+  const { container, target, spec } = options;
+  const fo = target.querySelector(":scope > foreignObject");
+  if (!fo)
+    return null;
+  const card = target.querySelector(":scope > rect.obmind-node-card");
+  const ta = document.createElement("textarea");
+  ta.className = "obmind-inline-editor";
+  ta.value = options.value;
+  ta.spellcheck = false;
+  ta.setAttribute("rows", "1");
+  const cs = getComputedStyle(fo);
+  ta.style.fontFamily = cs.fontFamily;
+  ta.style.fontSize = cs.fontSize;
+  ta.style.fontWeight = cs.fontWeight;
+  ta.style.fontStyle = cs.fontStyle;
+  ta.style.lineHeight = cs.lineHeight;
+  ta.style.letterSpacing = cs.letterSpacing;
+  ta.style.boxSizing = "border-box";
+  ta.style.padding = "0";
+  ta.style.border = "none";
+  ta.style.outline = "none";
+  ta.style.overflow = "hidden";
+  ta.style.resize = "none";
+  ta.style.color = fo.style.color || spec.nodeText;
+  ta.style.position = "absolute";
+  ta.style.transformOrigin = "0 0";
+  ta.style.zIndex = "20";
+  const fill = (_a = card == null ? void 0 : card.getAttribute("fill")) != null ? _a : "";
+  ta.style.background = fill && fill !== "transparent" ? fill : spec.bg;
+  const rx = (_b = card == null ? void 0 : card.getAttribute("rx")) != null ? _b : "0";
+  ta.style.borderRadius = `${Math.max(0, Number.parseFloat(rx) || 0)}px`;
+  container.appendChild(ta);
+  const svg = container.querySelector("svg");
+  let done = false;
+  const prevOpacity = fo.style.opacity;
+  const place = () => {
+    var _a2, _b2;
+    const rect = fo.getBoundingClientRect();
+    const base = container.getBoundingClientRect();
+    const rawW = Number.parseFloat((_a2 = fo.getAttribute("width")) != null ? _a2 : "") || rect.width;
+    const rawH = Number.parseFloat((_b2 = fo.getAttribute("height")) != null ? _b2 : "") || rect.height;
+    const scale = rawW > 0 ? rect.width / rawW : 1;
+    ta.style.left = `${rect.left - base.left}px`;
+    ta.style.top = `${rect.top - base.top}px`;
+    ta.style.width = `${rawW + 2}px`;
+    ta.style.transform = `scale(${scale})`;
+    ta.style.height = "1px";
+    const needed = Math.max(rawH, ta.scrollHeight);
+    ta.style.height = `${needed}px`;
+  };
+  let frame2 = 0;
+  const reposition = () => {
+    if (frame2)
+      return;
+    frame2 = window.requestAnimationFrame(() => {
+      frame2 = 0;
+      if (!done)
+        place();
+    });
+  };
+  const cleanup = () => {
+    if (frame2) {
+      window.cancelAnimationFrame(frame2);
+      frame2 = 0;
+    }
+    ta.removeEventListener("keydown", onKeyDown);
+    ta.removeEventListener("blur", onBlur);
+    ta.removeEventListener("input", reposition);
+    ta.removeEventListener("mousedown", stop);
+    ta.removeEventListener("wheel", stop);
+    svg == null ? void 0 : svg.removeEventListener("wheel", reposition, true);
+    window.removeEventListener("resize", reposition);
+    fo.style.opacity = prevOpacity;
+    ta.remove();
+  };
+  const finish = (action) => {
+    if (done)
+      return;
+    done = true;
+    const value = ta.value;
+    cleanup();
+    options.onFinish(action, value);
+  };
+  function stop(e) {
+    e.stopPropagation();
+  }
+  function onBlur() {
+    finish("commit");
+  }
+  function onKeyDown(e) {
+    if (e.isComposing || e.keyCode === 229)
+      return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey)
+        finish("sibling");
+      else
+        finish("commit");
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      finish("cancel");
+      return;
+    }
+    if (e.key === "Tab") {
+      e.preventDefault();
+      finish(e.shiftKey ? "outdent" : "indent");
+      return;
+    }
+    if (e.key === "Backspace" && ta.value.trim() === "") {
+      e.preventDefault();
+      finish("delete");
+    }
+  }
+  ta.addEventListener("keydown", onKeyDown);
+  ta.addEventListener("blur", onBlur);
+  ta.addEventListener("input", reposition);
+  ta.addEventListener("mousedown", stop);
+  ta.addEventListener("wheel", stop);
+  svg == null ? void 0 : svg.addEventListener("wheel", reposition, true);
+  window.addEventListener("resize", reposition);
+  fo.style.opacity = "0";
+  place();
+  ta.focus();
+  if (options.selectAll)
+    ta.select();
+  else
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  return {
+    close: () => {
+      if (done)
+        return;
+      done = true;
+      cleanup();
+    },
+    reposition
+  };
+}
+
+// src/edit/writer.ts
+var import_obsidian = require("obsidian");
+function findEditor(app, file) {
+  var _a, _b;
+  const active = app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+  if (((_a = active == null ? void 0 : active.file) == null ? void 0 : _a.path) === file.path)
+    return active.editor;
+  for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+    const view = leaf.view;
+    if (view instanceof import_obsidian.MarkdownView && ((_b = view.file) == null ? void 0 : _b.path) === file.path)
+      return view.editor;
+  }
+  return null;
+}
+function buildChange(editor, span) {
+  const last = Math.max(0, editor.lineCount() - 1);
+  const joined = span.lines.join("\n");
+  if (span.start === span.end) {
+    if (span.start > last) {
+      const ch = editor.getLine(last).length;
+      return { from: { line: last, ch }, to: { line: last, ch }, text: "\n" + joined };
+    }
+    return { from: { line: span.start, ch: 0 }, to: { line: span.start, ch: 0 }, text: joined + "\n" };
+  }
+  if (span.end > last) {
+    if (span.lines.length === 0 && span.start > 0) {
+      const prev = span.start - 1;
+      const ch = editor.getLine(prev).length;
+      return {
+        from: { line: prev, ch },
+        to: { line: last, ch: editor.getLine(last).length },
+        text: ""
+      };
+    }
+    return {
+      from: { line: span.start, ch: 0 },
+      to: { line: last, ch: editor.getLine(last).length },
+      text: joined
+    };
+  }
+  return {
+    from: { line: span.start, ch: 0 },
+    to: { line: span.end, ch: 0 },
+    text: span.lines.length === 0 ? "" : joined + "\n"
+  };
+}
+async function replaceAll(app, file, next, expect) {
+  const editor = findEditor(app, file);
+  if (editor) {
+    if (editor.getValue() !== expect)
+      return false;
+    const last = Math.max(0, editor.lineCount() - 1);
+    editor.transaction({
+      changes: [
+        {
+          from: { line: 0, ch: 0 },
+          to: { line: last, ch: editor.getLine(last).length },
+          text: next
+        }
+      ]
+    });
+    return true;
+  }
+  let ok = false;
+  await app.vault.process(file, (data) => {
+    if (data !== expect)
+      return data;
+    ok = true;
+    return next;
+  });
+  return ok;
+}
+async function applySpan(app, file, span) {
+  const editor = findEditor(app, file);
+  if (editor) {
+    if (span.checkLine >= editor.lineCount())
+      return false;
+    if (editor.getLine(span.checkLine) !== span.checkText)
+      return false;
+    editor.transaction({ changes: [buildChange(editor, span)] });
+    return true;
+  }
+  let ok = false;
+  await app.vault.process(file, (data) => {
+    const lines = data.split("\n");
+    if (lines[span.checkLine] !== span.checkText)
+      return data;
+    ok = true;
+    lines.splice(span.start, span.end - span.start, ...span.lines);
+    return lines.join("\n");
+  });
+  return ok;
+}
+
+// src/edit/drag.ts
+var DRAG_THRESHOLD = 5;
+var DragController = class {
+  constructor(svg, container, cb) {
+    this.layer = null;
+    this.box = null;
+    this.line = null;
+    this.origin = null;
+    this.originSrc = null;
+    this.startX = 0;
+    this.startY = 0;
+    this.active = false;
+    this.target = null;
+    /** 本次拖拽的候选目标，按下时算一次，避免每帧 querySelectorAll */
+    this.candidates = [];
+    // -------------------------------------------------------------------------
+    /** 命中节点时掐断 mousedown，否则 d3-zoom 会把它当成「拖画布」 */
+    this.blockOnNode = (e) => {
+      const g = this.nodeAt(e.target);
+      if (g)
+        e.stopPropagation();
+    };
+    this.onPointerDown = (e) => {
+      if (e.button !== 0)
+        return;
+      const el = e.target;
+      if (el.closest("a") || el.closest("circle"))
+        return;
+      const g = this.nodeAt(el);
+      if (!g)
+        return;
+      const src = this.cb.srcOf(g);
+      if (!src)
+        return;
+      e.stopPropagation();
+      this.origin = g;
+      this.originSrc = src;
+      this.startX = e.clientX;
+      this.startY = e.clientY;
+      this.active = false;
+      this.target = null;
+      const srcPath = pathOf(g);
+      this.candidates = Array.from(
+        this.svg.querySelectorAll("g.markmap-node")
+      ).filter((n) => {
+        if (n === g)
+          return false;
+        const p = pathOf(n);
+        return !(srcPath && p && (p === srcPath || p.startsWith(srcPath + ".")));
+      });
+    };
+    this.onPointerMove = (e) => {
+      if (!this.origin)
+        return;
+      if (!this.active) {
+        const dx = e.clientX - this.startX;
+        const dy = e.clientY - this.startY;
+        if (Math.hypot(dx, dy) < DRAG_THRESHOLD)
+          return;
+        this.active = true;
+        this.origin.classList.add("obmind-dragging");
+        document.body.style.userSelect = "none";
+        this.ensureLayer();
+      }
+      e.preventDefault();
+      this.target = this.hitTest(e.clientX, e.clientY);
+      this.renderHint();
+    };
+    this.onPointerUp = (e) => {
+      const originSrc = this.originSrc;
+      const target = this.target;
+      const wasActive = this.active;
+      this.reset();
+      if (!wasActive || !originSrc || !target)
+        return;
+      e.preventDefault();
+      e.stopPropagation();
+      const tgtSrc = this.cb.srcOf(target.g);
+      if (!tgtSrc)
+        return;
+      this.cb.onDrop(originSrc.line, tgtSrc.line, target.mode);
+    };
+    this.onKeyDown = (e) => {
+      if (e.key === "Escape" && this.origin)
+        this.reset();
+    };
+    this.svg = svg;
+    this.container = container;
+    this.cb = cb;
+    svg.addEventListener("mousedown", this.blockOnNode, true);
+    svg.addEventListener("pointerdown", this.onPointerDown, true);
+    window.addEventListener("pointermove", this.onPointerMove, true);
+    window.addEventListener("pointerup", this.onPointerUp, true);
+    window.addEventListener("keydown", this.onKeyDown, true);
+  }
+  destroy() {
+    var _a;
+    this.svg.removeEventListener("mousedown", this.blockOnNode, true);
+    this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
+    window.removeEventListener("pointermove", this.onPointerMove, true);
+    window.removeEventListener("pointerup", this.onPointerUp, true);
+    window.removeEventListener("keydown", this.onKeyDown, true);
+    this.reset();
+    (_a = this.layer) == null ? void 0 : _a.remove();
+    this.layer = null;
+  }
+  // -------------------------------------------------------------------------
+  nodeAt(el) {
+    return el.closest("g.markmap-node");
+  }
+  /** 找鼠标下方的目标节点，并按纵向位置决定「子节点 / 前面 / 后面」 */
+  hitTest(x2, y2) {
+    var _a;
+    let best = null;
+    let bestArea = Infinity;
+    for (const g of this.candidates) {
+      const fo = (_a = g.querySelector("foreignObject")) != null ? _a : g;
+      const r = fo.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0)
+        continue;
+      if (x2 < r.left || x2 > r.right || y2 < r.top || y2 > r.bottom)
+        continue;
+      const area = r.width * r.height;
+      if (area >= bestArea)
+        continue;
+      bestArea = area;
+      const rel = (y2 - r.top) / r.height;
+      const mode = rel < 0.3 ? "before" : rel > 0.7 ? "after" : "child";
+      best = { g, mode };
+    }
+    return best;
+  }
+  ensureLayer() {
+    if (this.layer)
+      return;
+    const layer = document.createElement("div");
+    layer.className = "obmind-drop-layer";
+    const box = document.createElement("div");
+    box.className = "obmind-drop-box";
+    const line = document.createElement("div");
+    line.className = "obmind-drop-line";
+    layer.append(box, line);
+    this.container.appendChild(layer);
+    this.layer = layer;
+    this.box = box;
+    this.line = line;
+  }
+  renderHint() {
+    var _a;
+    const box = this.box;
+    const line = this.line;
+    if (!box || !line)
+      return;
+    if (!this.target) {
+      box.style.display = "none";
+      line.style.display = "none";
+      return;
+    }
+    const fo = (_a = this.target.g.querySelector("foreignObject")) != null ? _a : this.target.g;
+    const r = fo.getBoundingClientRect();
+    const base = this.container.getBoundingClientRect();
+    const left = r.left - base.left;
+    const top = r.top - base.top;
+    if (this.target.mode === "child") {
+      box.style.display = "block";
+      box.style.left = `${left - 3}px`;
+      box.style.top = `${top - 3}px`;
+      box.style.width = `${r.width + 6}px`;
+      box.style.height = `${r.height + 6}px`;
+      line.style.display = "none";
+      return;
+    }
+    box.style.display = "none";
+    line.style.display = "block";
+    line.style.left = `${left - 3}px`;
+    line.style.width = `${r.width + 6}px`;
+    line.style.top = `${this.target.mode === "before" ? top - 2 : top + r.height}px`;
+  }
+  reset() {
+    var _a;
+    (_a = this.origin) == null ? void 0 : _a.classList.remove("obmind-dragging");
+    document.body.style.userSelect = "";
+    this.origin = null;
+    this.originSrc = null;
+    this.active = false;
+    this.target = null;
+    this.candidates = [];
+    if (this.box)
+      this.box.style.display = "none";
+    if (this.line)
+      this.line.style.display = "none";
+  }
+};
+function pathOf(g) {
+  var _a;
+  const data = g.__data__;
+  const path2 = (_a = data == null ? void 0 : data.state) == null ? void 0 : _a.path;
+  return typeof path2 === "string" ? path2 : "";
+}
+
+// src/edit/move.ts
+function collectSrc(root2) {
+  const out = [];
+  const walk = (n) => {
+    var _a, _b;
+    const src = (_a = n.payload) == null ? void 0 : _a.src;
+    if (src)
+      out.push(src);
+    for (const c of (_b = n.children) != null ? _b : [])
+      walk(c);
+  };
+  walk(root2);
+  return out.sort((a, b) => a.line - b.line);
+}
+var HEADING_RE = /^(#{1,6})(\s+)/;
+var QUOTE_PREFIX = /^(?:\s*>\s?)+/;
+function splitLine(line) {
+  const q2 = QUOTE_PREFIX.exec(line);
+  const quote = q2 ? q2[0] : "";
+  const rest = line.slice(quote.length);
+  const m = /^[ \t]*/.exec(rest);
+  const ws = m ? m[0] : "";
+  return { quote, ws, body: rest.slice(ws.length) };
+}
+function colsOf(line) {
+  return colsOfIndent(splitLine(line).ws);
+}
+function renderIndent(cols, unit, step) {
+  const safeStep = Math.max(1, step);
+  const levels = Math.floor(cols / safeStep);
+  const rest = cols - levels * safeStep;
+  const one2 = unit === "" ? " ".repeat(safeStep) : unit;
+  return one2.repeat(levels) + " ".repeat(rest);
+}
+function blockRange(nodes, index) {
+  const start2 = nodes[index].line;
+  const depth = nodes[index].depth;
+  let end = start2;
+  for (let i = index + 1; i < nodes.length; i++) {
+    if (nodes[i].depth <= depth)
+      break;
+    end = nodes[i].line;
+  }
+  return { start: start2, end };
+}
+function shiftBlock(block, delta, unit, step) {
+  if (delta === 0)
+    return block.slice();
+  return block.map((line) => {
+    if (line.trim() === "")
+      return line;
+    const { quote, ws, body } = splitLine(line);
+    const cols = colsOfIndent(ws);
+    const next = Math.max(0, cols + delta);
+    if (next === cols)
+      return line;
+    return quote + renderIndent(next, unit, step) + body;
+  });
+}
+function rewriteHeadingBlock(block, fromBase, toBase) {
+  const delta = toBase - fromBase;
+  if (delta === 0)
+    return block.slice();
+  return block.map((line) => {
+    if (line.trim() === "")
+      return line;
+    const m = HEADING_RE.exec(line);
+    if (!m)
+      return line;
+    const level = Math.min(6, Math.max(1, m[1].length + delta));
+    return "#".repeat(level) + line.slice(m[1].length);
+  });
+}
+function childIndentCols(nodes, tgtIdx) {
+  const tgt = nodes[tgtIdx];
+  for (let i = tgtIdx + 1; i < nodes.length; i++) {
+    if (nodes[i].depth <= tgt.depth)
+      break;
+    if (!nodes[i].heading)
+      return colsOfIndent(nodes[i].indent);
+  }
+  return null;
+}
+function moveNode(input) {
+  var _a, _b, _c;
+  const { lines, nodes, step, srcLine, targetLine, mode } = input;
+  const unit = (_a = input.unit) != null ? _a : "";
+  const srcIdx = nodes.findIndex((n) => n.line === srcLine);
+  const tgtIdx = nodes.findIndex((n) => n.line === targetLine);
+  if (srcIdx < 0 || tgtIdx < 0)
+    return { ok: false, reason: "\u627E\u4E0D\u5230\u5BF9\u5E94\u8282\u70B9" };
+  if (srcIdx === tgtIdx)
+    return { ok: false, reason: "\u4E0D\u80FD\u62D6\u5230\u81EA\u5DF1\u8EAB\u4E0A" };
+  const src = nodes[srcIdx];
+  const tgt = nodes[tgtIdx];
+  const srcBlock = blockRange(nodes, srcIdx);
+  const tgtBlock = blockRange(nodes, tgtIdx);
+  if (tgt.line > srcBlock.start && tgt.line <= srcBlock.end) {
+    return { ok: false, reason: "\u4E0D\u80FD\u79FB\u5230\u81EA\u5DF1\u7684\u5B50\u8282\u70B9\u4E0B\u9762" };
+  }
+  if (src.heading && !tgt.heading) {
+    return { ok: false, reason: "\u6807\u9898\u4E0D\u80FD\u62D6\u5230\u6B63\u6587\u8282\u70B9\u4E0A" };
+  }
+  if (!src.heading && tgt.heading && mode !== "child") {
+    return { ok: false, reason: "\u6B63\u6587\u4E0D\u80FD\u548C\u6807\u9898\u5E73\u7EA7\uFF0C\u53EA\u80FD\u62D6\u5230\u6807\u9898\u4E0A\u5F53\u5B50\u8282\u70B9" };
+  }
+  const block = lines.slice(srcBlock.start, srcBlock.end + 1);
+  if (block.length === 0)
+    return { ok: false, reason: "\u7A7A\u8282\u70B9" };
+  const insertAfterHeading = mode === "child" && tgt.heading;
+  const rawInsertAt = insertAfterHeading ? tgt.line + 1 : mode === "before" ? tgt.line : Math.min(tgtBlock.end + 1, lines.length);
+  let insertAt = rawInsertAt;
+  let rewritten;
+  if (src.heading) {
+    const srcLevel = (_b = src.level) != null ? _b : 1;
+    const tgtLevel = (_c = tgt.level) != null ? _c : 1;
+    const newLevel = mode === "child" ? tgtLevel + 1 : tgtLevel;
+    if (newLevel > 6)
+      return { ok: false, reason: "\u6807\u9898\u5C42\u7EA7\u8D85\u8FC7 6 \u7EA7\u4E86" };
+    rewritten = rewriteHeadingBlock(block, srcLevel, newLevel);
+  } else {
+    const srcCols = colsOf(src.full);
+    const tgtCols = colsOf(tgt.full);
+    let newCols;
+    if (mode === "child") {
+      const childCols = childIndentCols(nodes, tgtIdx);
+      if (childCols !== null)
+        newCols = childCols;
+      else if (tgt.heading)
+        newCols = 0;
+      else
+        newCols = tgtCols + step;
+    } else {
+      newCols = tgtCols;
+    }
+    rewritten = shiftBlock(block, newCols - srcCols, unit, step);
+  }
+  const rest = lines.slice(0, srcBlock.start).concat(lines.slice(srcBlock.end + 1));
+  if (insertAt > srcBlock.end)
+    insertAt -= block.length;
+  if (insertAt < 0)
+    insertAt = 0;
+  rest.splice(insertAt, 0, ...rewritten);
+  if (rest.join("\n") === lines.join("\n")) {
+    return { ok: false, reason: "\u4F4D\u7F6E\u6CA1\u6709\u53D8\u5316" };
+  }
+  return { ok: true, lines: rest };
+}
+
+// src/edit/text.ts
+function quoteOf(src) {
+  const m = /^(?:\s*>\s?)+/.exec(src.full);
+  return m ? m[0] : "";
+}
+function markOf(src) {
+  return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
+}
+function rewriteNode(src, text, checked, indent) {
+  const quote = quoteOf(src);
+  let mark = markOf(src);
+  const want = checked === void 0 ? src.checked : checked;
+  if (src.checked !== null && want !== src.checked) {
+    mark = mark.replace(/\[[ xX]\](?=\s*$)/, want ? "[x]" : "[ ]");
+  }
+  const nextIndent = indent === void 0 ? src.indent : indent;
+  return quote + nextIndent + mark + text + src.full.slice(src.bodyEnd);
+}
+function indentBy(src, delta, step) {
+  const unit = src.indent.includes("	") ? "	" : " ".repeat(Math.max(1, step));
+  if (delta > 0)
+    return src.indent + unit;
+  if (delta < 0) {
+    if (src.indent.length === 0)
+      return null;
+    return src.indent.slice(0, Math.max(0, src.indent.length - unit.length));
+  }
+  return src.indent;
+}
+function siblingLine(src, placeholder = "\u65B0\u8282\u70B9") {
+  const quote = quoteOf(src);
+  let mark = markOf(src);
+  const ordered = /(\d+)([.)])(\s+)$/.exec(mark);
+  if (ordered) {
+    const next = Number.parseInt(ordered[1], 10) + 1;
+    mark = mark.slice(0, ordered.index) + next + ordered[2] + ordered[3];
+  }
+  return quote + src.indent + mark + placeholder;
+}
+function parseEditorValue(src, raw) {
+  let text = raw.trim();
+  let checked = src.checked;
+  if (src.checked !== null) {
+    const m = /^([☐☑])\s*/u.exec(text);
+    if (m) {
+      checked = m[1] === "\u2611";
+      text = text.slice(m[0].length).trim();
+    }
+  }
+  return { text, checked };
+}
+
 // src/MindmapView.ts
-var MINDMAP_VIEW_TYPE = "mindmap-view";
-var MindmapView = class extends import_obsidian.ItemView {
+var MINDMAP_VIEW_TYPE = "obmind-view";
+var MindmapView = class extends import_obsidian2.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.mm = null;
@@ -5173,6 +5934,9 @@ var MindmapView = class extends import_obsidian.ItemView {
     this.canvasEl = null;
     this.themeSelect = null;
     this.observer = null;
+    this.resizeObserver = null;
+    /** 尺寸还没就绪时挂起的首次适配请求 */
+    this.pendingFit = false;
     this.painter = new NodePainter();
     this.currentSpec = null;
     /** 待执行的绘制帧（rAF），用它合并同一帧内的多次重绘请求 */
@@ -5191,6 +5955,18 @@ var MindmapView = class extends import_obsidian.ItemView {
     this.appliedThemeKey = "";
     // 上次渲染的笔记路径：只有换笔记时才重新适配视图
     this.lastFilePath = "";
+    // 编辑态闸门：编辑期间禁止重建导图，否则输入框会连同节点一起被冲掉
+    this.editing = false;
+    this.editorHandle = null;
+    this.pendingRefresh = false;
+    // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
+    this.indentStep = 2;
+    this.indentUnit = "  ";
+    // 新建同级节点后，等重建完成再把编辑框落到新行上
+    this.pendingEditLine = -1;
+    this.drag = null;
+    /** 最近一次渲染用的节点树：拖动时靠它取全部节点的源坐标（折叠的节点不在 DOM 里） */
+    this.lastTree = null;
     this.plugin = plugin;
   }
   getViewType() {
@@ -5234,6 +6010,18 @@ var MindmapView = class extends import_obsidian.ItemView {
       var _a;
       void ((_a = this.mm) == null ? void 0 : _a.fit());
     });
+    toolbar.createSpan({
+      cls: "obmind-hint",
+      text: "?",
+      attr: {
+        title: [
+          "\u53CC\u51FB\u8282\u70B9\uFF1A\u539F\u5730\u7F16\u8F91",
+          "Enter \u5B8C\u6210 \xB7 Esc \u53D6\u6D88 \xB7 Ctrl+Enter \u65B0\u5EFA\u540C\u7EA7",
+          "Tab \u7F29\u8FDB \xB7 Shift+Tab \u53CD\u7F29\u8FDB \xB7 \u6E05\u7A7A\u540E\u9000\u683C\u5220\u9664\u8BE5\u884C",
+          "Ctrl/\u2318 + \u5355\u51FB\u8282\u70B9\uFF1A\u6253\u5F00\u540C\u540D\u7B14\u8BB0"
+        ].join("\n")
+      }
+    });
     const canvas = container.createDiv({ cls: "obmind-canvas" });
     this.canvasEl = canvas;
     const svg = canvas.createSvg("svg");
@@ -5242,17 +6030,23 @@ var MindmapView = class extends import_obsidian.ItemView {
     svg.style.height = "100%";
     this.svgEl = svg;
     this.observeLayout(svg);
+    this.observeSize(canvas);
     await this.refresh();
     this.registerEvent(
       this.app.workspace.on(
         "editor-change",
-        (0, import_obsidian.debounce)(() => void this.refresh(), 300, true)
+        (0, import_obsidian2.debounce)(() => void this.refresh(), 300, true)
       )
     );
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => void this.refresh())
     );
     svg.addEventListener("click", (e) => this.onNodeClick(e));
+    svg.addEventListener("dblclick", (e) => this.onNodeDblClick(e), true);
+    this.drag = new DragController(svg, canvas, {
+      srcOf: (g) => this.srcOf(g),
+      onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(srcLine, targetLine, mode)
+    });
   }
   /**
    * 监听导图的结构与布局变化，并按变化类型分流：
@@ -5295,6 +6089,28 @@ var MindmapView = class extends import_obsidian.ItemView {
       attributes: true,
       attributeFilter: ["transform"]
     });
+  }
+  /**
+   * 监听画布尺寸。
+   *
+   * 首次适配完全依赖它：视图创建时右侧栏还在滑出，容器尺寸是 0，
+   * fitInstant 会挂起（pendingFit），等这里的尺寸真正就绪再补做，
+   * 否则就会「打开一片空白，点一下适配才出来」。
+   * 编辑框开着时尺寸变化要跟着重新对齐。
+   */
+  observeSize(el) {
+    var _a;
+    (_a = this.resizeObserver) == null ? void 0 : _a.disconnect();
+    this.resizeObserver = new ResizeObserver(() => {
+      var _a2;
+      if (this.pendingFit) {
+        void this.fitInstant();
+        return;
+      }
+      if (this.editing)
+        (_a2 = this.editorHandle) == null ? void 0 : _a2.reposition();
+    });
+    this.resizeObserver.observe(el);
   }
   /** 合并同一帧内的多次重绘请求，保证与浏览器刷新节奏同步 */
   requestPaint(mode, paths) {
@@ -5352,20 +6168,28 @@ var MindmapView = class extends import_obsidian.ItemView {
     }
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (view instanceof import_obsidian.MarkdownView && view.file) {
+      if (view instanceof import_obsidian2.MarkdownView && view.file) {
         this.targetFile = view.file;
         return view.file;
       }
     }
     return null;
   }
-  /** 取笔记正文：正在编辑时用编辑器里的实时内容，否则读缓存 */
+  /** 取笔记正文。
+   *
+   * 优先用「正打开这篇笔记的编辑器」里的实时内容。注意不能只看活跃视图：
+   * 用户拖导图时活跃视图是导图自己，`getActiveViewOfType(MarkdownView)` 返回 null，
+   * 于是退回 cachedRead —— 而刚通过 editor.transaction 写进编辑器缓冲的内容
+   * 还没被 Obsidian 自动保存到磁盘，读回来是旧的，内容比对就判「没变化」直接短路，
+   * 表现为「文件明明变了，导图要手动刷新才更新」。
+   *
+   * 没有编辑器时用 vault.read（不走缓存）：写完之后读缓存同样可能拿到旧数据。
+   */
   async readContent(file) {
-    const mdView = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-    if (mdView && mdView.file && mdView.file.path === file.path) {
-      return mdView.editor.getValue();
-    }
-    return this.app.vault.cachedRead(file);
+    const editor = findEditor(this.app, file);
+    if (editor)
+      return editor.getValue();
+    return this.app.vault.read(file);
   }
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
   applyTheme(spec) {
@@ -5422,8 +6246,17 @@ var MindmapView = class extends import_obsidian.ItemView {
    */
   async fitInstant() {
     const mm = this.mm;
-    if (!mm)
+    const el = this.svgEl;
+    if (!mm || !el)
       return;
+    if (el.clientWidth < 8 || el.clientHeight < 8) {
+      this.pendingFit = true;
+      return;
+    }
+    await this.nextFrame();
+    if (this.svgEl !== el || this.mm !== mm)
+      return;
+    this.pendingFit = false;
     const prev = mm.options.duration;
     mm.setOptions({ duration: 0 });
     try {
@@ -5432,7 +6265,17 @@ var MindmapView = class extends import_obsidian.ItemView {
       mm.setOptions({ duration: prev });
     }
   }
-  async refresh() {
+  nextFrame() {
+    return new Promise((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  }
+  async refresh(knownContent) {
+    var _a, _b, _c;
+    if (this.editing) {
+      this.pendingRefresh = true;
+      return;
+    }
     if (this.refreshing) {
       this.pending = true;
       return;
@@ -5444,19 +6287,28 @@ var MindmapView = class extends import_obsidian.ItemView {
       const file = this.resolveTargetFile();
       if (!file || !this.svgEl)
         return;
-      const content = await this.readContent(file);
+      const content = knownContent != null ? knownContent : await this.readContent(file);
       const fileChanged = this.lastFilePath !== file.path;
       const isDark = document.body.classList.contains("theme-dark");
       const spec = resolveTheme(this.plugin.settings.theme, isDark);
       const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
       this.applyTheme(spec);
       if (!fileChanged && this.mm && content === this.lastContent && themeKey === this.appliedThemeKey) {
+        this.flushPendingEdit();
         return;
       }
       const tree = buildTree(content, file.basename, {
         filterFrontmatter: this.plugin.settings.filterFrontmatter
       });
       this.lastContent = content;
+      this.lastTree = tree;
+      const step = (_a = tree.payload) == null ? void 0 : _a.step;
+      if (typeof step === "number" && step > 0)
+        this.indentStep = step;
+      const unit = (_b = tree.payload) == null ? void 0 : _b.indentUnit;
+      if (typeof unit === "string" && unit !== "")
+        this.indentUnit = unit;
+      applyFolds(tree, collectFolds((_c = this.mm) == null ? void 0 : _c.state.data));
       if (!this.mm) {
         this.mm = it.create(this.svgEl, this.buildOptions(spec));
         this.appliedThemeKey = themeKey;
@@ -5476,6 +6328,7 @@ var MindmapView = class extends import_obsidian.ItemView {
           await this.fitInstant();
       }
       this.lastFilePath = file.path;
+      this.flushPendingEdit();
     } finally {
       this.refreshing = false;
       if (this.pending) {
@@ -5502,12 +6355,14 @@ var MindmapView = class extends import_obsidian.ItemView {
         href,
         (_d = (_c = this.targetFile) == null ? void 0 : _c.path) != null ? _d : ""
       );
-      if (dest2 instanceof import_obsidian.TFile) {
+      if (dest2 instanceof import_obsidian2.TFile) {
         void this.app.workspace.getLeaf("tab").openFile(dest2);
       }
       return;
     }
     if (target.closest("circle"))
+      return;
+    if (!(e.ctrlKey || e.metaKey))
       return;
     const g = target.closest("g.markmap-node");
     if (!g)
@@ -5519,21 +6374,234 @@ var MindmapView = class extends import_obsidian.ItemView {
       text,
       (_g = (_f = this.targetFile) == null ? void 0 : _f.path) != null ? _g : ""
     );
-    if (dest instanceof import_obsidian.TFile) {
+    if (dest instanceof import_obsidian2.TFile) {
       void this.app.workspace.getLeaf("tab").openFile(dest);
     }
   }
+  // -------------------------------------------------------------------------
+  // 双向编辑
+  // -------------------------------------------------------------------------
+  /** 双击节点进入原地编辑 */
+  onNodeDblClick(e) {
+    var _a;
+    const target = e.target;
+    if (target.closest("a"))
+      return;
+    if (target.closest("circle"))
+      return;
+    const g = target.closest("g.markmap-node");
+    if (!g)
+      return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (this.editing || this.refreshing) {
+      const pendingLine = (_a = this.srcOf(g)) == null ? void 0 : _a.line;
+      if (pendingLine !== void 0)
+        this.pendingEditLine = pendingLine;
+      return;
+    }
+    this.startEdit(g, false);
+  }
+  /**
+   * 拖拽落下：把「移动」翻译成整篇新内容，一次性写回。
+   *
+   * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
+   * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
+   */
+  onNodeDrop(srcLine, targetLine, mode) {
+    const file = this.targetFile;
+    const tree = this.lastTree;
+    const content = this.lastContent;
+    if (!file || !tree || !content)
+      return;
+    const res = moveNode({
+      lines: content.split("\n"),
+      nodes: collectSrc(tree),
+      step: this.indentStep,
+      unit: this.indentUnit,
+      srcLine,
+      targetLine,
+      mode
+    });
+    if (!res.ok) {
+      new import_obsidian2.Notice(`obmind\uFF1A${res.reason}`);
+      return;
+    }
+    void this.applyMove(file, res.lines.join("\n"), content);
+  }
+  async applyMove(file, next, expect) {
+    try {
+      const ok = await replaceAll(this.app, file, next, expect);
+      if (!ok) {
+        new import_obsidian2.Notice("\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u79FB\u52A8\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002");
+        return;
+      }
+      await this.refresh(next);
+    } catch (err) {
+      console.error("[obmind] \u79FB\u52A8\u8282\u70B9\u5931\u8D25", err);
+      new import_obsidian2.Notice("\u79FB\u52A8\u8282\u70B9\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
+    }
+  }
+  /** 从节点的绑定数据里取源行坐标 */
+  srcOf(g) {
+    var _a;
+    const data = g.__data__;
+    const src = (_a = data == null ? void 0 : data.payload) == null ? void 0 : _a.src;
+    return src && typeof src.line === "number" ? src : null;
+  }
+  /** 找到渲染在指定源行上的节点（新建节点后定位用） */
+  findNodeByLine(line) {
+    var _a;
+    const svg = this.svgEl;
+    if (!svg)
+      return null;
+    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+      if (((_a = this.srcOf(g)) == null ? void 0 : _a.line) === line)
+        return g;
+    }
+    return null;
+  }
+  /** 打开原地编辑框；根节点（文件名）不可编辑 */
+  startEdit(g, selectAll) {
+    var _a, _b, _c;
+    if (this.editing || !this.canvasEl)
+      return;
+    if (this.refreshing) {
+      const pendingLine = (_a = this.srcOf(g)) == null ? void 0 : _a.line;
+      if (pendingLine !== void 0) {
+        window.setTimeout(() => {
+          const next = this.findNodeByLine(pendingLine);
+          if (next)
+            this.startEdit(next, selectAll);
+        }, 80);
+      }
+      return;
+    }
+    if (!g.isConnected)
+      return;
+    const data = g.__data__;
+    const src = this.srcOf(g);
+    if (!src || ((_b = data == null ? void 0 : data.state) == null ? void 0 : _b.depth) === 0)
+      return;
+    const spec = (_c = this.currentSpec) != null ? _c : resolveTheme(this.plugin.settings.theme, false);
+    const value = src.checked === null ? src.text : `${src.checked ? "\u2611" : "\u2610"} ${src.text}`;
+    this.editing = true;
+    const handle = openInlineEditor({
+      container: this.canvasEl,
+      target: g,
+      value,
+      spec,
+      selectAll,
+      onFinish: (action, text) => {
+        this.editorHandle = null;
+        void this.commitEdit(action, text, src);
+      }
+    });
+    if (!handle) {
+      this.editing = false;
+      return;
+    }
+    this.editorHandle = handle;
+  }
+  /** 编辑结束后：翻译成文本变更 → 写回笔记 → 重建导图 */
+  async commitEdit(action, value, src) {
+    try {
+      if (action === "cancel")
+        return;
+      const file = this.targetFile;
+      if (!file)
+        return;
+      const parsed = parseEditorValue(src, value);
+      let span = null;
+      if (parsed.text === "" && action !== "delete")
+        return;
+      if (action === "delete") {
+        span = {
+          start: src.line,
+          end: src.line + 1,
+          lines: [],
+          checkLine: src.line,
+          checkText: src.full
+        };
+      } else if (action === "sibling") {
+        span = {
+          start: src.line,
+          end: src.line + 1,
+          lines: [rewriteNode(src, parsed.text, parsed.checked), siblingLine(src)],
+          checkLine: src.line,
+          checkText: src.full
+        };
+        this.pendingEditLine = src.line + 1;
+      } else if (action === "indent" || action === "outdent") {
+        const nextIndent = indentBy(src, action === "indent" ? 1 : -1, this.indentStep);
+        if (nextIndent === null)
+          return;
+        span = {
+          start: src.line,
+          end: src.line + 1,
+          lines: [rewriteNode(src, parsed.text, parsed.checked, nextIndent)],
+          checkLine: src.line,
+          checkText: src.full
+        };
+      } else {
+        if (parsed.text === src.text && parsed.checked === src.checked)
+          return;
+        span = {
+          start: src.line,
+          end: src.line + 1,
+          lines: [rewriteNode(src, parsed.text, parsed.checked)],
+          checkLine: src.line,
+          checkText: src.full
+        };
+      }
+      const ok = await applySpan(this.app, file, span);
+      if (!ok) {
+        this.pendingEditLine = -1;
+        new import_obsidian2.Notice("\u7B14\u8BB0\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u672C\u6B21\u4FEE\u6539\u672A\u5199\u5165\u3002\u8BF7\u70B9\u300C\u5237\u65B0\u300D\u540E\u91CD\u8BD5\u3002");
+      }
+    } catch (err) {
+      this.pendingEditLine = -1;
+      console.error("[obmind] \u5199\u56DE\u7B14\u8BB0\u5931\u8D25", err);
+      new import_obsidian2.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
+    } finally {
+      this.editorHandle = null;
+      this.editing = false;
+      this.pendingRefresh = false;
+      await this.refresh();
+    }
+  }
+  /** 重建完成后，把编辑框落到新建的那一行上 */
+  flushPendingEdit() {
+    const line = this.pendingEditLine;
+    if (line < 0)
+      return;
+    this.pendingEditLine = -1;
+    window.setTimeout(() => {
+      const g = this.findNodeByLine(line);
+      if (g)
+        this.startEdit(g, true);
+    }, 240);
+  }
   async onClose() {
-    var _a, _b;
-    (_a = this.observer) == null ? void 0 : _a.disconnect();
+    var _a, _b, _c, _d, _e;
+    (_a = this.editorHandle) == null ? void 0 : _a.close();
+    this.editorHandle = null;
+    this.editing = false;
+    (_b = this.observer) == null ? void 0 : _b.disconnect();
     this.observer = null;
+    (_c = this.resizeObserver) == null ? void 0 : _c.disconnect();
+    this.resizeObserver = null;
+    this.pendingFit = false;
     if (this.paintFrame) {
       window.cancelAnimationFrame(this.paintFrame);
       this.paintFrame = 0;
     }
     this.painter.reset();
-    (_b = this.mm) == null ? void 0 : _b.destroy();
+    (_d = this.mm) == null ? void 0 : _d.destroy();
     this.mm = null;
+    (_e = this.drag) == null ? void 0 : _e.destroy();
+    this.drag = null;
+    this.lastTree = null;
     this.lastContent = "";
     this.lastFilePath = "";
     this.appliedThemeKey = "";
@@ -5545,12 +6613,12 @@ var MindmapView = class extends import_obsidian.ItemView {
 };
 
 // src/settings.ts
-var import_obsidian2 = require("obsidian");
+var import_obsidian3 = require("obsidian");
 var DEFAULT_SETTINGS = {
   theme: "follow",
   filterFrontmatter: true
 };
-var ObmindSettingTab = class extends import_obsidian2.PluginSettingTab {
+var ObmindSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -5558,7 +6626,7 @@ var ObmindSettingTab = class extends import_obsidian2.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian2.Setting(containerEl).setName("\u8FC7\u6EE4\u7B14\u8BB0\u5C5E\u6027").setDesc("\u751F\u6210\u5BFC\u56FE\u65F6\u8DF3\u8FC7\u7B14\u8BB0\u9876\u90E8\u7684 YAML frontmatter\uFF08\u5C5E\u6027\u533A\uFF09\u3002\u4E3B\u9898\u8BF7\u5728\u601D\u7EF4\u5BFC\u56FE\u89C6\u56FE\u9876\u90E8\u5207\u6362\u3002").addToggle((toggle) => {
+    new import_obsidian3.Setting(containerEl).setName("\u8FC7\u6EE4\u7B14\u8BB0\u5C5E\u6027").setDesc("\u751F\u6210\u5BFC\u56FE\u65F6\u8DF3\u8FC7\u7B14\u8BB0\u9876\u90E8\u7684 YAML frontmatter\uFF08\u5C5E\u6027\u533A\uFF09\u3002\u4E3B\u9898\u8BF7\u5728\u601D\u7EF4\u5BFC\u56FE\u89C6\u56FE\u9876\u90E8\u5207\u6362\u3002").addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.filterFrontmatter);
       toggle.onChange(async (value) => {
         this.plugin.settings.filterFrontmatter = value;
@@ -5571,38 +6639,71 @@ var ObmindSettingTab = class extends import_obsidian2.PluginSettingTab {
 
 // src/main.ts
 var THEME_CYCLE = ["follow", ...THEMES.map((t) => t.id)];
-var MindmapPlugin = class extends import_obsidian3.Plugin {
+var MindmapPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
   }
   async onload() {
-    await this.loadSettings();
-    this.registerView(
-      MINDMAP_VIEW_TYPE,
-      (leaf) => new MindmapView(leaf, this)
-    );
-    this.addRibbonIcon("network", "obmind\uFF1A\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE", () => {
-      void this.activateView();
+    try {
+      await this.loadSettings();
+    } catch (err) {
+      console.error("[obmind] \u8BFB\u53D6\u8BBE\u7F6E\u5931\u8D25\uFF0C\u6539\u7528\u9ED8\u8BA4\u8BBE\u7F6E", err);
+      this.settings = { ...DEFAULT_SETTINGS };
+    }
+    this.safely("\u6CE8\u518C\u89C6\u56FE", () => {
+      this.registerView(
+        MINDMAP_VIEW_TYPE,
+        (leaf) => new MindmapView(leaf, this)
+      );
     });
-    this.addCommand({
-      id: "open-outline-mindmap",
-      name: "\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE",
-      callback: () => {
+    this.safely("\u6DFB\u52A0\u4FA7\u8FB9\u680F\u56FE\u6807", () => {
+      this.addRibbonIcon("network", "obmind\uFF1A\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE", () => {
         void this.activateView();
-      }
+      });
     });
-    this.addCommand({
-      id: "switch-mindmap-theme",
-      name: "\u5207\u6362\u601D\u7EF4\u5BFC\u56FE\u4E3B\u9898",
-      callback: async () => {
-        const index = THEME_CYCLE.indexOf(this.settings.theme);
-        this.settings.theme = THEME_CYCLE[(index + 1) % THEME_CYCLE.length];
-        await this.saveSettings();
-        this.refreshMindmap();
-      }
+    this.safely("\u6DFB\u52A0\u547D\u4EE4", () => {
+      this.addCommand({
+        id: "open-outline-mindmap",
+        name: "\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE",
+        callback: () => {
+          void this.activateView();
+        }
+      });
+      this.addCommand({
+        id: "switch-mindmap-theme",
+        name: "\u5207\u6362\u601D\u7EF4\u5BFC\u56FE\u4E3B\u9898",
+        callback: async () => {
+          const index = THEME_CYCLE.indexOf(this.settings.theme);
+          this.settings.theme = THEME_CYCLE[(index + 1) % THEME_CYCLE.length];
+          await this.saveSettings();
+          this.refreshMindmap();
+        }
+      });
     });
-    this.addSettingTab(new ObmindSettingTab(this.app, this));
+    this.safely("\u6DFB\u52A0\u8BBE\u7F6E\u9875", () => {
+      this.addSettingTab(new ObmindSettingTab(this.app, this));
+    });
+  }
+  onunload() {
+    this.app.workspace.detachLeavesOfType(MINDMAP_VIEW_TYPE);
+  }
+  /**
+   * 执行一步 UI 注册，失败只提示不抛出。
+   * 插件「能加载、少个入口」远好过「整个插件加载失败被禁用」。
+   */
+  safely(step, fn) {
+    try {
+      fn();
+    } catch (err) {
+      const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      if (/existing view type/i.test(detail)) {
+        console.warn(`[obmind] ${step}\uFF1A\u89C6\u56FE\u7C7B\u578B\u5DF2\u5B58\u5728\uFF0C\u8DF3\u8FC7`, err);
+        return;
+      }
+      console.error(`[obmind] ${step}\u5931\u8D25`, err);
+      new import_obsidian4.Notice(`obmind ${step}\u5931\u8D25\uFF1A${detail}`, 15e3);
+    }
   }
   async activateView() {
     var _a, _b;
@@ -5617,7 +6718,7 @@ var MindmapPlugin = class extends import_obsidian3.Plugin {
     }
     const view = leaf.view;
     if (view instanceof MindmapView) {
-      view.setTargetFile(activeFile instanceof import_obsidian3.TFile ? activeFile : null);
+      view.setTargetFile(activeFile instanceof import_obsidian4.TFile ? activeFile : null);
       void view.refresh();
     }
     workspace.revealLeaf(leaf);

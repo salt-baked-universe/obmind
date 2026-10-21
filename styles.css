@@ -28,9 +28,24 @@
   font-size: var(--font-ui-smaller, 12px);
 }
 
+.obmind-toolbar .obmind-hint {
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 50%;
+  cursor: help;
+  font-size: 12px;
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+}
+
 .obmind-canvas {
   flex: 1 1 auto;
   min-height: 0;
+  /* 编辑框用 absolute 定位，需要这里是定位参照 */
+  position: relative;
   transition: background-color 0.18s ease;
 }
 
@@ -87,4 +102,48 @@
 .obmind-canvas .markmap-foreign a:hover {
   opacity: 1;
   text-decoration-thickness: 2px;
+}
+
+/* 原地编辑框。
+   刻意不放进 foreignObject：markmap 用 firstChild.scrollWidth/scrollHeight
+   测量节点尺寸，塞输入元素进去会撑歪布局；而且它每次 render 都会重建那层 DOM。
+   这里是画布上的绝对定位浮层，靠 transform: scale(k) 抵消画布缩放，
+   所以字号、行高、换行位置与卡片里完全一致。 */
+.obmind-inline-editor {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow-y: hidden;
+  box-shadow: 0 0 0 2px var(--interactive-accent, #4a7dff);
+  caret-color: var(--interactive-accent, #4a7dff);
+}
+
+/* 拖动改变父子关系的视觉反馈。
+   拖拽中的源节点淡出，跟随鼠标显示「落点」：
+   落在卡片中部 = 变成子节点（描边框），落在上下沿 = 排到前后（横线）。 */
+.obmind-canvas .markmap-node.obmind-dragging {
+  opacity: 0.32;
+}
+
+.obmind-drop-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 16;
+}
+
+.obmind-drop-box {
+  position: absolute;
+  display: none;
+  box-sizing: border-box;
+  border: 2px solid var(--interactive-accent, #4a7dff);
+  border-radius: 9px;
+}
+
+.obmind-drop-line {
+  position: absolute;
+  display: none;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--interactive-accent, #4a7dff);
 }
