@@ -5050,13 +5050,13 @@ var CLASSIC = {
   label: "\u7ECF\u5178",
   dark: false,
   bg: "#f6f7f9",
-  colors: ["#4a7dff", "#ff8a3d", "#2fb37c", "#9b56e0", "#e5484d", "#0ea5c6"],
+  colors: ["#4a7dff", "#ff8a3d", "#2fb37c", "#9b56e0", "#e5484d", "#0ea5c6", "#d9a300", "#e0559b"],
   rootBg: "#2b3445",
   rootFg: "#ffffff",
   level1Solid: true,
   level1Fg: "#ffffff",
   nodeText: "#33415c",
-  tint: 0.13,
+  tint: 0.3,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -5068,13 +5068,13 @@ var BUSINESS = {
   label: "\u5546\u52A1",
   dark: false,
   bg: "#eef2f7",
-  colors: ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0369a1"],
+  colors: ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0369a1", "#4d7c0f", "#57534e"],
   rootBg: "#0f2d5c",
   rootFg: "#ffffff",
   level1Solid: false,
   level1Fg: "#0f2d5c",
   nodeText: "#33415c",
-  tint: 0.1,
+  tint: 0.24,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -5086,13 +5086,13 @@ var DARK = {
   label: "\u6DF1\u8272",
   dark: true,
   bg: "#1b1d24",
-  colors: ["#7aa2f7", "#f6a45c", "#6ed3a5", "#c08cf0", "#f07d8a", "#4fc3d9"],
+  colors: ["#7aa2f7", "#f6a45c", "#6ed3a5", "#c08cf0", "#f07d8a", "#4fc3d9", "#e8c46a", "#f59ecb"],
   rootBg: "#7aa2f7",
   rootFg: "#12151c",
   level1Solid: false,
   level1Fg: "#e6ecf7",
   nodeText: "#c9d2e3",
-  tint: 0.2,
+  tint: 0.34,
   mixBase: "#1b1d24",
   circle: "#2a2f3c",
   card: true,
@@ -5104,13 +5104,13 @@ var CANDY = {
   label: "\u7CD6\u679C",
   dark: false,
   bg: "#fffaf3",
-  colors: ["#ff7aa2", "#ffb03a", "#3ecf8e", "#5aa9ff", "#b07cff", "#ff8a65"],
+  colors: ["#ff7aa2", "#ffb03a", "#3ecf8e", "#5aa9ff", "#b07cff", "#ff8a65", "#2ec4b6", "#e37cc9"],
   rootBg: "#ff7aa2",
   rootFg: "#ffffff",
   level1Solid: false,
   level1Fg: "#6b3f4c",
   nodeText: "#5a3b46",
-  tint: 0.2,
+  tint: 0.3,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -5122,7 +5122,7 @@ var MINIMAL = {
   label: "\u6781\u7B80",
   dark: false,
   bg: "#ffffff",
-  colors: ["#3d6fd1", "#d1743d", "#3d9c74", "#8b5cc7", "#c2454b", "#2a9bb0"],
+  colors: ["#3d6fd1", "#b45309", "#2f8f5b", "#8b5cc7", "#c2454b", "#0e7490", "#a16207", "#9d3b6d"],
   rootBg: "#1f2430",
   rootFg: "#ffffff",
   level1Solid: false,
@@ -5176,12 +5176,34 @@ function mixColor(color2, base, ratio) {
   const bl = Math.round(a[2] * ratio + b[2] * (1 - ratio));
   return `rgb(${r}, ${g}, ${bl})`;
 }
-function branchIndex(path2) {
-  const parts = path2.split(".");
-  if (parts.length < 2)
-    return 0;
-  const n = Number.parseInt(parts[1], 10);
-  return Number.isFinite(n) ? n : 0;
+function luminance(color2) {
+  const rgb2 = parseHex(color2);
+  if (!rgb2)
+    return 0.5;
+  const [r, g, b] = rgb2.map((v2) => {
+    const c = v2 / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+function contrastRatio(a, b) {
+  const la = luminance(a);
+  const lb = luminance(b);
+  const hi = Math.max(la, lb);
+  const lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+function readableOn(color2) {
+  const ink = "#12151c";
+  return contrastRatio(color2, "#ffffff") >= contrastRatio(color2, ink) ? "#ffffff" : ink;
+}
+function level1Tint(spec) {
+  return Math.min(0.5, Math.max(spec.tint * 1.5, 0.34));
+}
+function tintAt(spec, depth) {
+  if (depth <= 2)
+    return spec.tint;
+  return Math.max(spec.tint * 0.35, spec.tint * (1 - (depth - 2) * 0.22));
 }
 function nodeStyleAt(spec, depth, branch) {
   if (depth === 0) {
@@ -5191,16 +5213,16 @@ function nodeStyleAt(spec, depth, branch) {
     return { bg: "transparent", fg: depth === 1 ? branch : spec.nodeText, bold: depth === 1 };
   }
   if (depth === 1 && spec.level1Solid) {
-    return { bg: branch, fg: spec.level1Fg, bold: true };
+    return { bg: branch, fg: readableOn(branch), bold: true };
   }
   if (depth === 1) {
     return {
-      bg: mixColor(branch, spec.mixBase, Math.max(spec.tint, 0.18)),
+      bg: mixColor(branch, spec.mixBase, level1Tint(spec)),
       fg: spec.level1Fg,
       bold: true
     };
   }
-  return { bg: mixColor(branch, spec.mixBase, spec.tint), fg: spec.nodeText, bold: false };
+  return { bg: mixColor(branch, spec.mixBase, tintAt(spec, depth)), fg: spec.nodeText, bold: false };
 }
 
 // src/render/geometry.ts
@@ -5302,13 +5324,104 @@ function linkPath(child, parent) {
   return `M ${startX} ${startY} C ${c1x} ${startY}, ${c2x} ${endY}, ${endX} ${endY}`;
 }
 
+// src/render/colors.ts
+function branchPathOf(path2) {
+  const first = path2.indexOf(".");
+  if (first < 0)
+    return path2;
+  const second = path2.indexOf(".", first + 1);
+  return second < 0 ? path2 : path2.slice(0, second);
+}
+function hash32(text) {
+  let h2 = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h2 ^= text.charCodeAt(i);
+    h2 = Math.imul(h2, 16777619);
+  }
+  return h2 >>> 0;
+}
+function branchKey(text) {
+  const plain = text.replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/<[^>]*>/g, "").replace(/[`*_~]/g, "").replace(/\s+/g, " ").trim();
+  return plain === "" ? text.trim() : plain;
+}
+var BranchColors = class {
+  constructor() {
+    /** 分支 key → 槽位 */
+    this.slots = /* @__PURE__ */ new Map();
+    /** 上次使用的色板长度：换主题（色板长度不同）时全部重排 */
+    this.size = 0;
+  }
+  reset() {
+    this.slots.clear();
+    this.size = 0;
+  }
+  /**
+   * 按「本轮出现的分支」刷新分配。
+   *
+   * @param keys 一级分支的 key（文档顺序；顺序本身不参与运算，只影响重复流程）
+   * @param size 色板长度
+   * @returns key → 槽位
+   */
+  sync(keys, size) {
+    var _a;
+    const n = Math.max(1, Math.floor(size));
+    if (n !== this.size) {
+      this.slots.clear();
+      this.size = n;
+    }
+    const present = new Set(keys);
+    const removed = [];
+    for (const key of Array.from(this.slots.keys())) {
+      if (!present.has(key))
+        removed.push(key);
+    }
+    const added = [];
+    for (const key of present) {
+      if (!this.slots.has(key))
+        added.push(key);
+    }
+    if (removed.length === 1 && added.length === 1) {
+      this.slots.set(added[0], (_a = this.slots.get(removed[0])) != null ? _a : 0);
+      this.slots.delete(removed[0]);
+    } else {
+      for (const key of removed)
+        this.slots.delete(key);
+      const order = added.sort(
+        (a, b) => hash32(a) - hash32(b) || (a < b ? -1 : a > b ? 1 : 0)
+      );
+      for (const key of order)
+        this.place(key, hash32(key) % this.size);
+    }
+    const out = /* @__PURE__ */ new Map();
+    for (const key of present) {
+      const slot = this.slots.get(key);
+      if (slot !== void 0)
+        out.set(key, slot);
+    }
+    return out;
+  }
+  /** 放某个 key：首选位置被占就向后找空位；实在占满（分支比颜色多）只能重复 */
+  place(key, preferred) {
+    const taken = new Set(this.slots.values());
+    for (let step = 0; step < this.size; step++) {
+      const slot = (preferred + step) % this.size;
+      if (!taken.has(slot)) {
+        this.slots.set(key, slot);
+        return;
+      }
+    }
+    this.slots.set(key, preferred);
+  }
+};
+
 // src/render/painter.ts
 var CLS_SHADOW = "obmind-node-shadow";
 var CLS_LINK = "obmind-node-link";
 var CLS_CARD = "obmind-node-card";
 var FOLD_SCALE = 0.7;
 var NodePainter = class {
-  constructor() {
+  constructor(slotOf = (path2, size) => hash32(branchPathOf(path2)) % Math.max(1, size)) {
+    this.slotOf = slotOf;
     this.entries = /* @__PURE__ */ new Map();
   }
   /** 视图重建导图时调用，丢掉所有缓存 */
@@ -5480,7 +5593,7 @@ var NodePainter = class {
     const shadow = entry.shadow;
     if (!card || !shadow)
       return;
-    const branch = branchIndex(box.path);
+    const branch = this.slotOf(box.path, spec.colors.length);
     if (entry.themeKey === themeKey && entry.depth === box.depth && entry.branch === branch) {
       return;
     }
@@ -5571,7 +5684,7 @@ var NodePainter = class {
     const link2 = entry.link;
     if (!link2)
       return;
-    const branch = spec.colors[branchIndex(box.path) % spec.colors.length];
+    const branch = spec.colors[this.slotOf(box.path, spec.colors.length) % spec.colors.length];
     const d = linkPath(box, parent);
     if (entry.linkD === d && entry.linkBranch === branch && entry.linkWidth === spec.linkWidth) {
       return;
@@ -7099,7 +7212,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.mm = null;
     this.svgEl = null;
     this.canvasEl = null;
-    this.themeSelect = null;
+    /** 主题按钮（图标 + 菜单）：比原生 <select> 窄一半，也不用跟各主题的 select 样式搏斗 */
+    this.themeBtn = null;
     this.observer = null;
     this.resizeObserver = null;
     /** 尺寸还没就绪时挂起的首次适配请求 */
@@ -7124,7 +7238,15 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.autoFitTimer = 0;
     /** 画布空态提示（没有可显示的笔记时） */
     this.emptyEl = null;
-    this.painter = new NodePainter();
+    /**
+     * 分支 → 色板槽位。跨 setData 保留：新加/删除分支只影响新出现的那根，
+     * 已有分支的颜色纹丝不动（见 render/colors.ts）。
+     */
+    this.branchColors = new BranchColors();
+    this.branchSlots = /* @__PURE__ */ new Map();
+    this.painter = new NodePainter(
+      (path2, size) => this.branchSlot(path2, size)
+    );
     this.currentSpec = null;
     // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
     this.targetFile = null;
@@ -7217,21 +7339,22 @@ var MindmapView = class extends import_obsidian3.ItemView {
     container.empty();
     container.classList.add("obmind-container");
     const header = container.createDiv({ cls: "obmind-header" });
-    const select = document.createElement("select");
-    select.className = "dropdown";
-    for (const opt of THEME_OPTIONS) {
-      const optionEl = document.createElement("option");
-      optionEl.value = opt.value;
-      optionEl.textContent = opt.label;
-      select.appendChild(optionEl);
-    }
-    select.value = this.plugin.settings.theme;
-    select.addEventListener("change", () => {
-      void this.onThemeChange(select.value);
+    const themeBtn = header.createEl("button", {
+      cls: "clickable-icon obmind-theme-btn"
     });
-    this.themeSelect = select;
+    (0, import_obsidian3.setIcon)(themeBtn, "palette");
+    if (themeBtn.childElementCount === 0) {
+      themeBtn.setText("\u4E3B\u9898");
+      themeBtn.addClass("obmind-icon-fallback");
+    }
+    themeBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      this.openThemeMenu(themeBtn);
+    });
+    this.themeBtn = themeBtn;
+    this.syncThemeButton();
     this.toolbar = buildToolbar(header, {
-      leading: select,
+      leading: themeBtn,
       rows: [
         {
           groups: [
@@ -7287,7 +7410,13 @@ var MindmapView = class extends import_obsidian3.ItemView {
                   label: "\u63D0\u5347\u4E00\u7EA7",
                   key: "Shift+Tab",
                   fallback: "\u63D0"
-                },
+                }
+              ]
+            },
+            // 删除单独成组：破坏性操作不要和「新建 / 提升」贴在一起，
+            // 手指连点时误触的代价太大
+            {
+              buttons: [
                 { id: "delete", icon: "trash-2", label: "\u5220\u9664\u8282\u70B9", key: "Delete", fallback: "\u5220" }
               ]
             }
@@ -7486,6 +7615,62 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.plugin.settings.theme = theme;
     await this.plugin.saveSettings();
     this.refresh();
+  }
+  /** 主题按钮的提示要跟着当前主题变，否则用户看不出现在是哪套 */
+  syncThemeButton() {
+    var _a, _b;
+    const btn = this.themeBtn;
+    if (!btn)
+      return;
+    const current = this.plugin.settings.theme;
+    const label = (_b = (_a = THEME_OPTIONS.find((o) => o.value === current)) == null ? void 0 : _a.label) != null ? _b : "\u4E3B\u9898";
+    btn.setAttribute("aria-label", `\u4E3B\u9898\uFF1A${label}`);
+    btn.toggleClass("is-overridden", current !== "follow");
+  }
+  openThemeMenu(anchor) {
+    const rect = anchor.getBoundingClientRect();
+    const menu = new import_obsidian3.Menu();
+    for (const opt of THEME_OPTIONS) {
+      menu.addItem((item) => {
+        item.setTitle(opt.label).setChecked(this.plugin.settings.theme === opt.value).onClick(() => void this.onThemeChange(opt.value));
+      });
+    }
+    menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+  }
+  /**
+   * 算出「一级分支 → 色板槽位」。**必须在 setData 之前**调用：
+   * markmap 的 color 回调是在 render 里同步取色的，那时还没有节点 DOM，
+   * 只能从树的孩子顺序推 path（根是 "0"，第 i 个一级分支就是 "0.i"）。
+   *
+   * 用分支名而不是序号做 key，是为了「插一行 / 删一行」时不跳色 ——
+   * 序号会整体平移，名字不会。细节见 render/colors.ts。
+   */
+  syncBranchSlots(tree, size) {
+    var _a;
+    const children2 = (_a = tree.children) != null ? _a : [];
+    const seen = /* @__PURE__ */ new Map();
+    const keys = children2.map((child) => {
+      var _a2, _b;
+      const base = branchKey((_a2 = child.content) != null ? _a2 : "");
+      const n = (_b = seen.get(base)) != null ? _b : 0;
+      seen.set(base, n + 1);
+      return n === 0 ? base : `${base}\0${n}`;
+    });
+    const slots = this.branchColors.sync(keys, size);
+    this.branchSlots.clear();
+    keys.forEach((key, i) => {
+      const slot = slots.get(key);
+      if (slot !== void 0)
+        this.branchSlots.set(`0.${i}`, slot);
+    });
+  }
+  /** path → 色板槽位；表里没有（刚新建、还没重建）时按 path 哈希兜底 */
+  branchSlot(path2, size) {
+    const branch = branchPathOf(path2);
+    const slot = this.branchSlots.get(branch);
+    if (slot !== void 0)
+      return slot;
+    return hash32(branch) % Math.max(1, size);
   }
   // -------------------------------------------------------------------------
   // 操作栏
@@ -7829,7 +8014,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       color: (node) => {
         if (!node.state || node.state.depth === 0)
           return spec.rootBg;
-        return spec.colors[branchIndex(node.state.path) % spec.colors.length];
+        return spec.colors[this.branchSlot(node.state.path, spec.colors.length)];
       },
       paddingX: 6,
       spacingHorizontal: 64,
@@ -7970,8 +8155,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
   }
   async project(rev, knownContent) {
     var _a, _b;
-    if (this.themeSelect)
-      this.themeSelect.value = this.plugin.settings.theme;
+    this.syncThemeButton();
     if (!this.svgEl)
       return;
     const file = this.resolveTargetFile();
@@ -8117,10 +8301,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
    * 这里只临时改了本次 setData 的 duration。
    */
   async applyTree(tree) {
+    var _a, _b;
     const mm = this.mm;
     const svg = this.svgEl;
     if (!mm || !svg)
       return;
+    this.syncBranchSlots(tree, (_b = (_a = this.currentSpec) == null ? void 0 : _a.colors.length) != null ? _b : 6);
     this.rt.setPhase("rebuilding");
     const prev = mm.options.duration;
     mm.setOptions({ duration: 0 });
@@ -8798,7 +8984,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.svgEl = null;
     this.canvasEl = null;
     this.emptyEl = null;
-    this.themeSelect = null;
+    this.themeBtn = null;
   }
 };
 

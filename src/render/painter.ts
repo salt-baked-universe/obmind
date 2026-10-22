@@ -17,7 +17,7 @@
  *    每个节点挂滤镜等于给每个节点建一张离屏图，缩放时必掉帧。
  */
 
-import { branchIndex, nodeStyleAt } from "../theme";
+import { nodeStyleAt } from "../theme";
 import type { ThemeSpec } from "../theme";
 import {
   SVG_NS,
@@ -28,6 +28,16 @@ import {
   readNodeBox,
 } from "./geometry";
 import type { NodeBox } from "./geometry";
+import { branchPathOf, hash32 } from "./colors";
+
+/**
+ * 分支 → 色板槽位。
+ *
+ * 由调用方注入（见 MindmapView.syncBranchSlots），因为只有它手里有「整棵树」
+ * 和那份跨重建保留的粘性分配表；painter 只负责按 path 问一句该用第几个颜色。
+ * 缺省实现按 path 哈希：即便没注入也不会画出全同色的图。
+ */
+export type SlotResolver = (path: string, size: number) => number;
 
 const CLS_SHADOW = "obmind-node-shadow";
 const CLS_LINK = "obmind-node-link";
@@ -71,6 +81,11 @@ interface Entry {
 
 export class NodePainter {
   private entries = new Map<string, Entry>();
+
+  constructor(
+    private readonly slotOf: SlotResolver = (path: string, size: number) =>
+      hash32(branchPathOf(path)) % Math.max(1, size),
+  ) {}
 
   /** 视图重建导图时调用，丢掉所有缓存 */
   reset(): void {
@@ -262,7 +277,7 @@ export class NodePainter {
     const shadow = entry.shadow;
     if (!card || !shadow) return;
 
-    const branch: number = branchIndex(box.path);
+    const branch: number = this.slotOf(box.path, spec.colors.length);
     if (
       entry.themeKey === themeKey &&
       entry.depth === box.depth &&
@@ -380,7 +395,7 @@ export class NodePainter {
     const link = entry.link;
     if (!link) return;
 
-    const branch: string = spec.colors[branchIndex(box.path) % spec.colors.length];
+    const branch: string = spec.colors[this.slotOf(box.path, spec.colors.length) % spec.colors.length];
     const d = linkPath(box, parent);
     if (entry.linkD === d && entry.linkBranch === branch && entry.linkWidth === spec.linkWidth) {
       return;

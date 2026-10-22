@@ -8,7 +8,8 @@
 - L0 `src/types.ts`：SrcRef / BlockInfo / Span / WriteOp / EditorAction / DropMode。
 - L1 `src/domain/syntax.ts`：buildTree、缩进度量。**行内渲染改为注入 `render` 参数**，
   domain 不认识 HTML，能在 Node 直接跑用例。
-- L2 `src/render/`：inlineHtml、frame（rAF 合并）、painter（卡片/连线/收放点）、geometry。
+- L2 `src/render/`：inlineHtml、frame（rAF 合并）、painter（卡片/连线/收放点）、geometry、
+  **colors（分支粘性配色）**、viewport（适配前等尺寸稳定）。
   `src/ui/toolbar.ts`：操作栏（按钮声明成数据表 + setEnabled/setStatus）。
 - L3 `src/edit/writer.ts`（applyOp 是唯一写入出口）、`edit/inlineText.ts`、`edit/drag.ts`。
 - L4 `src/app/`：runtime（phase+rev）、plan（投影判定）、EditService（写用例）、
@@ -62,8 +63,10 @@
 16. **不要给「是否隐藏某元素」缓存布尔**：`painter.reset()` 后同一个 DOM 会带着旧的
     inline 状态回来，缓存与实际不符就永远不恢复。直接读 `el.style.display`。
 17. **@container 不提升优先级**，同优先级靠书写顺序 —— 容器查询必须放在基础规则之后。
-    操作栏用 `container-type: inline-size`，260px 窄侧栏仍能一行放下（图标 24、分隔线隐藏、
-    下拉收缩；图标按钮绝不缩，缩了就点不中）。
+    操作栏用 `container-type: inline-size`，240px 窄侧栏仍能一行放下（≤310px 图标 28→24、
+    ≤280px 分隔线隐藏）；行级 `overflow: hidden`，任何时候都不换行（换行会让画布上下跳）。
+    主题选择用 palette 图标 + `Menu`，**不要用原生 `<select>`**：92px 宽、样式改不动，
+    在窄侧栏里最扎眼。
     **但 container-type 会建立层叠上下文**：容器内浮层的 `z-index` 只在这个上下文里比较，
     跟外层的兄弟节点（如画布）无关。所以浮层能不能压住画布，取决于**整块 header 的 z-index**
     （`.obmind-header` 100 / `.obmind-canvas` 0），给浮层自己写 30 是没用的 —— 踩过。
@@ -81,6 +84,17 @@
     否则「正文 `a | b` + `---`」会被误判成单列表格。缩进在列表项下的表格先 dedent。
     卡片里没有 `.markdown-rendered`，Obsidian 的表格样式挂不上，样式要自己写：
     `width: max-content; max-width: 320px`，单元格 `overflow-wrap: anywhere`。
+21. **分支颜色绝不能用节点 path 的序号算**。path 是位置编码，插一行 / 删一行会整体平移，
+    表现就是「新加一个节点满屏跳色」。走 `render/colors.ts` 的 `BranchColors`：
+    以**分支名**（`branchKey` 归一化）为 key 的粘性槽位表，跨 setData 保留，
+    已有 key 永不移位，「一增一减」直接过户（改名不换色），冷启动按哈希排序分配。
+    槽位表必须在 `setData` **之前**刷新（markmap 的 `color` 回调在 render 里同步取色，
+    那时候还没有节点 DOM，path 只能从孩子顺序推 `0.i`）。
+22. 色板 8 色起（6 色在 5～10 根分支的常态下必撞色）；撞槽向后探测空位。
+    实色卡片的文字色用 `readableOn`（白/深墨取对比度更高者），不要一律白字 ——
+    橙黄系上白字只有 2.3，等于看不清。
+23. 层级靠**浓淡**区分：`tintAt` 每深一层递减（地板 35%），非实色主题的一级节点
+    用 `level1Tint`（≈tint*1.5），否则一级和二级是同一个色块的深浅。
 
 ## 构建与验证
 - `node esbuild.config.mjs production`（Windows 沙箱内可能 EBUSY，需 `dangerouslyDisableSandbox`）。

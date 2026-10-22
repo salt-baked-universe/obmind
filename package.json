@@ -1,6 +1,6 @@
 {
   "name": "obmind",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "description": "Turn the current note's outline (filename as root, indentation as hierarchy) into an interactive mindmap.",
   "main": "main.js",
   "scripts": {

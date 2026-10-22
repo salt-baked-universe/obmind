@@ -1,5 +1,6 @@
 import {
   ItemView,
+  Menu,
   Notice,
   WorkspaceLeaf,
   MarkdownView,
@@ -7,15 +8,17 @@ import {
   Component,
   TFile,
   debounce,
+  setIcon,
 } from "obsidian";
 import type { WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
 import { collectBlocks } from "./parser";
 import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
-import { branchIndex, resolveTheme, THEME_OPTIONS } from "./theme";
+import { resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
 import { NodePainter } from "./render/painter";
+import { BranchColors, branchKey, branchPathOf, hash32 } from "./render/colors";
 import { FrameScheduler } from "./render/frame";
 import { waitStableSize } from "./render/viewport";
 import { nodePathOf } from "./render/geometry";
@@ -120,7 +123,8 @@ export class MindmapView extends ItemView {
   private mm: Markmap | null = null;
   private svgEl: SVGSVGElement | null = null;
   private canvasEl: HTMLElement | null = null;
-  private themeSelect: HTMLSelectElement | null = null;
+  /** 主题按钮（图标 + 菜单）：比原生 <select> 窄一半，也不用跟各主题的 select 样式搏斗 */
+  private themeBtn: HTMLElement | null = null;
   private observer: MutationObserver | null = null;
   private resizeObserver: ResizeObserver | null = null;
   /** 尺寸还没就绪时挂起的首次适配请求 */
@@ -145,7 +149,15 @@ export class MindmapView extends ItemView {
   private autoFitTimer = 0;
   /** 画布空态提示（没有可显示的笔记时） */
   private emptyEl: HTMLElement | null = null;
-  private readonly painter = new NodePainter();
+  /**
+   * 分支 → 色板槽位。跨 setData 保留：新加/删除分支只影响新出现的那根，
+   * 已有分支的颜色纹丝不动（见 render/colors.ts）。
+   */
+  private readonly branchColors = new BranchColors();
+  private branchSlots = new Map<string, number>();
+  private readonly painter = new NodePainter((path: string, size: number) =>
+    this.branchSlot(path, size),
+  );
   private readonly frames: FrameScheduler;
   /** 状态闸门 + 重建串行化（替代原来的 refreshing / pending / rebuilding / pendingRefresh） */
   private readonly rt: ViewRuntime;
@@ -258,22 +270,28 @@ export class MindmapView extends ItemView {
     // 而且面包屑出现/消失会让工具条高度跳动。
     const header = container.createDiv({ cls: "obmind-header" });
 
-    const select = document.createElement("select");
-    select.className = "dropdown";
-    for (const opt of THEME_OPTIONS) {
-      const optionEl = document.createElement("option");
-      optionEl.value = opt.value;
-      optionEl.textContent = opt.label;
-      select.appendChild(optionEl);
-    }
-    select.value = this.plugin.settings.theme;
-    select.addEventListener("change", () => {
-      void this.onThemeChange(select.value as MindmapTheme);
+    // 主题选择：图标按钮 + 菜单。
+    // 原来是一个原生 <select>：宽 92px，字号/高度/箭头一律改不动，在 300px 的
+    // 侧栏里是最扎眼的控件，而且各主题都给它塞自己的样式。换成图标按钮之后
+    // 与其余操作共用一套视觉，当前选中项用菜单里的对勾表示。
+    const themeBtn = header.createEl("button", {
+      cls: "clickable-icon obmind-theme-btn",
     });
-    this.themeSelect = select;
+    setIcon(themeBtn, "palette");
+    // setIcon 遇到不认识的图标名会静默什么都不画，按钮就变成空方块
+    if (themeBtn.childElementCount === 0) {
+      themeBtn.setText("主题");
+      themeBtn.addClass("obmind-icon-fallback");
+    }
+    themeBtn.addEventListener("click", (ev: MouseEvent) => {
+      ev.preventDefault();
+      this.openThemeMenu(themeBtn);
+    });
+    this.themeBtn = themeBtn;
+    this.syncThemeButton();
 
     this.toolbar = buildToolbar(header, {
-      leading: select,
+      leading: themeBtn,
       rows: [
         {
           groups: [
@@ -330,6 +348,12 @@ export class MindmapView extends ItemView {
                   key: "Shift+Tab",
                   fallback: "提",
                 },
+              ],
+            },
+            // 删除单独成组：破坏性操作不要和「新建 / 提升」贴在一起，
+            // 手指连点时误触的代价太大
+            {
+              buttons: [
                 { id: "delete", icon: "trash-2", label: "删除节点", key: "Delete", fallback: "删" },
               ],
             },
@@ -565,6 +589,66 @@ export class MindmapView extends ItemView {
     this.plugin.settings.theme = theme;
     await this.plugin.saveSettings();
     this.refresh();
+  }
+
+  /** 主题按钮的提示要跟着当前主题变，否则用户看不出现在是哪套 */
+  private syncThemeButton(): void {
+    const btn = this.themeBtn;
+    if (!btn) return;
+    const current: MindmapTheme = this.plugin.settings.theme;
+    const label: string = THEME_OPTIONS.find((o) => o.value === current)?.label ?? "主题";
+    btn.setAttribute("aria-label", `主题：${label}`);
+    // 「跟随外观」时图标压暗一档：表示这一步没有手动覆盖
+    btn.toggleClass("is-overridden", current !== "follow");
+  }
+
+  private openThemeMenu(anchor: HTMLElement): void {
+    const rect: DOMRect = anchor.getBoundingClientRect();
+    const menu = new Menu();
+    for (const opt of THEME_OPTIONS) {
+      menu.addItem((item) => {
+        item
+          .setTitle(opt.label)
+          .setChecked(this.plugin.settings.theme === opt.value)
+          .onClick(() => void this.onThemeChange(opt.value));
+      });
+    }
+    menu.showAtPosition({ x: rect.left, y: rect.bottom + 4 });
+  }
+
+  /**
+   * 算出「一级分支 → 色板槽位」。**必须在 setData 之前**调用：
+   * markmap 的 color 回调是在 render 里同步取色的，那时还没有节点 DOM，
+   * 只能从树的孩子顺序推 path（根是 "0"，第 i 个一级分支就是 "0.i"）。
+   *
+   * 用分支名而不是序号做 key，是为了「插一行 / 删一行」时不跳色 ——
+   * 序号会整体平移，名字不会。细节见 render/colors.ts。
+   */
+  private syncBranchSlots(tree: IPureNode, size: number): void {
+    const children: readonly IPureNode[] = tree.children ?? [];
+    const seen = new Map<string, number>();
+    const keys: string[] = children.map((child: IPureNode) => {
+      const base: string = branchKey(child.content ?? "");
+      const n: number = seen.get(base) ?? 0;
+      seen.set(base, n + 1);
+      // 同名分支（例如两个「其他」）必须分开，否则它们会共用一个颜色
+      return n === 0 ? base : `${base}\u0000${n}`;
+    });
+
+    const slots: Map<string, number> = this.branchColors.sync(keys, size);
+    this.branchSlots.clear();
+    keys.forEach((key: string, i: number) => {
+      const slot: number | undefined = slots.get(key);
+      if (slot !== undefined) this.branchSlots.set(`0.${i}`, slot);
+    });
+  }
+
+  /** path → 色板槽位；表里没有（刚新建、还没重建）时按 path 哈希兜底 */
+  private branchSlot(path: string, size: number): number {
+    const branch: string = branchPathOf(path);
+    const slot: number | undefined = this.branchSlots.get(branch);
+    if (slot !== undefined) return slot;
+    return hash32(branch) % Math.max(1, size);
   }
 
   // -------------------------------------------------------------------------
@@ -927,7 +1011,7 @@ export class MindmapView extends ItemView {
       // 连线与折叠圆点的颜色：根节点用强调色，其余跟随所属一级分支
       color: (node: INode): string => {
         if (!node.state || node.state.depth === 0) return spec.rootBg;
-        return spec.colors[branchIndex(node.state.path) % spec.colors.length];
+        return spec.colors[this.branchSlot(node.state.path, spec.colors.length)];
       },
       paddingX: 6,
       spacingHorizontal: 64,
@@ -1085,7 +1169,7 @@ export class MindmapView extends ItemView {
   }
 
   private async project(rev: number, knownContent?: string): Promise<void> {
-    if (this.themeSelect) this.themeSelect.value = this.plugin.settings.theme;
+    this.syncThemeButton();
 
     if (!this.svgEl) return;
     const file = this.resolveTargetFile();
@@ -1283,6 +1367,10 @@ export class MindmapView extends ItemView {
     const mm = this.mm;
     const svg = this.svgEl;
     if (!mm || !svg) return;
+
+    // 槽位表必须在 setData 之前刷新：markmap 的 color 回调在 render 里同步取色，
+    // 那时节点 DOM 还没建出来，只能从树上推 path
+    this.syncBranchSlots(tree, this.currentSpec?.colors.length ?? 6);
 
     this.rt.setPhase("rebuilding");
     const prev: number = mm.options.duration;
@@ -2055,6 +2143,6 @@ export class MindmapView extends ItemView {
     this.svgEl = null;
     this.canvasEl = null;
     this.emptyEl = null;
-    this.themeSelect = null;
+    this.themeBtn = null;
   }
 }

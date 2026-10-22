@@ -6,6 +6,10 @@
  *
  * 节点颜色按「一级分支」分配：根节点一套色，一级分支各自一色，
  * 更深的节点用同色系浅色调（与底色混合），保证分支一眼可辨。
+ *
+ * 色板刻意给到 8 色而不是 6：分支数的常态是 5～10，6 色一过就会撞色，
+ * 而「两根分支同色」比「颜色不完美」难看得多。具体哪根分支拿哪个槽位
+ * 由 `render/colors.ts` 的粘性分配器决定（保证增删不跳色）。
  */
 
 export type MindmapTheme =
@@ -53,13 +57,13 @@ const CLASSIC: ThemeSpec = {
   label: "经典",
   dark: false,
   bg: "#f6f7f9",
-  colors: ["#4a7dff", "#ff8a3d", "#2fb37c", "#9b56e0", "#e5484d", "#0ea5c6"],
+  colors: ["#4a7dff", "#ff8a3d", "#2fb37c", "#9b56e0", "#e5484d", "#0ea5c6", "#d9a300", "#e0559b"],
   rootBg: "#2b3445",
   rootFg: "#ffffff",
   level1Solid: true,
   level1Fg: "#ffffff",
   nodeText: "#33415c",
-  tint: 0.13,
+  tint: 0.3,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -72,13 +76,13 @@ const BUSINESS: ThemeSpec = {
   label: "商务",
   dark: false,
   bg: "#eef2f7",
-  colors: ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0369a1"],
+  colors: ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0369a1", "#4d7c0f", "#57534e"],
   rootBg: "#0f2d5c",
   rootFg: "#ffffff",
   level1Solid: false,
   level1Fg: "#0f2d5c",
   nodeText: "#33415c",
-  tint: 0.1,
+  tint: 0.24,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -91,13 +95,13 @@ const DARK: ThemeSpec = {
   label: "深色",
   dark: true,
   bg: "#1b1d24",
-  colors: ["#7aa2f7", "#f6a45c", "#6ed3a5", "#c08cf0", "#f07d8a", "#4fc3d9"],
+  colors: ["#7aa2f7", "#f6a45c", "#6ed3a5", "#c08cf0", "#f07d8a", "#4fc3d9", "#e8c46a", "#f59ecb"],
   rootBg: "#7aa2f7",
   rootFg: "#12151c",
   level1Solid: false,
   level1Fg: "#e6ecf7",
   nodeText: "#c9d2e3",
-  tint: 0.2,
+  tint: 0.34,
   mixBase: "#1b1d24",
   circle: "#2a2f3c",
   card: true,
@@ -110,13 +114,13 @@ const CANDY: ThemeSpec = {
   label: "糖果",
   dark: false,
   bg: "#fffaf3",
-  colors: ["#ff7aa2", "#ffb03a", "#3ecf8e", "#5aa9ff", "#b07cff", "#ff8a65"],
+  colors: ["#ff7aa2", "#ffb03a", "#3ecf8e", "#5aa9ff", "#b07cff", "#ff8a65", "#2ec4b6", "#e37cc9"],
   rootBg: "#ff7aa2",
   rootFg: "#ffffff",
   level1Solid: false,
   level1Fg: "#6b3f4c",
   nodeText: "#5a3b46",
-  tint: 0.2,
+  tint: 0.3,
   mixBase: "#ffffff",
   circle: "#ffffff",
   card: true,
@@ -129,7 +133,7 @@ const MINIMAL: ThemeSpec = {
   label: "极简",
   dark: false,
   bg: "#ffffff",
-  colors: ["#3d6fd1", "#d1743d", "#3d9c74", "#8b5cc7", "#c2454b", "#2a9bb0"],
+  colors: ["#3d6fd1", "#b45309", "#2f8f5b", "#8b5cc7", "#c2454b", "#0e7490", "#a16207", "#9d3b6d"],
   rootBg: "#1f2430",
   rootFg: "#ffffff",
   level1Solid: false,
@@ -193,14 +197,62 @@ export function mixColor(color: string, base: string, ratio: number): string {
 }
 
 /**
- * 从节点 path 取一级分支索引。path 形如 "0"（根）、"0.2"（第 3 个一级分支）、
- * "0.2.1"（其下第一个子节点）。
+ * 相对亮度（WCAG 公式）。用来决定实色卡片上该配白字还是深字。
+ *
+ * 需要它的原因：色板扩到 8 色之后必然有橙、黄这类高明度色。
+ * 原来「一级分支一律白字」在 #ff8a3d 上的对比度只有 2.4，字是糊的。
  */
-export function branchIndex(path: string): number {
-  const parts = path.split(".");
-  if (parts.length < 2) return 0;
-  const n = Number.parseInt(parts[1], 10);
-  return Number.isFinite(n) ? n : 0;
+export function luminance(color: string): number {
+  const rgb = parseHex(color);
+  if (!rgb) return 0.5;
+  const [r, g, b] = rgb.map((v: number) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  }) as [number, number, number];
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** 两个颜色的对比度（WCAG 公式，1～21） */
+export function contrastRatio(a: string, b: string): number {
+  const la: number = luminance(a);
+  const lb: number = luminance(b);
+  const hi: number = Math.max(la, lb);
+  const lo: number = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/**
+ * 在这个底色上可读的文字色：白或深墨，取对比度更高的那个。
+ *
+ * 为什么不用「亮度 > 阈值就配深字」：色板扩到 8 色之后必然有橙、黄这类
+ * 中间明度色，阈值一刀切会在 #ff8a3d 上选中白色（对比度只有 2.35，字是糊的）。
+ * 直接比两边谁更清楚，就不会挑错。
+ */
+export function readableOn(color: string): string {
+  const ink = "#12151c";
+  return contrastRatio(color, "#ffffff") >= contrastRatio(color, ink) ? "#ffffff" : ink;
+}
+
+/**
+ * 一级节点（非实色主题）的填充浓度。
+ *
+ * 必须明显浓于深层：原来固定 0.18，而深层是 0.13～0.2 —— 一级和二级
+ * 看起来是同一个色块，层级感全靠字号撑着。这里按「深层的 1.6 倍、下限 0.3」算。
+ */
+export function level1Tint(spec: ThemeSpec): number {
+  return Math.min(0.5, Math.max(spec.tint * 1.5, 0.34));
+}
+
+/**
+ * 深层节点的填充浓度。
+ *
+ * 层级越深越淡（XMind 的做法）：同一分支里 5 层节点全用一个浓度，
+ * 满屏同一块颜色的卡片会让人分不清哪层是哪层。
+ */
+export function tintAt(spec: ThemeSpec, depth: number): number {
+  if (depth <= 2) return spec.tint;
+  // 每深一层淡一点，但留个地板（35%），避免第 6 层忽然掉成透明
+  return Math.max(spec.tint * 0.35, spec.tint * (1 - (depth - 2) * 0.22));
 }
 
 export interface NodeStyle {
@@ -224,14 +276,15 @@ export function nodeStyleAt(spec: ThemeSpec, depth: number, branch: string): Nod
     return { bg: "transparent", fg: depth === 1 ? branch : spec.nodeText, bold: depth === 1 };
   }
   if (depth === 1 && spec.level1Solid) {
-    return { bg: branch, fg: spec.level1Fg, bold: true };
+    // 文字色跟着底色亮度走，而不是写死白色 —— 见 readableOn
+    return { bg: branch, fg: readableOn(branch), bold: true };
   }
   if (depth === 1) {
     return {
-      bg: mixColor(branch, spec.mixBase, Math.max(spec.tint, 0.18)),
+      bg: mixColor(branch, spec.mixBase, level1Tint(spec)),
       fg: spec.level1Fg,
       bold: true,
     };
   }
-  return { bg: mixColor(branch, spec.mixBase, spec.tint), fg: spec.nodeText, bold: false };
+  return { bg: mixColor(branch, spec.mixBase, tintAt(spec, depth)), fg: spec.nodeText, bold: false };
 }
