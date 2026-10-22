@@ -192,9 +192,11 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     // 表现就是「根本没法连续输入」。keyCode 229 是部分输入法的老写法。
     if (e.isComposing || e.keyCode === 229) return;
 
-    // 节点 = 笔记里的一行，多行文本没有意义，一律吞掉换行
+    // 节点 = 笔记里的一行，多行文本没有意义，一律吞掉换行。
+    // 软换行（Shift+Enter）同样无意义：吞掉，不插入换行、也不提交。
     if (e.key === "Enter") {
       e.preventDefault();
+      if (e.shiftKey) return;
       if (e.ctrlKey || e.metaKey) finish("sibling");
       else finish("commit");
       return;

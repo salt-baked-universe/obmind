@@ -190,5 +190,9 @@ export function renderInline(raw: string): string {
   const htmlRe = new RegExp(`${HTML_TOKEN}(\\d+)${HTML_TOKEN}`, "g");
   s = s.replace(htmlRe, (_m: string, idx: string) => tags[Number(idx)] ?? "");
 
+  // 节点内软换行：解析阶段把续行并入同一节点的 src.text（以 \n 分隔），
+  // 这里统一转成 <br>，让多行正文在导图里显示为换行而非空格。
+  s = s.replace(/\n/g, "<br>");
+
   return s;
 }

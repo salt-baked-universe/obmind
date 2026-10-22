@@ -2011,6 +2011,13 @@ export class MindmapView extends ItemView {
     const snap = this.editSnapshot();
     if (!file || !snap) return;
 
+    // Bug 2 修复：多行合并节点暂不支持拖动（续行写回会错位），请在笔记里调整层级。
+    const dragSrc = this.editSnapshot() ? this.nodeAt(srcLine) : null;
+    if (dragSrc && dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
+      new Notice("obmind：多行节点暂不支持拖动，请在笔记中调整层级");
+      return;
+    }
+
     const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
@@ -2072,6 +2079,13 @@ export class MindmapView extends ItemView {
     const src = this.srcOf(g);
     // 根节点没有 src；折叠起来的节点不渲染，也不会有 DOM
     if (!src || data?.state?.depth === 0) return;
+
+    // Bug 2 修复：多行合并节点（软换行）在 UI 里只读，请在笔记中编辑，
+    // 避免续行被单独写回、把节点拆坏。
+    if (src.endLine !== undefined && src.endLine > src.line) {
+      new Notice("obmind：多行节点请在笔记中编辑");
+      return;
+    }
 
     const spec: ThemeSpec =
       this.currentSpec ?? resolveTheme(this.plugin.settings.theme, false);
@@ -2137,6 +2151,11 @@ export class MindmapView extends ItemView {
       // 这里再显式请求一次，保证刚写进编辑器缓冲的内容立刻反映到导图上。
       this.rt.setPhase("idle");
       this.refresh(next);
+      // Bug 1 修复：编辑框移除后把焦点交还给画布，否则下一次 Enter/Tab
+      // 因 e.target !== canvas 被 onCanvasKeyDown 提前 return，无法继续加节点。
+      // 仅在不会立刻打开新编辑框（pendingEditLine<0）时夺回焦点，
+      // 避免抢走 Ctrl/⌘+Enter 新建同级时即将打开的兄弟编辑框。
+      if (this.pendingEditLine < 0) this.canvasEl?.focus({ preventScroll: true });
     }
   }
 

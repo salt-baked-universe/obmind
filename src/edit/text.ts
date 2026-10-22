@@ -89,5 +89,8 @@ export function parseEditorValue(
       text = text.slice(m[0].length).trim();
     }
   }
+  // 折叠内部换行：编辑框里粘贴进来的多行文本（或误触的软换行）一律压成空格，
+  // 避免把一行节点拆成多个、污染导图结构。同时顺手归一化内部空白。
+  text = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
   return { text, checked };
 }

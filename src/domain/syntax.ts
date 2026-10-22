@@ -263,10 +263,15 @@ export function buildTree(
 
   // 2. 收集有效行（跳过空行与分隔线；代码块 / 公式块整块收成一个节点）
   const raws: RawLine[] = [];
+  // 软换行合并：记录上一个「可合并」的列表项，后续续行（同缩进、无标记）并入它。
+  let lastListRaw: RawLine | null = null;
 
   for (let idx = lineOffset; idx < allLines.length; idx++) {
     const line: string = allLines[idx];
-    if (line.trim() === "") continue;
+    if (line.trim() === "") {
+      lastListRaw = null;
+      continue;
+    }
 
     // 围栏代码块 / 公式块。
     // 以前这里是一个 inCodeBlock 开关，遇到就 continue —— 代码和公式在导图里
@@ -315,9 +320,13 @@ export function buildTree(
           heading: false,
           level: null,
           depth: 0,
+          endLine: idx,
+          extra: undefined,
         },
       });
 
+      // 块节点是结构性节点：打断软换行续行（块与正文之间不再并入）
+      lastListRaw = null;
       idx = end;
       continue;
     }
@@ -368,9 +377,13 @@ export function buildTree(
           heading: false,
           level: null,
           depth: 0,
+          endLine: idx,
+          extra: undefined,
         },
       });
 
+      // 块节点是结构性节点：打断软换行续行（块与正文之间不再并入）
+      lastListRaw = null;
       idx = end;
       continue;
     }
@@ -389,37 +402,68 @@ export function buildTree(
     let rest: string = body.slice(ws.length);
     let restStart: number = quoteLen + ws.length;
 
-    // 标题行
+    // 标题行 / 列表行 / 分隔线：先识别结构，再决定能否接软换行续行。
     const headingMatch: RegExpMatchArray | null = rest.match(HEADING_PREFIX);
+    const listMatch: RegExpMatchArray | null =
+      headingMatch === null ? rest.match(LIST_PREFIX) : null;
+
     if (headingMatch) {
       marker = headingMatch[0];
       heading = true;
       rest = rest.slice(marker.length);
       restStart += marker.length;
-    } else {
-      // 正文分隔线
-      if (RULE_LINE.test(rest.trim())) continue;
-
+    } else if (RULE_LINE.test(rest.trim())) {
+      // 正文分隔线：结构性行，不参与软换行合并
+      lastListRaw = null;
+      continue;
+    } else if (listMatch) {
       // 剥离列表标记；任务列表的勾选框单独记下来
-      const listMatch: RegExpMatchArray | null = rest.match(LIST_PREFIX);
-      if (listMatch) {
-        const checkbox: string | undefined = listMatch[1];
-        const whole: string = listMatch[0];
-        if (checkbox !== undefined) {
-          checked = checkbox !== " ";
-          marker = whole.replace(/\[[ xX]\]\s+$/, "");
-        } else {
-          marker = whole;
-        }
-        rest = rest.slice(whole.length);
-        restStart += whole.length;
+      const checkbox: string | undefined = listMatch[1];
+      const whole: string = listMatch[0];
+      if (checkbox !== undefined) {
+        checked = checkbox !== " ";
+        marker = whole.replace(/\[[ xX]\]\s+$/, "");
+      } else {
+        marker = whole;
       }
+      rest = rest.slice(whole.length);
+      restStart += whole.length;
     }
 
     const m = measure(rest, restStart);
     if (m.text === "") continue;
 
-    raws.push({
+    // 软换行续行：上一个节点是可合并的列表项、本行无引用前缀、不是标题/列表项，
+    // 且缩进不浅于该列表项的标记缩进，就并入它（节点即"一行"，
+    // 笔记里 Shift+Enter 产生的硬换行在这里当作节点内 <br> 而非新节点）。
+    // 用前缀匹配而非严格相等：编辑器里 Shift+Enter 会把新行自动缩进到
+    // 与列表项文字对齐（比标记缩进多 2 个空格），严格相等会漏掉、
+    // 让续行落成更深的子节点（实测踩过）。
+    const hasQuotePrefix: boolean = /^\s*>/.test(line);
+    // 当前行首缩进（含 0 个空白的情况）：match 在 TS 眼中可能为空，用空串兜底
+    const leadWs: string = (line.match(/^[ \t]*/) ?? [""])[0];
+    if (
+      lastListRaw !== null &&
+      !hasQuotePrefix &&
+      !headingMatch &&
+      !listMatch &&
+      lastListRaw.src.indent.length > 0 &&
+      leadWs.startsWith(lastListRaw.src.indent)
+    ) {
+      const merged = lastListRaw;
+      const bodyText: string = line
+        .slice(merged.src.indent.length)
+        .replace(/^[ \t]+/, "")
+        .replace(/\s+$/, "");
+      merged.src.text += "\n" + bodyText;
+      if (!merged.src.extra) merged.src.extra = [];
+      merged.src.extra.push(bodyText);
+      merged.src.endLine = idx;
+      continue;
+    }
+
+    // 普通节点：标题 / 列表项 / 段落，各自独立成行。
+    const raw: RawLine = {
       text: m.text,
       headingLevel: headingMatch ? headingMatch[1].length : null,
       src: {
@@ -434,8 +478,18 @@ export function buildTree(
         heading,
         level: headingMatch ? headingMatch[1].length : null,
         depth: 0,
+        endLine: idx,
       },
-    });
+    };
+    raws.push(raw);
+
+    // 结构性行：标题 / 分隔线 / 列表项都重置"可合并"状态；
+    // 只有普通列表项（非引用、非标题）才允许后续续行并入。
+    if (listMatch && !heading && !hasQuotePrefix) {
+      lastListRaw = raw;
+    } else {
+      lastListRaw = null;
+    }
   }
 
   const hasHeadings: boolean = raws.some((r) => r.headingLevel !== null);

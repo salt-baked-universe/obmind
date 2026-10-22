@@ -40,6 +40,10 @@ export interface SrcRef {
   level: number | null;
   /** 在树里的深度，根为 0。拖动时用来算子树范围和缩进增量 */
   depth: number;
+  /** 多行节点（软换行）占用的末行号（0 基，含）；单行节点等于 line */
+  endLine: number;
+  /** 软换行续行的正文（不含缩进/标记）；单行节点为 undefined */
+  extra?: string[];
 }
 
 /**

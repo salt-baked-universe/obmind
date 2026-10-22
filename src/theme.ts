@@ -58,10 +58,13 @@ const CLASSIC: ThemeSpec = {
   dark: false,
   bg: "#f6f7f9",
   colors: ["#4a7dff", "#ff8a3d", "#2fb37c", "#9b56e0", "#e5484d", "#0ea5c6", "#d9a300", "#e0559b"],
-  rootBg: "#2b3445",
-  rootFg: "#ffffff",
-  level1Solid: true,
-  level1Fg: "#ffffff",
+  rootBg: "#8492ae",
+  rootFg: "#1c2433",
+  // 一级节点不再用色板原色实底（#4a7dff/#9b56e0 这类饱和深块太重，
+  // 且金色系白字对比度只有 2.3），改用 0.45 浓度的浅色调 + 深色字，
+  // 仍比二级（0.3）深一档，层级感靠浓度差维持。
+  level1Solid: false,
+  level1Fg: "#33415c",
   nodeText: "#33415c",
   tint: 0.3,
   mixBase: "#ffffff",
@@ -77,8 +80,8 @@ const BUSINESS: ThemeSpec = {
   dark: false,
   bg: "#eef2f7",
   colors: ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#0369a1", "#4d7c0f", "#57534e"],
-  rootBg: "#0f2d5c",
-  rootFg: "#ffffff",
+  rootBg: "#5b90cc",
+  rootFg: "#16223d",
   level1Solid: false,
   level1Fg: "#0f2d5c",
   nodeText: "#33415c",
@@ -99,11 +102,14 @@ const DARK: ThemeSpec = {
   rootBg: "#7aa2f7",
   rootFg: "#12151c",
   level1Solid: false,
-  level1Fg: "#e6ecf7",
-  nodeText: "#c9d2e3",
+  // 下面三处是「深色包裹深色」的根因修复：原来 mixBase 用深色画布、字用浅色，
+  // 导致卡片 = mix(浅分支, 深画布) 仍是暗块，既和黑底糊在一起、浅字对比度还掉到 4.0。
+  // 改成「浅色调卡 + 深色字」，卡片从黑画布里跳出来、文字永远深字可读。
+  level1Fg: "#1f2a38",
+  nodeText: "#26303d",
   tint: 0.34,
-  mixBase: "#1b1d24",
-  circle: "#2a2f3c",
+  mixBase: "#ffffff",
+  circle: "#5b6b82",
   card: true,
   radius: "8px",
   linkWidth: 2,
@@ -116,7 +122,7 @@ const CANDY: ThemeSpec = {
   bg: "#fffaf3",
   colors: ["#ff7aa2", "#ffb03a", "#3ecf8e", "#5aa9ff", "#b07cff", "#ff8a65", "#2ec4b6", "#e37cc9"],
   rootBg: "#ff7aa2",
-  rootFg: "#ffffff",
+  rootFg: "#5a1f3a",
   level1Solid: false,
   level1Fg: "#6b3f4c",
   nodeText: "#5a3b46",
@@ -134,8 +140,8 @@ const MINIMAL: ThemeSpec = {
   dark: false,
   bg: "#ffffff",
   colors: ["#3d6fd1", "#b45309", "#2f8f5b", "#8b5cc7", "#c2454b", "#0e7490", "#a16207", "#9d3b6d"],
-  rootBg: "#1f2430",
-  rootFg: "#ffffff",
+  rootBg: "#828a98",
+  rootFg: "#15191f",
   level1Solid: false,
   level1Fg: "#1f2430",
   nodeText: "#3a4252",
@@ -273,7 +279,13 @@ export function nodeStyleAt(spec: ThemeSpec, depth: number, branch: string): Nod
     return { bg: spec.rootBg, fg: spec.rootFg, bold: true };
   }
   if (!spec.card) {
-    return { bg: "transparent", fg: depth === 1 ? branch : spec.nodeText, bold: depth === 1 };
+    // 无卡片主题（极简）：一级文字用分支色，但直接用原色在白画布上对比度只有 ~4。
+    // 往墨色压 55% 既保留分支身份又保证可读。
+    return {
+      bg: "transparent",
+      fg: depth === 1 ? mixColor(branch, "#12151c", 0.55) : spec.nodeText,
+      bold: depth === 1,
+    };
   }
   if (depth === 1 && spec.level1Solid) {
     // 文字色跟着底色亮度走，而不是写死白色 —— 见 readableOn
