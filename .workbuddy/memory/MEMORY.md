@@ -64,8 +64,23 @@
 17. **@container 不提升优先级**，同优先级靠书写顺序 —— 容器查询必须放在基础规则之后。
     操作栏用 `container-type: inline-size`，260px 窄侧栏仍能一行放下（图标 24、分隔线隐藏、
     下拉收缩；图标按钮绝不缩，缩了就点不中）。
+    **但 container-type 会建立层叠上下文**：容器内浮层的 `z-index` 只在这个上下文里比较，
+    跟外层的兄弟节点（如画布）无关。所以浮层能不能压住画布，取决于**整块 header 的 z-index**
+    （`.obmind-header` 100 / `.obmind-canvas` 0），给浮层自己写 30 是没用的 —— 踩过。
 18. 撤销/重做存**整篇快照**（`app/History.ts`，纯函数，上限 40），不存反向操作；
     `runWrite(..., remember=false)` 给撤销自身用，否则「撤销」会把自己压进 past 原地打转。
+19. **「打开偶现空白」是时序问题**：markmap 的 `fit()` 读 `svg.getBoundingClientRect()`，
+    侧栏滑出期间尺寸走 `0 → 60 → 200 → 400`，在 0 上 fit 得到 scale=0（缩成点），
+    在中间值上 fit 得到 0.07（缩在角落），之后没人重算。适配前必须用
+    `render/viewport.ts` 的 `waitStableSize` 等「够大且连续两帧不变」，
+    且要量 **svg** 而不是容器的 clientWidth。fit 后用 `state.rect` 是否为空 +
+    `__zoom.k > 0` 自检并重试（别用「scale 够大」判定，大图在窄栏里本来就只有 0.02）。
+    容器尺寸变化且用户没滚轮缩放过（`userView`）时跟随重适配。
+20. **GFM 表格按整块节点处理**（`BlockInfo.kind = "table"`），和代码块走同一条
+    `renderBlocks`（MarkdownRenderer）。识别要「头行含 `|` + 分隔行 + 分隔行自身含 `|`」，
+    否则「正文 `a | b` + `---`」会被误判成单列表格。缩进在列表项下的表格先 dedent。
+    卡片里没有 `.markdown-rendered`，Obsidian 的表格样式挂不上，样式要自己写：
+    `width: max-content; max-width: 320px`，单元格 `overflow-wrap: anywhere`。
 
 ## 构建与验证
 - `node esbuild.config.mjs production`（Windows 沙箱内可能 EBUSY，需 `dangerouslyDisableSandbox`）。
