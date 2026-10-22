@@ -106,22 +106,25 @@ export class NodeBar {
 
   /** 换一个目标节点；传 null 收起。同一个目标重复调用只重新定位（重建后 g 会换） */
   attach(target: SVGGElement | null): void {
-    if (target !== this.target) {
-      this.target = target;
-      if (!target) {
-        this.close();
-        return;
-      }
-      // 先摆好再淡入：否则会先从上一个位置滑过来
-      this.lastLeft = Number.NaN;
-      this.lastTop = Number.NaN;
-      this.el.removeClass("is-out");
-      this.measure();
-      this.place();
-      this.el.addClass("is-in");
-    } else if (target) {
-      this.place();
+    if (target === this.target) {
+      // 已是「收起」状态就什么都不做 —— 否则每次取消选中都白起一个 rAF 循环，
+      // 而循环里的 place() 因为没目标立刻 return，等于每帧空转
+      if (target) this.place();
+      return;
     }
+
+    this.target = target;
+    if (!target) {
+      this.close();
+      return;
+    }
+    // 先摆好再淡入：否则会先从上一个位置滑过来
+    this.lastLeft = Number.NaN;
+    this.lastTop = Number.NaN;
+    this.el.removeClass("is-out");
+    this.measure();
+    this.place();
+    this.el.addClass("is-in");
     this.start();
   }
 

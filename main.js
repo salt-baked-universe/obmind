@@ -7134,6 +7134,9 @@ var GLOBAL_GROUPS = [
     ]
   },
   {
+    buttons: [{ id: "export", icon: "download", label: "\u5BFC\u51FA\u4E3A SVG", fallback: "\u5BFC" }]
+  },
+  {
     pin: true,
     buttons: [{ id: "help", icon: "help-circle", label: "\u64CD\u4F5C\u4E0E\u5FEB\u6377\u952E", fallback: "?" }]
   }
@@ -7151,6 +7154,11 @@ var NODE_GROUPS = [
   // 手指连点时误触的代价太大
   {
     buttons: [{ id: "delete", icon: "trash-2", label: "\u5220\u9664\u8282\u70B9", key: "Delete", fallback: "\u5220" }]
+  },
+  // 取消选中：点画布空白和 Esc 也能收，但浮动条上有个明确的出口更符合直觉 ——
+  // 「浮出来一个东西，却没有关掉它的按钮」会让人以为界面卡住了
+  {
+    buttons: [{ id: "deselect", icon: "x", label: "\u53D6\u6D88\u9009\u4E2D", key: "Esc", fallback: "\u5173" }]
   }
 ];
 
@@ -7199,21 +7207,22 @@ var NodeBar = class {
   }
   /** 换一个目标节点；传 null 收起。同一个目标重复调用只重新定位（重建后 g 会换） */
   attach(target) {
-    if (target !== this.target) {
-      this.target = target;
-      if (!target) {
-        this.close();
-        return;
-      }
-      this.lastLeft = Number.NaN;
-      this.lastTop = Number.NaN;
-      this.el.removeClass("is-out");
-      this.measure();
-      this.place();
-      this.el.addClass("is-in");
-    } else if (target) {
-      this.place();
+    if (target === this.target) {
+      if (target)
+        this.place();
+      return;
     }
+    this.target = target;
+    if (!target) {
+      this.close();
+      return;
+    }
+    this.lastLeft = Number.NaN;
+    this.lastTop = Number.NaN;
+    this.el.removeClass("is-out");
+    this.measure();
+    this.place();
+    this.el.addClass("is-in");
     this.start();
   }
   setEnabled(id2, on) {
@@ -7438,6 +7447,183 @@ function planProjection(input) {
   return { kind: "patch", line, content };
 }
 
+// src/export/svg.ts
+function exportViewBox(rect, padding = 24) {
+  const w = rect.x2 - rect.x1;
+  const h2 = rect.y2 - rect.y1;
+  if (!Number.isFinite(w) || !Number.isFinite(h2) || w < 2 || h2 < 2)
+    return null;
+  const pad = Number.isFinite(padding) ? Math.max(0, padding) : 24;
+  return {
+    x: Math.round(rect.x1 - pad),
+    y: Math.round(rect.y1 - pad),
+    width: Math.round(w + pad * 2),
+    height: Math.round(h2 + pad * 2)
+  };
+}
+function isOpaqueColor(color2) {
+  const text = (color2 != null ? color2 : "").trim();
+  if (!text || text === "transparent")
+    return false;
+  const hex2 = /^#([0-9a-f]{3,8})$/i.exec(text);
+  if (hex2) {
+    const v2 = hex2[1];
+    if (v2.length === 3 || v2.length === 6)
+      return true;
+    if (v2.length === 4)
+      return Number.parseInt(v2[3] + v2[3], 16) > 2;
+    if (v2.length === 8)
+      return Number.parseInt(v2.slice(6), 16) > 2;
+    return false;
+  }
+  const m = /^rgba?\(([^)]+)\)$/i.exec(text);
+  if (!m)
+    return false;
+  const parts = m[1].split(",").map((s) => s.trim());
+  if (parts.length < 4)
+    return true;
+  const a = Number(parts[3]);
+  return Number.isFinite(a) ? a > 0.01 : true;
+}
+function exportFileName(basename) {
+  const safe = (basename || "mindmap").replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+  return `${safe || "mindmap"}.mindmap.svg`;
+}
+var COPY_PROPS = [
+  "font-family",
+  "font-size",
+  "font-weight",
+  "font-style",
+  "line-height",
+  "letter-spacing",
+  "color",
+  "background-color",
+  "border-radius",
+  "text-align",
+  "text-decoration-line",
+  "white-space",
+  "overflow-wrap",
+  "word-break",
+  "vertical-align",
+  "display",
+  "list-style-type"
+];
+var SKIP_VALUES = /* @__PURE__ */ new Set([
+  "",
+  "none",
+  "normal",
+  "auto",
+  "0px",
+  "0",
+  "rgba(0, 0, 0, 0)",
+  "transparent",
+  "visible",
+  "start"
+]);
+function inlineForeignStyles(source, clone) {
+  var _a;
+  const srcFos = Array.from(
+    source.querySelectorAll("foreignObject")
+  );
+  const dstFos = Array.from(
+    clone.querySelectorAll("foreignObject")
+  );
+  for (let i = 0; i < srcFos.length; i++) {
+    const dst = dstFos[i];
+    if (!dst)
+      break;
+    const srcEls = [srcFos[i], ...Array.from(srcFos[i].querySelectorAll("*"))];
+    const dstEls = [dst, ...Array.from(dst.querySelectorAll("*"))];
+    const n = Math.min(srcEls.length, dstEls.length);
+    for (let k = 0; k < n; k++) {
+      const cs = getComputedStyle(srcEls[k]);
+      const decls = [];
+      for (const prop of COPY_PROPS) {
+        const v2 = cs.getPropertyValue(prop).trim();
+        if (!v2 || SKIP_VALUES.has(v2))
+          continue;
+        decls.push(`${prop}:${v2}`);
+      }
+      const pad = ["top", "right", "bottom", "left"].map(
+        (s) => cs.getPropertyValue(`padding-${s}`).trim() || "0px"
+      );
+      if (pad.some((v2) => v2 !== "0px" && v2 !== "0")) {
+        decls.push(`padding:${pad.join(" ")}`);
+      }
+      const side = (s) => {
+        const w = cs.getPropertyValue(`border-${s}-width`).trim() || "0px";
+        if (w === "0px" || w === "0")
+          return "";
+        const style = cs.getPropertyValue(`border-${s}-style`).trim() || "solid";
+        const color2 = cs.getPropertyValue(`border-${s}-color`).trim();
+        return `${w} ${style} ${color2}`;
+      };
+      const tops = side("top");
+      if (tops) {
+        const all = ["top", "right", "bottom", "left"].map(side);
+        if (all.every((v2) => v2 === tops))
+          decls.push(`border:${tops}`);
+        else {
+          decls.push(`border-top:${all[0]}`);
+          decls.push(`border-right:${all[1]}`);
+          decls.push(`border-bottom:${all[2]}`);
+          decls.push(`border-left:${all[3]}`);
+        }
+      }
+      if (decls.length === 0)
+        continue;
+      const old = (_a = dst.getAttribute("style")) != null ? _a : "";
+      dst.setAttribute("style", old ? `${decls.join(";")};${old}` : decls.join(";"));
+    }
+  }
+}
+function buildSvgText(svg, box, opts = {}) {
+  var _a;
+  const clone = svg.cloneNode(true);
+  inlineForeignStyles(svg, clone);
+  for (const el of Array.from(clone.querySelectorAll(".obmind-selected"))) {
+    el.classList.remove("obmind-selected");
+  }
+  for (const fo of Array.from(clone.querySelectorAll("foreignObject"))) {
+    fo.style.opacity = "";
+    if (fo.getAttribute("style") === "")
+      fo.removeAttribute("style");
+  }
+  for (const deco of Array.from(clone.querySelectorAll('[class^="obmind-node"]'))) {
+    deco.style.opacity = "";
+    if (deco.getAttribute("style") === "")
+      deco.removeAttribute("style");
+  }
+  for (const g of Array.from(clone.querySelectorAll(":scope > g"))) {
+    g.removeAttribute("transform");
+  }
+  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+  clone.setAttribute("viewBox", `${box.x} ${box.y} ${box.width} ${box.height}`);
+  clone.setAttribute("width", String(box.width));
+  clone.setAttribute("height", String(box.height));
+  clone.removeAttribute("style");
+  const root2 = clone.querySelector(":scope > g");
+  const bg = (_a = opts.background) != null ? _a : "";
+  if (root2 && isOpaqueColor(bg)) {
+    const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("x", String(box.x));
+    rect.setAttribute("y", String(box.y));
+    rect.setAttribute("width", String(box.width));
+    rect.setAttribute("height", String(box.height));
+    rect.setAttribute("fill", bg);
+    clone.insertBefore(rect, root2);
+  }
+  if (opts.title) {
+    const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    title.textContent = opts.title;
+    clone.insertBefore(title, clone.firstChild);
+  }
+  const xml = new XMLSerializer().serializeToString(clone);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+${xml}`;
+}
+
 // src/MindmapView.ts
 var MINDMAP_VIEW_TYPE = "obmind-view";
 var HELP_ROWS = [
@@ -7452,8 +7638,18 @@ var HELP_ROWS = [
   ["Ctrl+Z / \u21E7Ctrl+Z", "\u64A4\u9500 / \u91CD\u505A"],
   ["\u7F16\u8F91\u6846 Tab", "\u7F29\u8FDB / Shift+Tab \u53CD\u7F29\u8FDB"],
   ["\u7F16\u8F91\u6846 Ctrl+\u21B5", "\u63D0\u4EA4\u5E76\u65B0\u5EFA\u540C\u7EA7"],
-  ["Esc", "\u53D6\u6D88\u7F16\u8F91\u6216\u53D6\u6D88\u9009\u4E2D"]
+  ["Esc", "\u53D6\u6D88\u7F16\u8F91\u3001\u6536\u8D77\u9762\u677F\u6216\u53D6\u6D88\u9009\u4E2D"],
+  ["\u70B9\u7A7A\u767D", "\u53D6\u6D88\u9009\u4E2D\uFF0C\u6536\u8D77\u8282\u70B9\u64CD\u4F5C\u6761"],
+  ["\u5BFC\u51FA", "\u6574\u5F20\u56FE\u5B58\u6210 <\u7B14\u8BB0\u540D>.mindmap.svg\uFF08\u7B14\u8BB0\u540C\u76EE\u5F55\uFF09"]
 ];
+function errText(err) {
+  if (err instanceof Error)
+    return err.message;
+  return String(err);
+}
+function formatSize(bytes) {
+  return bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
+}
 var MIN_VIEWPORT = 40;
 var DECOR_CLASSES = ["obmind-node-card", "obmind-node-shadow", "obmind-node-link"];
 function isOwnDecoration(rec) {
@@ -7680,6 +7876,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       { capture: true, passive: true }
     );
     this.renderBreadcrumb();
+    this.registerDomEvent(document, "keydown", (e) => this.onGlobalKeyDown(e));
     this.registerDomEvent(document, "click", (e) => {
       if (!this.helpPanel || this.helpPanel.hasClass("is-hidden"))
         return;
@@ -7900,6 +8097,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
         this.snapshot = null;
         this.refresh();
         break;
+      case "export":
+        void this.exportSvg();
+        break;
+      case "deselect":
+        this.setSelectedLine(-1);
+        break;
       case "edit":
         this.editSelected();
         break;
@@ -8003,6 +8206,69 @@ var MindmapView = class extends import_obsidian3.ItemView {
   fitView() {
     this.userView = false;
     void this.fitInstant();
+  }
+  /**
+   * 导出当前导图为独立 SVG，写在笔记同目录（同名覆盖）。
+   *
+   * 三个「不能直接存 outerHTML」的理由见 export/svg.ts 的文件头：
+   * 缩放要复位、样式要内联、背景要补上。
+   *
+   * 用 `viewBox` 而不是当前视口，意味着导出的永远是**整张图**，
+   * 和用户此刻缩放到哪儿无关 —— 想只导一部分是另一个功能（截图），
+   * 这里给的是可以贴进文档、能二次编辑的矢量图。
+   */
+  async exportSvg() {
+    var _a;
+    const svg = this.svgEl;
+    const mm = this.mm;
+    const file = this.resolveTargetFile();
+    if (!svg || !mm || !file) {
+      new import_obsidian3.Notice("obmind\uFF1A\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u5BFC\u56FE");
+      return;
+    }
+    const box = exportViewBox(mm.state.rect, 28);
+    if (!box) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5BFC\u56FE\u8FD8\u6CA1\u753B\u5B8C\uFF0C\u7A0D\u7B49\u4E00\u4E0B\u518D\u8BD5");
+      return;
+    }
+    let text;
+    try {
+      text = buildSvgText(svg, box, {
+        background: this.exportBackground(),
+        title: file.basename
+      });
+    } catch (err) {
+      new import_obsidian3.Notice(`obmind\uFF1A\u5BFC\u51FA\u5931\u8D25\uFF08${errText(err)}\uFF09`);
+      return;
+    }
+    const name = exportFileName(file.basename);
+    const path2 = (0, import_obsidian3.normalizePath)(((_a = file.parent) == null ? void 0 : _a.path) ? `${file.parent.path}/${name}` : name);
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(path2);
+      if (existing instanceof import_obsidian3.TFile)
+        await this.app.vault.modify(existing, text);
+      else
+        await this.app.vault.create(path2, text);
+    } catch (err) {
+      new import_obsidian3.Notice(`obmind\uFF1A\u5199\u5165\u5931\u8D25\uFF08${errText(err)}\uFF09`);
+      return;
+    }
+    new import_obsidian3.Notice(`obmind\uFF1A\u5DF2\u5BFC\u51FA ${path2}\uFF08${formatSize(text.length)}\uFF09`, 5e3);
+  }
+  /**
+   * 导出图的底色。
+   *
+   * 画布自身通常是透明（底色来自 Obsidian 的内容区），要逐级往上找，
+   * 否则深色主题导出来的 SVG 是「浅色文字 + 透明底」，丢进白底阅读器就没了。
+   */
+  exportBackground() {
+    const pick = (el) => {
+      if (!el)
+        return "";
+      const c = getComputedStyle(el).backgroundColor;
+      return isOpaqueColor(c) ? c : "";
+    };
+    return pick(this.canvasEl) || pick(this.containerEl.querySelector(".view-content")) || pick(document.body) || "#ffffff";
   }
   /**
    * 全部折叠 / 全部展开。
@@ -8586,8 +8852,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (target.closest("circle"))
       return;
     const g = target.closest("g.markmap-node");
-    if (!g)
+    if (!g) {
+      if (this.selectedLine >= 0)
+        this.setSelectedLine(-1);
       return;
+    }
     if (e.ctrlKey || e.metaKey) {
       const text = ((_e = g.textContent) != null ? _e : "").trim();
       if (!text)
@@ -8897,6 +9166,27 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (g)
         this.startEdit(g, false);
     }
+  }
+  /**
+   * 焦点不在画布上时的 Esc 兜底。
+   *
+   * 只做两件事：收起帮助面板、取消选中。**不拦默认行为也不阻断冒泡** ——
+   * Obsidian 自己的 Esc（关模态、退全屏）要继续工作，抢了就成 bug。
+   * 画布内部的按键仍由 onCanvasKeyDown 处理，这里直接让路。
+   */
+  onGlobalKeyDown(e) {
+    if (e.key !== "Escape")
+      return;
+    if (this.rt.phase === "editing")
+      return;
+    if (this.canvasEl && e.target instanceof Node && this.canvasEl.contains(e.target))
+      return;
+    if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+      this.helpPanel.addClass("is-hidden");
+      return;
+    }
+    if (this.selectedLine >= 0)
+      this.setSelectedLine(-1);
   }
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
   createNode(mode) {

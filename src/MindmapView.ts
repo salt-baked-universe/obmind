@@ -8,6 +8,7 @@ import {
   Component,
   TFile,
   debounce,
+  normalizePath,
   setIcon,
 } from "obsidian";
 import type { WorkspaceSplit } from "obsidian";
@@ -45,6 +46,13 @@ import type { ToolbarActionId, ToolbarHandle } from "./ui/toolbar";
 import { NodeBar } from "./ui/nodeBar";
 import { ViewRuntime } from "./app/runtime";
 import { planProjection } from "./app/plan";
+import {
+  buildSvgText,
+  exportFileName,
+  exportViewBox,
+  isOpaqueColor,
+} from "./export/svg";
+import type { ViewBox } from "./export/svg";
 import type MindmapPlugin from "./main";
 
 // 必须带插件前缀。早先用的是通用名 "mindmap-view"，一旦 onload 中途抛错，
@@ -67,8 +75,21 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["Ctrl+Z / ⇧Ctrl+Z", "撤销 / 重做"],
   ["编辑框 Tab", "缩进 / Shift+Tab 反缩进"],
   ["编辑框 Ctrl+↵", "提交并新建同级"],
-  ["Esc", "取消编辑或取消选中"],
+  ["Esc", "取消编辑、收起面板或取消选中"],
+  ["点空白", "取消选中，收起节点操作条"],
+  ["导出", "整张图存成 <笔记名>.mindmap.svg（笔记同目录）"],
 ];
+
+/** 把 catch 到的东西变成一句能显示的话（unknown 不能直接拼字符串） */
+function errText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/** 导出提示里报文件大小，单位只在需要时出现 */
+function formatSize(bytes: number): string {
+  return bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
+}
 
 /**
  * 适配时认定「视口已就绪」的最小边长。
@@ -402,6 +423,10 @@ export class MindmapView extends ItemView {
     // 初始没有导航，先置成隐藏，免得空容器占位
     this.renderBreadcrumb();
 
+    // Esc 兜底：画布的 keydown 只在**焦点在画布上**时生效，而点过工具栏、
+    // 点过侧栏、或者切过窗口之后焦点就不在了 —— 那时浮动条关不掉。
+    this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => this.onGlobalKeyDown(e));
+
     // 点面板外面就收起快捷键说明。
     // 忽略工具栏内的点击，否则点「?」的同一个事件会立刻把它关掉。
     this.registerDomEvent(document, "click", (e: MouseEvent) => {
@@ -643,6 +668,12 @@ export class MindmapView extends ItemView {
         this.snapshot = null;
         this.refresh();
         break;
+      case "export":
+        void this.exportSvg();
+        break;
+      case "deselect":
+        this.setSelectedLine(-1);
+        break;
       case "edit":
         this.editSelected();
         break;
@@ -751,6 +782,77 @@ export class MindmapView extends ItemView {
   fitView(): void {
     this.userView = false;
     void this.fitInstant();
+  }
+
+  /**
+   * 导出当前导图为独立 SVG，写在笔记同目录（同名覆盖）。
+   *
+   * 三个「不能直接存 outerHTML」的理由见 export/svg.ts 的文件头：
+   * 缩放要复位、样式要内联、背景要补上。
+   *
+   * 用 `viewBox` 而不是当前视口，意味着导出的永远是**整张图**，
+   * 和用户此刻缩放到哪儿无关 —— 想只导一部分是另一个功能（截图），
+   * 这里给的是可以贴进文档、能二次编辑的矢量图。
+   */
+  private async exportSvg(): Promise<void> {
+    const svg = this.svgEl;
+    const mm = this.mm;
+    const file = this.resolveTargetFile();
+    if (!svg || !mm || !file) {
+      new Notice("obmind：没有可导出的导图");
+      return;
+    }
+
+    // 还没 _relayout 完时 rect 是 0×0，导出来会是个空文件
+    const box: ViewBox | null = exportViewBox(mm.state.rect, 28);
+    if (!box) {
+      new Notice("obmind：导图还没画完，稍等一下再试");
+      return;
+    }
+
+    let text: string;
+    try {
+      text = buildSvgText(svg, box, {
+        background: this.exportBackground(),
+        title: file.basename,
+      });
+    } catch (err) {
+      new Notice(`obmind：导出失败（${errText(err)}）`);
+      return;
+    }
+
+    const name: string = exportFileName(file.basename);
+    const path: string = normalizePath(file.parent?.path ? `${file.parent.path}/${name}` : name);
+    try {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      // 同名覆盖而不是加序号：反复导出不该在库里堆一串 mindmap-2/-3
+      if (existing instanceof TFile) await this.app.vault.modify(existing, text);
+      else await this.app.vault.create(path, text);
+    } catch (err) {
+      new Notice(`obmind：写入失败（${errText(err)}）`);
+      return;
+    }
+    new Notice(`obmind：已导出 ${path}（${formatSize(text.length)}）`, 5000);
+  }
+
+  /**
+   * 导出图的底色。
+   *
+   * 画布自身通常是透明（底色来自 Obsidian 的内容区），要逐级往上找，
+   * 否则深色主题导出来的 SVG 是「浅色文字 + 透明底」，丢进白底阅读器就没了。
+   */
+  private exportBackground(): string {
+    const pick = (el: Element | null): string => {
+      if (!el) return "";
+      const c: string = getComputedStyle(el).backgroundColor;
+      return isOpaqueColor(c) ? c : "";
+    };
+    return (
+      pick(this.canvasEl) ||
+      pick(this.containerEl.querySelector(".view-content")) ||
+      pick(document.body) ||
+      "#ffffff"
+    );
   }
 
   /**
@@ -1423,9 +1525,15 @@ export class MindmapView extends ItemView {
     if (target.closest("circle")) return;
 
     const g = target.closest("g.markmap-node") as SVGGElement | null;
-    if (!g) return;
+    // 3) 点在空白处 = 取消选中，浮动条跟着收起。
+    // 这是关掉浮动条最自然的手势；之前这里直接 return，于是「一旦选中就再也
+    // 关不掉」—— 只能去点另一个节点，浮动条永远挂在某个卡片下面。
+    if (!g) {
+      if (this.selectedLine >= 0) this.setSelectedLine(-1);
+      return;
+    }
 
-    // 3) Ctrl/⌘ + 单击节点：把节点文字当笔记名打开（原行为保留）
+    // 4) Ctrl/⌘ + 单击节点：把节点文字当笔记名打开（原行为保留）
     if (e.ctrlKey || e.metaKey) {
       const text: string = (g.textContent ?? "").trim();
       if (!text) return;
@@ -1437,7 +1545,7 @@ export class MindmapView extends ItemView {
       return;
     }
 
-    // 4) 普通左键单击 = 选中。选中之后 Tab 建子级、Enter 建同级才有基准。
+    // 5) 普通左键单击 = 选中。选中之后 Tab 建子级、Enter 建同级才有基准。
     this.selectNode(g);
   }
 
@@ -1788,9 +1896,28 @@ export class MindmapView extends ItemView {
     }
   }
 
+  /**
+   * 焦点不在画布上时的 Esc 兜底。
+   *
+   * 只做两件事：收起帮助面板、取消选中。**不拦默认行为也不阻断冒泡** ——
+   * Obsidian 自己的 Esc（关模态、退全屏）要继续工作，抢了就成 bug。
+   * 画布内部的按键仍由 onCanvasKeyDown 处理，这里直接让路。
+   */
+  private onGlobalKeyDown(e: KeyboardEvent): void {
+    if (e.key !== "Escape") return;
+    // 编辑框里的 Esc 是「撤销这次编辑」，交给 inlineText 自己处理
+    if (this.rt.phase === "editing") return;
+    if (this.canvasEl && e.target instanceof Node && this.canvasEl.contains(e.target)) return;
+
+    if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+      this.helpPanel.addClass("is-hidden");
+      return;
+    }
+    if (this.selectedLine >= 0) this.setSelectedLine(-1);
+  }
+
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
-  private createNode(mode: "sibling" | "child"): void {
-    const line: number = this.selectedLine;
+  private createNode(mode: "sibling" | "child"): void {    const line: number = this.selectedLine;
     if (line < 0) {
       new Notice("obmind：先左键点一下要挂在哪个节点上");
       return;
@@ -1848,7 +1975,8 @@ export class MindmapView extends ItemView {
   }
 
   /** 双击节点进入原地编辑 */
-  private onNodeDblClick(e: MouseEvent): void {    const target = e.target as Element;
+  private onNodeDblClick(e: MouseEvent): void {
+    const target = e.target as Element;
     // 双链上双击是选中文字，不接管
     if (target.closest("a")) return;
     // 折叠圆点交给 markmap

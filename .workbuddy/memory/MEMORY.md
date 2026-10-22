@@ -4,7 +4,7 @@
 依赖单向向下，`domain` 永不 import obsidian、不碰 DOM：
 `types`(L0) → `domain` 纯函数(L1) → `render`/`ui`(L2) → `infra` Obsidian 适配(L3) → `app` 用例+会话状态(L4) → `view`(L5)。
 
-进度（1.11.0）：
+进度（1.12.0）：
 - L0 `src/types.ts`：SrcRef / BlockInfo / Span / WriteOp / EditorAction / DropMode。
 - L1 `src/domain/syntax.ts`：buildTree、缩进度量。**行内渲染改为注入 `render` 参数**，
   domain 不认识 HTML，能在 Node 直接跑用例。
@@ -12,7 +12,8 @@
   painter（卡片/连线/收放点/淡出跟随）、geometry、
   **colors（分支粘性配色）**、viewport（适配前等尺寸稳定）。
   `src/ui/toolbar.ts`：单行全局操作栏（按钮声明成数据表）；
-  `src/ui/nodeBar.ts`：选中节点时浮出的节点操作条（定位是纯函数，可单测）。
+  `src/ui/nodeBar.ts`：选中节点时浮出的节点操作条（定位是纯函数，可单测）；
+  `src/export/svg.ts`：导出独立 SVG（viewBox/文件名/颜色判断是纯函数）。
 - L3 `src/edit/writer.ts`（applyOp 是唯一写入出口）、`edit/inlineText.ts`、`edit/drag.ts`。
 - L4 `src/app/`：runtime（phase+rev）、plan（投影判定）、EditService（写用例）、
   QueryService（读用例）、NavStack（跳转栈，条目可带 leafId）、
@@ -114,6 +115,18 @@
 27. **`applyTree` 出口必须调 `paintSelection()` + `syncToolbar()`**：重建换掉整批 g，
     不重新挂就等于「选中态凭空丢了」，而 `selectedLine` 还指着那一行 ——
     用户按 Tab 会莫名多出一个子级。
+28. **浮动条必须有三个关闭出口**：点画布空白、条上的「×」、Esc。
+    只有 Esc 不够 —— 画布的 keydown 只在焦点在画布上时收得到，点过工具栏焦点就跑了，
+    所以 Esc 要有一条 `document` 级兜底（对应 `onGlobalKeyDown`），
+    但它必须**让路**给编辑框（`phase === "editing"`）和画布内事件
+    （`canvas.contains(target)`），否则一次 Esc 会连着关两样东西。
+29. **`NodeBar.attach` 在「目标没变且已收起」时必须直接 return**，不能落到 `start()`：
+    否则每次取消选中都起一个永远空转的 rAF（`place()` 没目标立刻返回）。
+30. **导出 SVG 三件事缺一不可**：① 清掉最外层 `g` 上的 zoom transform（否则只导出当前视口），
+    用 `mm.state.rect` 当 viewBox；② 把 `getComputedStyle` 的字体/颜色/底色/边框内联到
+    克隆体（原件与克隆体按下标对应，读原件）；③ 补背景色（画布自己通常 transparent，
+    要沿 `.view-content` → `body` 往上找）。验收用 `<img src="data:image/svg+xml,...">`：
+    它是隔离文档，不继承页面 CSS，能正常显示才算真导出成功。
 
 ## 构建与验证
 - `node esbuild.config.mjs production`（Windows 沙箱内可能 EBUSY，需 `dangerouslyDisableSandbox`）。

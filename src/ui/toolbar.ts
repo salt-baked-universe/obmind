@@ -25,6 +25,8 @@ export type ToolbarActionId =
   | "expandAll"
   | "fit"
   | "refresh"
+  | "export"
+  | "deselect"
   | "edit"
   | "child"
   | "sibling"
@@ -147,6 +149,9 @@ export const GLOBAL_GROUPS: readonly ToolbarGroup[] = [
     ],
   },
   {
+    buttons: [{ id: "export", icon: "download", label: "导出为 SVG", fallback: "导" }],
+  },
+  {
     pin: true,
     buttons: [{ id: "help", icon: "help-circle", label: "操作与快捷键", fallback: "?" }],
   },
@@ -166,5 +171,10 @@ export const NODE_GROUPS: readonly ToolbarGroup[] = [
   // 手指连点时误触的代价太大
   {
     buttons: [{ id: "delete", icon: "trash-2", label: "删除节点", key: "Delete", fallback: "删" }],
+  },
+  // 取消选中：点画布空白和 Esc 也能收，但浮动条上有个明确的出口更符合直觉 ——
+  // 「浮出来一个东西，却没有关掉它的按钮」会让人以为界面卡住了
+  {
+    buttons: [{ id: "deselect", icon: "x", label: "取消选中", key: "Esc", fallback: "关" }],
   },
 ];
