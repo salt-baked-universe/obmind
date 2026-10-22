@@ -5256,12 +5256,19 @@ function nodePathOf(g) {
   const path2 = (_a = node == null ? void 0 : node.state) == null ? void 0 : _a.path;
   return typeof path2 === "string" ? path2 : null;
 }
+function directChild(g, tag) {
+  for (let el = g.firstElementChild; el; el = el.nextElementSibling) {
+    if (el.tagName === tag)
+      return el;
+  }
+  return null;
+}
 function readNodeBox(g) {
   var _a, _b;
   const path2 = nodePathOf(g);
   if (!path2)
     return null;
-  const fo = g.querySelector(":scope > foreignObject");
+  const fo = directChild(g, "foreignObject");
   if (!fo)
     return null;
   const w = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "");
@@ -5415,6 +5422,15 @@ var BranchColors = class {
 };
 
 // src/render/painter.ts
+function readOpacity(fo) {
+  const raw = fo.style.opacity;
+  if (raw === "")
+    return 1;
+  const v2 = Number(raw);
+  if (!Number.isFinite(v2))
+    return 1;
+  return v2 > 1 ? 1 : v2 < 0 ? 0 : v2;
+}
 var CLS_SHADOW = "obmind-node-shadow";
 var CLS_LINK = "obmind-node-link";
 var CLS_CARD = "obmind-node-card";
@@ -5423,10 +5439,22 @@ var NodePainter = class {
   constructor(slotOf = (path2, size) => hash32(branchPathOf(path2)) % Math.max(1, size)) {
     this.slotOf = slotOf;
     this.entries = /* @__PURE__ */ new Map();
+    /**
+     * path → 节点 g。
+     *
+     * 折叠/展开动画里每帧都要「从子节点的 path 找到父节点的 g」，原来每次都
+     * `svg.querySelectorAll("g.markmap-node")` 全量扫一遍再逐条读属性 ——
+     * 上千节点的图，每帧几万次属性读，卡顿主要来自这里。
+     * 索引在 paintAll 时重建（结构变化本来就要重扫一次），动画期间只查表。
+     */
+    this.index = /* @__PURE__ */ new Map();
+    this.indexReady = false;
   }
   /** 视图重建导图时调用，丢掉所有缓存 */
   reset() {
     this.entries.clear();
+    this.index.clear();
+    this.indexReady = false;
   }
   /**
    * 全量绘制：结构发生变化时调用。
@@ -5443,6 +5471,7 @@ var NodePainter = class {
       this.applyStyle(box, entry, spec, themeKey);
       this.applySize(box, entry);
       this.applyCircle(box, entry);
+      this.syncFade(box, entry);
       if (box.depth === 0)
         continue;
       const parent = byPath.get(parentPathOf(box.path));
@@ -5452,64 +5481,102 @@ var NodePainter = class {
     this.prune(boxes);
   }
   /**
-   * 只更新连线：节点位移时调用（折叠/展开的 180ms 动画里每帧都会来一次）。
+   * 只处理「这一帧真的动了」的节点：折叠/展开的 180ms 动画里每帧调用一次。
    *
-   * @param only 本帧发生位移的节点 path 集合；null 表示全部重算。
-   *             传入集合时只处理「自己动了」和「父节点动了」的节点，
-   *             节点越多收益越明显。
+   * 和旧版的关键差别是**同步调用 + 元素直给**：
+   *
+   * - 旧版走 `requestAnimationFrame` 合并，结果是连线比节点晚一帧 ——
+   *   节点已经移到新位置，线还画在上一帧的位置，动画看起来就是线在抖/追不上。
+   *   现在由 MutationObserver 回调直接调（回调紧跟在 d3 写 transform 之后、
+   *   同一帧渲染之前），线与节点同帧落位。
+   * - 旧版传的是 path 集合，进来还要全量 querySelectorAll 把 path 换回元素。
+   *   现在直接把变了 transform 的 g 传进来，父节点走索引，全程不做 DOM 查询。
+   *
+   * @param els 本帧 transform 发生变化的节点 g
    */
-  paintLinks(svg, spec, only = null) {
+  paintMoved(els, spec) {
     var _a;
-    const needed = /* @__PURE__ */ new Set();
-    if (only) {
-      for (const path2 of only) {
-        needed.add(path2);
-        needed.add(parentPathOf(path2));
-      }
-    }
-    const boxes = [];
-    const byPath = /* @__PURE__ */ new Map();
-    for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-      if (only) {
-        const data = el.__data__;
-        const path2 = (_a = data == null ? void 0 : data.state) == null ? void 0 : _a.path;
-        if (!path2 || !needed.has(path2))
-          continue;
-      }
-      const box = readNodeBox(el);
-      if (!box)
-        continue;
-      boxes.push(box);
-      byPath.set(box.path, box);
-    }
-    if (boxes.length === 0)
+    if (!this.indexReady)
+      this.buildIndex(els);
+    if (this.entries.size === 0 && !this.indexReady)
       return;
-    for (const box of boxes) {
-      if (box.depth === 0)
-        continue;
-      const parentPath = parentPathOf(box.path);
-      if (only && !only.has(box.path) && !only.has(parentPath))
-        continue;
-      const parent = byPath.get(parentPath);
-      if (!parent)
+    const seen = /* @__PURE__ */ new Map();
+    const boxOf = (g) => {
+      const hit = seen.get(g);
+      if (hit !== void 0)
+        return hit;
+      const box = readNodeBox(g);
+      seen.set(g, box);
+      if (box)
+        this.index.set(box.path, g);
+      return box;
+    };
+    for (const g of els) {
+      const cached = this.entries.get((_a = nodePathOf(g)) != null ? _a : "");
+      if (cached && cached.g === g && cached.linkD !== "") {
+        const v2 = readOpacity(cached.fo);
+        if (v2 < 1) {
+          this.writeFade(cached, v2);
+          continue;
+        }
+      }
+      const box = boxOf(g);
+      if (!box)
         continue;
       const entry = this.entryOf(box);
       if (!entry.link)
         this.ensureLayers(box.g, entry);
+      this.syncFade(box, entry);
+      if (box.depth === 0)
+        continue;
+      if (entry.linkD === "" && readOpacity(box.fo) < 1) {
+        continue;
+      }
+      const parentG = this.index.get(parentPathOf(box.path));
+      if (!parentG)
+        continue;
+      const parent = boxOf(parentG);
+      if (!parent)
+        continue;
       this.applyLink(box, parent, entry, spec);
     }
+  }
+  /**
+   * 兜底建索引：正常情况下 paintAll 已经建好了，走到这里说明动画先于全量绘制开始
+   * （视图刚从隐藏状态恢复之类）。拿任何一个节点反查它的父图层，扫一次全量 ——
+   * 这条路只会在异常时序上走一次，不进每帧的热路径。
+   */
+  buildIndex(els) {
+    let root2 = null;
+    for (const el of els) {
+      root2 = el.parentElement;
+      break;
+    }
+    if (!root2)
+      return;
+    this.index.clear();
+    for (const el of Array.from(root2.querySelectorAll("g.markmap-node"))) {
+      const path2 = nodePathOf(el);
+      if (path2)
+        this.index.set(path2, el);
+    }
+    this.indexReady = this.index.size > 0;
   }
   /** 一次性读完所有节点几何，供写阶段使用 */
   collect(svg) {
     const boxes = [];
     const byPath = /* @__PURE__ */ new Map();
+    const index = /* @__PURE__ */ new Map();
     for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
       const box = readNodeBox(el);
       if (!box)
         continue;
       boxes.push(box);
       byPath.set(box.path, box);
+      index.set(box.path, el);
     }
+    this.index = index;
+    this.indexReady = index.size > 0;
     return { boxes, byPath };
   }
   /** 取（或重建）节点缓存。g 被 markmap 重建、元素掉出 DOM 时都要重置。 */
@@ -5521,6 +5588,7 @@ var NodePainter = class {
     const g = box.g;
     const entry = {
       g,
+      fo: box.fo,
       shadow: g.querySelector(`:scope > rect.${CLS_SHADOW}`),
       link: g.querySelector(`:scope > path.${CLS_LINK}`),
       card: g.querySelector(`:scope > rect.${CLS_CARD}`),
@@ -5534,7 +5602,8 @@ var NodePainter = class {
       linkBranch: "",
       linkWidth: -1,
       circleX: Number.NaN,
-      circleY: Number.NaN
+      circleY: Number.NaN,
+      fade: -1
     };
     this.entries.set(box.path, entry);
     return entry;
@@ -5605,12 +5674,41 @@ var NodePainter = class {
     const radius = Math.max(0, Number.parseFloat(spec.radius) || 0);
     const rx = String(isRoot ? radius + 2 : radius);
     card.setAttribute("fill", style.bg);
-    card.setAttribute("opacity", style.bg === "transparent" ? "0" : "1");
     card.setAttribute("rx", rx);
     shadow.setAttribute("fill", spec.dark ? "rgba(0,0,0,0.45)" : "rgba(15,23,42,0.10)");
     shadow.setAttribute("rx", rx);
-    shadow.setAttribute("opacity", spec.card ? "1" : "0");
+    shadow.style.display = spec.card ? "" : "none";
     box.fo.style.color = style.fg;
+  }
+  /**
+   * 让自绘装饰跟着 markmap 的淡入淡出一起变透明。
+   *
+   * markmap 折叠时把要消失的子树 `transform` 过渡到父节点位置，同时只把
+   * **foreignObject**（文字）的 opacity 过渡到 0 —— 我们的卡片 rect、连线、
+   * 收放点是自己插进 g 里的，它不知道。于是文字正常淡出，一堆彩色方块和曲线
+   * 却继续往父节点"飞"，然后啪一下被删掉；展开时反过来，方块凭空出现再飞出去。
+   * 这就是「收放动画看着奇怪」的主要来源。
+   *
+   * 判据用内联 style.opacity（markmap 就写在这里），读它不触发布局。
+   */
+  syncFade(box, entry) {
+    return this.writeFade(entry, readOpacity(box.fo));
+  }
+  /** 把透明度写到当前值（同一个值不重复写 DOM） */
+  writeFade(entry, v2) {
+    if (entry.fade === v2)
+      return v2;
+    entry.fade = v2;
+    const text = v2 >= 1 ? "" : String(v2);
+    if (entry.card)
+      entry.card.style.opacity = text;
+    if (entry.shadow)
+      entry.shadow.style.opacity = text;
+    if (entry.link)
+      entry.link.style.opacity = text;
+    if (entry.circle)
+      entry.circle.style.opacity = text;
+    return v2;
   }
   /** 卡片尺寸：只依赖内容宽高，与节点位移无关，所以动画期间零写入 */
   applySize(box, entry) {
@@ -5706,28 +5804,16 @@ var FrameScheduler = class {
     this.painter = painter;
     this.source = source;
     this.frame = 0;
-    this.mode = "links";
-    this.paths = /* @__PURE__ */ new Set();
   }
-  /**
-   * 请求一次绘制。
-   * @param paths 本帧发生位移的节点 path；只有 links 模式且非空时才做定向更新
-   */
-  request(mode, paths) {
+  /** 请求一次全量绘制（本帧内多次请求合并成一次） */
+  requestAll() {
     if (this.source.blocked())
       return;
-    if (mode === "all") {
-      this.mode = "all";
-      this.paths.clear();
-    } else if (this.mode !== "all" && paths !== void 0) {
-      for (const path2 of paths)
-        this.paths.add(path2);
-    }
     if (this.frame !== 0)
       return;
     this.frame = window.requestAnimationFrame(() => {
       this.frame = 0;
-      this.flush();
+      this.paintNow();
     });
   }
   /**
@@ -5744,31 +5830,30 @@ var FrameScheduler = class {
       return;
     this.painter.paintAll(svg, spec);
   }
+  /**
+   * 同步刷新「这一帧动了」的节点连线。
+   *
+   * 由 MutationObserver 直接调用，**刻意不合并到 rAF**（见文件头）。
+   * 每次调用只处理传进来的元素，成本与「动了的节点数」成正比。
+   */
+  paintMoved(els) {
+    if (this.source.blocked())
+      return;
+    const spec = this.source.spec();
+    if (!spec)
+      return;
+    this.painter.paintMoved(els, spec);
+  }
   cancel() {
     if (this.frame !== 0) {
       window.cancelAnimationFrame(this.frame);
       this.frame = 0;
     }
-    this.mode = "links";
-    this.paths.clear();
   }
   /** 缓存全清（重建后元素引用全部作废） */
   reset() {
     this.cancel();
     this.painter.reset();
-  }
-  flush() {
-    const svg = this.source.svg();
-    const spec = this.source.spec();
-    if (!svg || !spec)
-      return;
-    if (this.mode === "all") {
-      this.painter.paintAll(svg, spec);
-    } else {
-      this.painter.paintLinks(svg, spec, this.paths.size > 0 ? this.paths : null);
-    }
-    this.mode = "links";
-    this.paths.clear();
   }
 };
 
@@ -6985,7 +7070,7 @@ function redo(h2, current) {
 
 // src/ui/toolbar.ts
 var import_obsidian2 = require("obsidian");
-function iconButton(parent, spec, onAction) {
+function createIconButton(parent, spec, onAction) {
   var _a;
   const btn = parent.createEl("button", { cls: "clickable-icon" });
   (0, import_obsidian2.setIcon)(btn, spec.icon);
@@ -7004,32 +7089,23 @@ function iconButton(parent, spec, onAction) {
 }
 function buildToolbar(parent, spec) {
   const el = parent.createDiv({ cls: "obmind-toolbars" });
+  const rowEl = el.createDiv({ cls: "obmind-toolbar" });
   const buttons = /* @__PURE__ */ new Map();
-  let statusEl = null;
-  spec.rows.forEach((row, index) => {
-    const rowEl = el.createDiv({
-      cls: index === 0 ? "obmind-toolbar" : "obmind-toolbar is-sub"
-    });
-    if (index === 0 && spec.leading)
-      rowEl.appendChild(spec.leading);
-    let firstGroup = true;
-    for (const group of row.groups) {
-      if (group.pin) {
-        rowEl.createDiv({ cls: "obmind-toolbar-spacer" });
-        firstGroup = true;
-      } else if (!firstGroup) {
-        rowEl.createSpan({ cls: "obmind-toolbar-sep" });
-      }
-      for (const item of group.buttons) {
-        buttons.set(item.id, iconButton(rowEl, item, spec.onAction));
-      }
-      firstGroup = false;
-    }
-    if (row.status) {
+  if (spec.leading)
+    rowEl.appendChild(spec.leading);
+  let firstGroup = true;
+  for (const group of spec.groups) {
+    if (group.pin) {
       rowEl.createDiv({ cls: "obmind-toolbar-spacer" });
-      statusEl = rowEl.createSpan({ cls: "obmind-status" });
+      firstGroup = true;
+    } else if (!firstGroup) {
+      rowEl.createSpan({ cls: "obmind-toolbar-sep" });
     }
-  });
+    for (const item of group.buttons) {
+      buttons.set(item.id, createIconButton(rowEl, item, spec.onAction));
+    }
+    firstGroup = false;
+  }
   return {
     el,
     setEnabled(id2, on) {
@@ -7039,15 +7115,192 @@ function buildToolbar(parent, spec) {
       if (btn.disabled === !on)
         return;
       btn.disabled = !on;
-    },
-    setStatus(text) {
-      if (!statusEl)
-        return;
-      statusEl.setText(text);
-      statusEl.toggleClass("is-empty", text === "");
     }
   };
 }
+var GLOBAL_GROUPS = [
+  {
+    buttons: [
+      { id: "undo", icon: "undo-2", label: "\u64A4\u9500", key: "Ctrl+Z", fallback: "\u64A4" },
+      { id: "redo", icon: "redo-2", label: "\u91CD\u505A", key: "Ctrl+Shift+Z", fallback: "\u91CD" }
+    ]
+  },
+  {
+    buttons: [
+      { id: "collapseAll", icon: "chevrons-down-up", label: "\u6298\u53E0\u5168\u90E8", fallback: "\u6298" },
+      { id: "expandAll", icon: "chevrons-up-down", label: "\u5C55\u5F00\u5168\u90E8", fallback: "\u5C55" },
+      { id: "fit", icon: "maximize", label: "\u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3", fallback: "\u9002" },
+      { id: "refresh", icon: "refresh-cw", label: "\u91CD\u65B0\u8BFB\u53D6\u7B14\u8BB0", fallback: "\u5237" }
+    ]
+  },
+  {
+    pin: true,
+    buttons: [{ id: "help", icon: "help-circle", label: "\u64CD\u4F5C\u4E0E\u5FEB\u6377\u952E", fallback: "?" }]
+  }
+];
+var NODE_GROUPS = [
+  {
+    buttons: [
+      { id: "child", icon: "corner-down-right", label: "\u65B0\u5EFA\u5B50\u7EA7", key: "Tab", fallback: "\u5B50" },
+      { id: "sibling", icon: "plus", label: "\u65B0\u5EFA\u540C\u7EA7", key: "Enter", fallback: "\u540C" },
+      { id: "edit", icon: "pencil", label: "\u7F16\u8F91\u8282\u70B9", key: "F2 / \u53CC\u51FB", fallback: "\u6539" },
+      { id: "outdent", icon: "corner-up-left", label: "\u63D0\u5347\u4E00\u7EA7", key: "Shift+Tab", fallback: "\u63D0" }
+    ]
+  },
+  // 删除单独成组：破坏性操作不要和「新建 / 提升」贴在一起，
+  // 手指连点时误触的代价太大
+  {
+    buttons: [{ id: "delete", icon: "trash-2", label: "\u5220\u9664\u8282\u70B9", key: "Delete", fallback: "\u5220" }]
+  }
+];
+
+// src/ui/nodeBar.ts
+function nodeBarPosition(a) {
+  var _a, _b;
+  const gap = (_a = a.gap) != null ? _a : 6;
+  const margin = (_b = a.margin) != null ? _b : 4;
+  const { target, host, bar } = a;
+  const center = target.left + target.width / 2 - bar.width / 2;
+  const left = Math.min(
+    Math.max(center, margin),
+    Math.max(margin, host.width - bar.width - margin)
+  );
+  let top = target.bottom + gap;
+  if (top + bar.height > host.height - margin) {
+    const above = target.top - bar.height - gap;
+    top = above >= margin ? above : Math.max(margin, host.height - bar.height - margin);
+  }
+  return { left: Math.round(left), top: Math.round(top) };
+}
+var CLS = "obmind-nodebar";
+var NodeBar = class {
+  constructor(host, spec, onAction) {
+    this.target = null;
+    this.frame = 0;
+    this.lastLeft = Number.NaN;
+    this.lastTop = Number.NaN;
+    this.barW = 0;
+    this.barH = 0;
+    this.buttons = /* @__PURE__ */ new Map();
+    this.host = host;
+    this.el = host.createDiv({ cls: `${CLS} is-out` });
+    let first = true;
+    for (const group of spec.groups) {
+      if (!first)
+        this.el.createSpan({ cls: "obmind-toolbar-sep" });
+      for (const item of group.buttons) {
+        const btn = createIconButton(this.el, item, onAction);
+        btn.tabIndex = -1;
+        btn.addEventListener("mousedown", (e) => e.preventDefault());
+        this.buttons.set(item.id, btn);
+      }
+      first = false;
+    }
+  }
+  /** 换一个目标节点；传 null 收起。同一个目标重复调用只重新定位（重建后 g 会换） */
+  attach(target) {
+    if (target !== this.target) {
+      this.target = target;
+      if (!target) {
+        this.close();
+        return;
+      }
+      this.lastLeft = Number.NaN;
+      this.lastTop = Number.NaN;
+      this.el.removeClass("is-out");
+      this.measure();
+      this.place();
+      this.el.addClass("is-in");
+    } else if (target) {
+      this.place();
+    }
+    this.start();
+  }
+  setEnabled(id2, on) {
+    const btn = this.buttons.get(id2);
+    if (!btn)
+      return;
+    if (btn.disabled === !on)
+      return;
+    btn.disabled = !on;
+  }
+  destroy() {
+    this.stop();
+    this.target = null;
+    this.el.remove();
+  }
+  /**
+   * 尺寸只量一次。
+   *
+   * 每帧都读 offsetWidth 会触发样式/布局重算；浮层内容和字号在生命周期内
+   * 不会变，量大一次就够。
+   */
+  measure() {
+    this.barW = this.el.offsetWidth;
+    this.barH = this.el.offsetHeight;
+  }
+  close() {
+    this.stop();
+    this.el.removeClass("is-in");
+    this.el.addClass("is-out");
+  }
+  /**
+   * 跟随用 rAF 循环，而不是在各个地方挂监听。
+   *
+   * 会让卡片移动的东西太多了：滚轮缩放、拖动画布、折叠展开、重建、侧栏宽度变化。
+   * 每个都挂一遍必然漏掉某一个（之前编辑框就漏过折叠动画）。循环只在选中期间跑，
+   * 且位置没变就不写 style —— 静止时每帧只有一次 getBoundingClientRect。
+   */
+  start() {
+    if (this.frame !== 0)
+      return;
+    const loop = () => {
+      this.frame = window.requestAnimationFrame(loop);
+      this.place();
+    };
+    this.frame = window.requestAnimationFrame(loop);
+  }
+  stop() {
+    if (this.frame === 0)
+      return;
+    window.cancelAnimationFrame(this.frame);
+    this.frame = 0;
+  }
+  place() {
+    const g = this.target;
+    if (!g)
+      return;
+    if (!g.isConnected) {
+      this.target = null;
+      this.close();
+      return;
+    }
+    const fo = g.querySelector(":scope > foreignObject");
+    if (!fo)
+      return;
+    const r = fo.getBoundingClientRect();
+    const h2 = this.host.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || h2.width < 1)
+      return;
+    const box = nodeBarPosition({
+      target: {
+        left: r.left - h2.left,
+        top: r.top - h2.top,
+        right: r.right - h2.left,
+        bottom: r.bottom - h2.top,
+        width: r.width,
+        height: r.height
+      },
+      host: { width: h2.width, height: h2.height },
+      bar: { width: this.barW, height: this.barH }
+    });
+    if (box.left === this.lastLeft && box.top === this.lastTop)
+      return;
+    this.lastLeft = box.left;
+    this.lastTop = box.top;
+    this.el.style.transform = `translate(${box.left}px, ${box.top}px)`;
+  }
+};
 
 // src/app/runtime.ts
 var ViewRuntime = class {
@@ -7189,6 +7442,7 @@ function planProjection(input) {
 var MINDMAP_VIEW_TYPE = "obmind-view";
 var HELP_ROWS = [
   ["\u5355\u51FB", "\u9009\u4E2D\u8282\u70B9\uFF08\u4E4B\u540E\u53EF\u7528\u4E0B\u9762\u7684\u6309\u952E\uFF09"],
+  ["\u9009\u4E2D\u540E", "\u5361\u7247\u4E0B\u65B9\u6D6E\u51FA\u64CD\u4F5C\u6761\uFF1A\u65B0\u5EFA\u5B50\u7EA7 / \u540C\u7EA7\u3001\u7F16\u8F91\u3001\u63D0\u5347\u3001\u5220\u9664"],
   ["\u53CC\u51FB / F2", "\u539F\u5730\u7F16\u8F91"],
   ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
   ["Shift+Tab", "\u63D0\u5347\u4E00\u7EA7"],
@@ -7200,11 +7454,20 @@ var HELP_ROWS = [
   ["\u7F16\u8F91\u6846 Ctrl+\u21B5", "\u63D0\u4EA4\u5E76\u65B0\u5EFA\u540C\u7EA7"],
   ["Esc", "\u53D6\u6D88\u7F16\u8F91\u6216\u53D6\u6D88\u9009\u4E2D"]
 ];
-function clip(text, max3 = 18) {
-  const plain = text.replace(/\s+/g, " ").trim();
-  return plain.length <= max3 ? plain : `${plain.slice(0, max3)}\u2026`;
-}
 var MIN_VIEWPORT = 40;
+var DECOR_CLASSES = ["obmind-node-card", "obmind-node-shadow", "obmind-node-link"];
+function isOwnDecoration(rec) {
+  const target = rec.target;
+  if (!(target instanceof Element) || !target.classList.contains("markmap-node")) {
+    return false;
+  }
+  const nodes = [...Array.from(rec.addedNodes), ...Array.from(rec.removedNodes)];
+  if (nodes.length === 0)
+    return false;
+  return nodes.every(
+    (n) => n instanceof Element && DECOR_CLASSES.some((c) => n.classList.contains(c))
+  );
+}
 var MIN_CONTENT = 1;
 var MindmapView = class extends import_obsidian3.ItemView {
   constructor(leaf, plugin) {
@@ -7285,8 +7548,10 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.leafSeq = 0;
     this.leafById = /* @__PURE__ */ new Map();
     this.drag = null;
-    /** 操作栏（图标按钮 + 主题下拉 + 状态文字）。构建细节在 ui/toolbar.ts */
+    /** 操作栏（图标按钮 + 主题按钮）。构建细节在 ui/toolbar.ts */
     this.toolbar = null;
+    /** 选中节点时浮在卡片下方的节点操作条（ui/nodeBar.ts） */
+    this.nodeBar = null;
     /** 快捷键说明面板（点「?」浮出） */
     this.helpPanel = null;
     /**
@@ -7355,74 +7620,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.syncThemeButton();
     this.toolbar = buildToolbar(header, {
       leading: themeBtn,
-      rows: [
-        {
-          groups: [
-            {
-              buttons: [
-                { id: "undo", icon: "undo-2", label: "\u64A4\u9500", key: "Ctrl+Z", fallback: "\u64A4" },
-                { id: "redo", icon: "redo-2", label: "\u91CD\u505A", key: "Ctrl+Shift+Z", fallback: "\u91CD" }
-              ]
-            },
-            {
-              buttons: [
-                {
-                  id: "collapseAll",
-                  icon: "chevrons-down-up",
-                  label: "\u6298\u53E0\u5168\u90E8",
-                  fallback: "\u6298"
-                },
-                {
-                  id: "expandAll",
-                  icon: "chevrons-up-down",
-                  label: "\u5C55\u5F00\u5168\u90E8",
-                  fallback: "\u5C55"
-                },
-                { id: "fit", icon: "maximize", label: "\u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3", fallback: "\u9002" },
-                { id: "refresh", icon: "refresh-cw", label: "\u91CD\u65B0\u8BFB\u53D6\u7B14\u8BB0", fallback: "\u5237" }
-              ]
-            },
-            {
-              pin: true,
-              buttons: [
-                { id: "help", icon: "help-circle", label: "\u64CD\u4F5C\u4E0E\u5FEB\u6377\u952E", fallback: "?" }
-              ]
-            }
-          ]
-        },
-        {
-          status: true,
-          groups: [
-            {
-              buttons: [
-                { id: "edit", icon: "pencil", label: "\u7F16\u8F91\u8282\u70B9", key: "F2 / \u53CC\u51FB", fallback: "\u6539" },
-                {
-                  id: "child",
-                  icon: "corner-down-right",
-                  label: "\u65B0\u5EFA\u5B50\u7EA7",
-                  key: "Tab",
-                  fallback: "\u5B50"
-                },
-                { id: "sibling", icon: "plus", label: "\u65B0\u5EFA\u540C\u7EA7", key: "Enter", fallback: "\u540C" },
-                {
-                  id: "outdent",
-                  icon: "corner-up-left",
-                  label: "\u63D0\u5347\u4E00\u7EA7",
-                  key: "Shift+Tab",
-                  fallback: "\u63D0"
-                }
-              ]
-            },
-            // 删除单独成组：破坏性操作不要和「新建 / 提升」贴在一起，
-            // 手指连点时误触的代价太大
-            {
-              buttons: [
-                { id: "delete", icon: "trash-2", label: "\u5220\u9664\u8282\u70B9", key: "Delete", fallback: "\u5220" }
-              ]
-            }
-          ]
-        }
-      ],
+      groups: GLOBAL_GROUPS,
       onAction: (id2) => this.onToolbar(id2)
     });
     this.helpPanel = this.toolbar.el.createDiv({ cls: "obmind-help-panel is-hidden" });
@@ -7438,6 +7636,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     svg.style.width = "100%";
     svg.style.height = "100%";
     this.svgEl = svg;
+    this.nodeBar = new NodeBar(
+      canvas,
+      { groups: NODE_GROUPS },
+      (id2) => this.onToolbar(id2)
+    );
     this.observeLayout(svg);
     this.observeSize(canvas);
     this.refresh();
@@ -7513,21 +7716,21 @@ var MindmapView = class extends import_obsidian3.ItemView {
       const moved = /* @__PURE__ */ new Set();
       for (const rec of records) {
         if (rec.type === "childList") {
-          structural = true;
+          if (!isOwnDecoration(rec))
+            structural = true;
           continue;
         }
         const target = rec.target;
         if (!(target instanceof SVGGElement) || !target.classList.contains("markmap-node")) {
           continue;
         }
-        const path2 = nodePathOf(target);
-        if (path2)
-          moved.add(path2);
+        moved.add(target);
       }
-      if (structural)
-        this.frames.request("all");
-      else if (moved.size > 0)
-        this.frames.request("links", moved);
+      if (structural) {
+        this.frames.requestAll();
+      } else if (moved.size > 0) {
+        this.frames.paintMoved(moved);
+      }
     });
     this.observer.observe(svg, {
       childList: true,
@@ -7716,29 +7919,36 @@ var MindmapView = class extends import_obsidian3.ItemView {
     }
   }
   /**
-   * 同步按钮可用态与状态文字。
+   * 同步按钮可用态。
    *
    * 集中在这一处而不是散在各操作里：按钮该不该点亮只取决于「有没有选中节点」
    * 「能不能撤销」这两三个状态，散着写必然出现「删完了删除键还是亮的」这类不同步。
+   *
+   * 节点操作现在在浮动条上，可用态跟着它一起走 —— 没有选中节点时浮动条本身就
+   * 不出现，所以那排灰按钮的问题不存在了。
    */
   syncToolbar() {
+    const src = this.nodeAt(this.selectedLine);
+    const onNode = src !== null && src.depth > 0;
+    const onAny = src !== null;
+    const bar = this.nodeBar;
+    if (bar) {
+      bar.setEnabled("edit", onNode);
+      bar.setEnabled("child", onAny);
+      bar.setEnabled("sibling", onAny);
+      bar.setEnabled("outdent", onNode);
+      bar.setEnabled("delete", onNode);
+    }
     const t = this.toolbar;
     if (!t)
       return;
-    const src = this.nodeAt(this.selectedLine);
-    const onNode = src !== null && src.depth > 0;
-    t.setEnabled("edit", onNode);
-    t.setEnabled("child", src !== null);
-    t.setEnabled("sibling", src !== null);
-    t.setEnabled("outdent", onNode);
-    t.setEnabled("delete", onNode);
     t.setEnabled("undo", canUndo(this.history));
     t.setEnabled("redo", canRedo(this.history));
     const ready = this.mm !== null;
     t.setEnabled("fit", ready);
     t.setEnabled("collapseAll", ready);
     t.setEnabled("expandAll", ready);
-    t.setStatus(onNode && src ? `\u5DF2\u9009\u4E2D\uFF1A${clip(src.text)}` : "");
+    t.setEnabled("refresh", ready);
   }
   /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
   nodeAt(line) {
@@ -7825,10 +8035,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     walk(tree);
     if (!changed)
       return;
-    void this.applyTree(tree).then(() => {
-      this.paintSelection();
-      this.syncToolbar();
-    });
+    void this.applyTree(tree);
   }
   /**
    * 撤销 / 重做一步。
@@ -8283,7 +8490,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h2));
     }
-    this.frames.request("all");
+    this.frames.requestAll();
     return true;
   }
   /**
@@ -8319,6 +8526,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
       mm.setOptions({ duration: prev });
       this.rt.setPhase("idle");
     }
+    this.paintSelection();
+    this.syncToolbar();
   }
   /**
    * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
@@ -8608,16 +8817,26 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.paintSelection();
     this.syncToolbar();
   }
-  /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
+  /**
+   * 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class），
+   * 顺便把节点浮动条挂到选中的那个节点上。
+   *
+   * 浮动条每次重建后都要重新挂：markmap 的 setData 会换掉整批 g，
+   * 拿着旧元素等于指着一个已经掉出 DOM 的东西。
+   */
   paintSelection() {
-    var _a;
+    var _a, _b;
     const svg = this.svgEl;
-    if (!svg)
-      return;
-    for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-      const on = ((_a = this.srcOf(g)) == null ? void 0 : _a.line) === this.selectedLine;
-      g.classList.toggle("obmind-selected", on);
+    let hit = null;
+    if (svg) {
+      for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
+        const on = this.selectedLine >= 0 && ((_a = this.srcOf(g)) == null ? void 0 : _a.line) === this.selectedLine;
+        g.classList.toggle("obmind-selected", on);
+        if (on)
+          hit = g;
+      }
     }
+    (_b = this.nodeBar) == null ? void 0 : _b.attach(hit);
   }
   /**
    * 画布上的键盘操作。
@@ -8948,7 +9167,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     });
   }
   async onClose() {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f;
     this.rt.dispose();
     (_a = this.editorHandle) == null ? void 0 : _a.close();
     this.editorHandle = null;
@@ -8980,6 +9199,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.selectedLine = -1;
     this.history = EMPTY_HISTORY;
     this.toolbar = null;
+    (_f = this.nodeBar) == null ? void 0 : _f.destroy();
+    this.nodeBar = null;
     this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;

@@ -1,14 +1,14 @@
 /**
- * 绘制帧调度：把同一帧内的多次重绘请求合并成一次。
+ * 绘制帧调度：全量绘制按 rAF 合并，增量绘制同步执行。
  *
- * 从 MindmapView 搬出来的（原来叫 requestPaint / paintAllSync，外加三个字段
- * paintFrame / paintMode / paintPaths）。搬出来的理由很实在：每次折叠动画都会
- * 每帧触发一次 MutationObserver，这些请求必须按帧合并，否则 60fps 下每秒会
- * 重算几十次全部连线路径。
+ * 两条路径的区别是「为什么需要等」：
  *
- * 两种模式：
- * - all   全量（卡片 + 连线），结构变化、尺寸变化时用；
- * - links 只刷连线，节点位移时用（卡片画在节点局部坐标里，跟位移无关）。
+ * - **全量**（结构变化）必须等一帧：markmap 的 `renderData` 会先 append 节点，
+ *   再 `await requestAnimationFrame` 之后才 `_relayout`。刚 append 完的那一刻
+ *   节点宽高还是 0，这时候量出来全是空盒子。合并到下一帧再画。
+ * - **增量**（折叠动画里节点位移）**不能等**：d3 在 rAF 回调里写 transform，
+ *   MutationObserver 回调紧跟着在微任务里执行 —— 此刻写连线还是同一帧，
+ *   画面一致。若再排一次 rAF，线就比节点晚一帧，动画看起来是线在追节点。
  *
  * 还有一条硬规则：**重建导图期间不画**。那时候 DOM 是半成品，画出来必然是错的，
  * 重建结束后由 paintNow() 在同一帧内一次性补上。
@@ -26,32 +26,19 @@ export interface FrameSource {
 
 export class FrameScheduler {
   private frame = 0;
-  private mode: "all" | "links" = "links";
-  private paths = new Set<string>();
 
   constructor(
     private readonly painter: NodePainter,
     private readonly source: FrameSource,
   ) {}
 
-  /**
-   * 请求一次绘制。
-   * @param paths 本帧发生位移的节点 path；只有 links 模式且非空时才做定向更新
-   */
-  request(mode: "all" | "links", paths?: Set<string>): void {
+  /** 请求一次全量绘制（本帧内多次请求合并成一次） */
+  requestAll(): void {
     if (this.source.blocked()) return;
-
-    if (mode === "all") {
-      this.mode = "all";
-      this.paths.clear();
-    } else if (this.mode !== "all" && paths !== undefined) {
-      for (const path of paths) this.paths.add(path);
-    }
-
     if (this.frame !== 0) return;
     this.frame = window.requestAnimationFrame(() => {
       this.frame = 0;
-      this.flush();
+      this.paintNow();
     });
   }
 
@@ -69,32 +56,29 @@ export class FrameScheduler {
     this.painter.paintAll(svg, spec);
   }
 
+  /**
+   * 同步刷新「这一帧动了」的节点连线。
+   *
+   * 由 MutationObserver 直接调用，**刻意不合并到 rAF**（见文件头）。
+   * 每次调用只处理传进来的元素，成本与「动了的节点数」成正比。
+   */
+  paintMoved(els: Iterable<SVGGElement>): void {
+    if (this.source.blocked()) return;
+    const spec = this.source.spec();
+    if (!spec) return;
+    this.painter.paintMoved(els, spec);
+  }
+
   cancel(): void {
     if (this.frame !== 0) {
       window.cancelAnimationFrame(this.frame);
       this.frame = 0;
     }
-    this.mode = "links";
-    this.paths.clear();
   }
 
   /** 缓存全清（重建后元素引用全部作废） */
   reset(): void {
     this.cancel();
     this.painter.reset();
-  }
-
-  private flush(): void {
-    const svg = this.source.svg();
-    const spec = this.source.spec();
-    if (!svg || !spec) return;
-
-    if (this.mode === "all") {
-      this.painter.paintAll(svg, spec);
-    } else {
-      this.painter.paintLinks(svg, spec, this.paths.size > 0 ? this.paths : null);
-    }
-    this.mode = "links";
-    this.paths.clear();
   }
 }

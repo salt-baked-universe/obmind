@@ -4,13 +4,15 @@
 依赖单向向下，`domain` 永不 import obsidian、不碰 DOM：
 `types`(L0) → `domain` 纯函数(L1) → `render`/`ui`(L2) → `infra` Obsidian 适配(L3) → `app` 用例+会话状态(L4) → `view`(L5)。
 
-进度（1.8.0）：
+进度（1.11.0）：
 - L0 `src/types.ts`：SrcRef / BlockInfo / Span / WriteOp / EditorAction / DropMode。
 - L1 `src/domain/syntax.ts`：buildTree、缩进度量。**行内渲染改为注入 `render` 参数**，
   domain 不认识 HTML，能在 Node 直接跑用例。
-- L2 `src/render/`：inlineHtml、frame（rAF 合并）、painter（卡片/连线/收放点）、geometry、
+- L2 `src/render/`：inlineHtml、frame（全量 rAF 合并 + 增量**同步**）、
+  painter（卡片/连线/收放点/淡出跟随）、geometry、
   **colors（分支粘性配色）**、viewport（适配前等尺寸稳定）。
-  `src/ui/toolbar.ts`：操作栏（按钮声明成数据表 + setEnabled/setStatus）。
+  `src/ui/toolbar.ts`：单行全局操作栏（按钮声明成数据表）；
+  `src/ui/nodeBar.ts`：选中节点时浮出的节点操作条（定位是纯函数，可单测）。
 - L3 `src/edit/writer.ts`（applyOp 是唯一写入出口）、`edit/inlineText.ts`、`edit/drag.ts`。
 - L4 `src/app/`：runtime（phase+rev）、plan（投影判定）、EditService（写用例）、
   QueryService（读用例）、NavStack（跳转栈，条目可带 leafId）、
@@ -52,6 +54,8 @@
     → 全量重绘。内容尺寸真变化的唯一路径是 `applyPatch`，它自己 `request("all")`。
     另：**不能用 `getAttribute(name) === rec.oldValue` 过滤同值重写** ——
     回调批量投递，DOM 已是最新值，比对必然不等。
+    还有：childList 要排除**我们自己插进节点 g 的装饰**（带 `obmind-node-*` class 的
+    rect/path），否则每次首绘都会多触发一次全量重绘；只有「g 本身被增删」才算结构变化。
 13. **导航跳转不重置缩放**（`keepViewport` 一次性标记，在 stale 检查之后消费）。
     用户主动切笔记/首次打开才 fit。
 14. 节点操作：`Delete`/`Backspace` 删**整棵子树**（不是一行），删完选中挪到父节点。
@@ -95,6 +99,21 @@
     橙黄系上白字只有 2.3，等于看不清。
 23. 层级靠**浓淡**区分：`tintAt` 每深一层递减（地板 35%），非实色主题的一级节点
     用 `level1Tint`（≈tint*1.5），否则一级和二级是同一个色块的深浅。
+
+24. **增量绘制（节点位移）必须同步，不能排 rAF**。d3 在 rAF 回调里写 transform，
+    MutationObserver 回调在紧随其后的微任务里执行 —— 此刻重画连线仍是同一帧；
+    排到下一个 rAF 就**迟一帧**，折叠动画里看着就是线在追节点、发飘。
+    rAF 合并只留给**全量**绘制（它必须等 markmap `_relayout` 完）。
+25. **自绘装饰必须跟着 markmap 的淡入淡出**。折叠时 markmap 把子树 transform 过渡到父节点、
+    且**只**给 foreignObject 过渡 opacity；我们插进 g 的卡片/连线/收放点不跟就会
+    「文字正常消失、彩色方块继续飞」。按 `fo.style.opacity` 同步到三者上；
+    并且**正在消失的节点要冻结连线形状**，否则按被拖动的 transform 反推的路径会被拉成歪线。
+26. 节点操作用**浮动条**（`ui/nodeBar.ts`），不要塞回顶部工具栏：它们只在选中后有意义，
+    钉在顶部就是一排常驻灰按钮。隐藏用 `opacity + pointer-events`，**不要用 display:none**
+    （隐藏态也要参与布局，否则读不到 offsetWidth，第一次弹出会先落左上角再跳过来）。
+27. **`applyTree` 出口必须调 `paintSelection()` + `syncToolbar()`**：重建换掉整批 g，
+    不重新挂就等于「选中态凭空丢了」，而 `selectedLine` 还指着那一行 ——
+    用户按 Tab 会莫名多出一个子级。
 
 ## 构建与验证
 - `node esbuild.config.mjs production`（Windows 沙箱内可能 EBUSY，需 `dangerouslyDisableSandbox`）。

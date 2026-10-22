@@ -34,11 +34,10 @@
   z-index: 100;
 }
 
-/* 操作栏：两行。
-   第一行是「对整张图」的动作（主题 / 撤销 / 折叠 / 适配 / 刷新 / 帮助），
-   第二行是「对选中节点」的动作（编辑 / 新建 / 提升 / 删除）。
-   分成两行而不是堆一行：侧栏通常只有 300px 宽，一行塞十来个图标必然爆掉；
-   按语义分行之后，扫一眼就知道哪排作用于什么。 */
+/* 操作栏：**一行**，只放「对整张图」的动作（主题 / 撤销 / 折叠 / 适配 / 刷新 / 帮助）。
+   「对选中节点」的五个动作搬到了画布里的浮动条（.obmind-nodebar）：
+   它们只有在选中节点后才有意义，钉在顶部就成了一排长期挂着的灰按钮，
+   既占高度又让操作栏看起来是两截。 */
 .obmind-toolbars {
   display: flex;
   flex-direction: column;
@@ -54,20 +53,13 @@
   display: flex;
   align-items: center;
   /* 绝不换行：工具条高度必须稳定，换行会让画布在每次点击时上下跳。
-     宽度真的不够时由 .is-sub 的状态文字让位（它会省略号），
-     再不够就裁掉尾部图标 —— 总之不换行。 */
+     宽度真的不够就裁掉尾部图标 —— 总之不换行。 */
   flex-wrap: nowrap;
   gap: 2px;
-  padding: 4px 6px 3px;
+  padding: 5px 6px 4px;
   min-width: 0;
   flex: 0 0 auto;
   overflow: hidden;
-}
-
-/* 第二行贴着第一行：两排图标之间不要留出一道空隙，否则像两个独立工具条 */
-.obmind-toolbar.is-sub {
-  padding-top: 0;
-  padding-bottom: 4px;
 }
 
 /* 图标按钮：28px 见方 + 7px 圆角，hover 底色由 Obsidian 的 .clickable-icon
@@ -105,7 +97,8 @@
 
 /* 禁用态：保留图标与 tooltip，只是变淡。
    直接隐藏会让用户以为「没有这个功能」，变淡才是「现在用不了」。 */
-.obmind-toolbar .clickable-icon:disabled {
+.obmind-toolbar .clickable-icon:disabled,
+.obmind-nodebar .clickable-icon:disabled {
   opacity: 0.3;
   cursor: default;
   background: transparent;
@@ -113,7 +106,8 @@
 }
 
 /* 图标缺失时的文字兜底按钮 */
-.obmind-toolbar .clickable-icon.obmind-icon-fallback {
+.obmind-toolbar .clickable-icon.obmind-icon-fallback,
+.obmind-nodebar .clickable-icon.obmind-icon-fallback {
   width: auto;
   min-width: 28px;
   padding: 0 7px;
@@ -137,24 +131,59 @@
   min-width: 4px;
 }
 
-/* 状态文字：说明第二行为什么可以（或不可以）点。
-   没有它，没选中节点时那一排灰按钮看起来就像坏了。 */
-.obmind-toolbar .obmind-status {
-  font-size: 11px;
-  color: var(--text-faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  /* 允许收缩 + min-width:0：省略号才会真正生效，
-     否则 flex 项的最小内容宽度会把这一行顶出可视区 */
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 62%;
-  padding: 0 2px 0 6px;
+/* 节点操作条：选中节点时浮在卡片正下方，操作跟着上下文走。
+   位置由 JS 用 transform 写（ui/nodeBar.ts），这里只管长相。
+
+   隐藏用 opacity + pointer-events 而不是 display:none —— 隐藏态也要参与布局，
+   否则刚创建时读不到 offsetWidth，第一次弹出会先落在左上角再跳过来。 */
+.obmind-nodebar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 4px;
+  border-radius: 10px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s, 0 6px 18px rgba(0, 0, 0, 0.16));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  /* 浮层每帧都在跟着卡片挪，提前合成一层，避免跟节点动画抢主线程 */
+  will-change: transform;
 }
 
-.obmind-toolbar .obmind-status.is-empty {
-  display: none;
+.obmind-nodebar.is-in {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 比顶部工具栏再小一档：它是「贴着内容」的临时控件，太大会压住相邻节点 */
+.obmind-nodebar .clickable-icon {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  color: var(--text-muted);
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.obmind-nodebar .clickable-icon:hover {
+  color: var(--text-normal);
+}
+
+.obmind-nodebar .clickable-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.obmind-nodebar .obmind-toolbar-sep {
+  height: 13px;
+  margin: 0 3px;
 }
 
 /* 快捷键面板：点「?」浮出。
@@ -217,6 +246,13 @@
 /* 窄侧栏（Obsidian 允许拖到 260px 上下）：
    图标 28 → 24、分隔线留白减半，实测 240px 仍能一行放下 8 个按钮。 */
 @container (max-width: 310px) {
+  /* 图标缩到 24 之后把上下内边距补回来，行高仍是 37px ——
+     拖动侧栏跨过断点时工具条不会突然变矮，画布也不会跟着跳。 */
+  .obmind-toolbar {
+    padding-top: 7px;
+    padding-bottom: 6px;
+  }
+
   .obmind-toolbar .clickable-icon {
     width: 24px;
     height: 24px;

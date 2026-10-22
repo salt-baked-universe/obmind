@@ -21,7 +21,6 @@ import { NodePainter } from "./render/painter";
 import { BranchColors, branchKey, branchPathOf, hash32 } from "./render/colors";
 import { FrameScheduler } from "./render/frame";
 import { waitStableSize } from "./render/viewport";
-import { nodePathOf } from "./render/geometry";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { openInlineEditor } from "./edit/inlineText";
 import type { EditorAction, InlineEditorHandle } from "./edit/inlineText";
@@ -41,8 +40,9 @@ import type { ForwardTarget, NavSyncMode } from "./app/NavPolicy";
 import { QueryService } from "./app/QueryService";
 import { canRedo, canUndo, EMPTY_HISTORY, record, redo, undo } from "./app/History";
 import type { HistoryState } from "./app/History";
-import { buildToolbar } from "./ui/toolbar";
+import { buildToolbar, GLOBAL_GROUPS, NODE_GROUPS } from "./ui/toolbar";
 import type { ToolbarActionId, ToolbarHandle } from "./ui/toolbar";
+import { NodeBar } from "./ui/nodeBar";
 import { ViewRuntime } from "./app/runtime";
 import { planProjection } from "./app/plan";
 import type MindmapPlugin from "./main";
@@ -57,6 +57,7 @@ type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
 /** 快捷键说明面板的内容。改一处就够，不必再维护标记里的长 tooltip。 */
 const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["单击", "选中节点（之后可用下面的按键）"],
+  ["选中后", "卡片下方浮出操作条：新建子级 / 同级、编辑、提升、删除"],
   ["双击 / F2", "原地编辑"],
   ["Tab / Enter", "新建子级 / 新建同级"],
   ["Shift+Tab", "提升一级"],
@@ -69,12 +70,6 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["Esc", "取消编辑或取消选中"],
 ];
 
-/** 节点文字截断：状态栏只有一行，长标题会把按钮挤走 */
-function clip(text: string, max = 18): string {
-  const plain: string = text.replace(/\s+/g, " ").trim();
-  return plain.length <= max ? plain : `${plain.slice(0, max)}…`;
-}
-
 /**
  * 适配时认定「视口已就绪」的最小边长。
  *
@@ -82,6 +77,27 @@ function clip(text: string, max = 18): string {
  * fit 出来的 scale 要么是 0（缩成一个点），要么极小 —— 两者看起来都是空白。
  */
 const MIN_VIEWPORT = 40;
+
+/** 我们自己插进节点 g 的装饰元素（卡片 / 阴影 / 连线）的 class */
+const DECOR_CLASSES = ["obmind-node-card", "obmind-node-shadow", "obmind-node-link"];
+
+/**
+ * 这条 childList 记录是不是「我们往节点里插装饰」造成的。
+ *
+ * 判据刻意收得很窄：只有「目标就是节点 g」且「增删的全是带装饰 class 的元素」
+ * 才算。markmap 往 g 里插 foreignObject / circle 属于重建的一部分，必须当结构变化。
+ */
+function isOwnDecoration(rec: MutationRecord): boolean {
+  const target = rec.target;
+  if (!(target instanceof Element) || !target.classList.contains("markmap-node")) {
+    return false;
+  }
+  const nodes: Node[] = [...Array.from(rec.addedNodes), ...Array.from(rec.removedNodes)];
+  if (nodes.length === 0) return false;
+  return nodes.every(
+    (n: Node) => n instanceof Element && DECOR_CLASSES.some((c) => n.classList.contains(c)),
+  );
+}
 
 /**
  * 适配后认定「内容包围盒有效」的最小宽高。
@@ -199,8 +215,10 @@ export class MindmapView extends ItemView {
   private leafSeq = 0;
   private readonly leafById = new Map<number, WorkspaceLeaf>();
   private drag: DragController | null = null;
-  /** 操作栏（图标按钮 + 主题下拉 + 状态文字）。构建细节在 ui/toolbar.ts */
+  /** 操作栏（图标按钮 + 主题按钮）。构建细节在 ui/toolbar.ts */
   private toolbar: ToolbarHandle | null = null;
+  /** 选中节点时浮在卡片下方的节点操作条（ui/nodeBar.ts） */
+  private nodeBar: NodeBar | null = null;
   /** 快捷键说明面板（点「?」浮出） */
   private helpPanel: HTMLElement | null = null;
   /**
@@ -292,74 +310,7 @@ export class MindmapView extends ItemView {
 
     this.toolbar = buildToolbar(header, {
       leading: themeBtn,
-      rows: [
-        {
-          groups: [
-            {
-              buttons: [
-                { id: "undo", icon: "undo-2", label: "撤销", key: "Ctrl+Z", fallback: "撤" },
-                { id: "redo", icon: "redo-2", label: "重做", key: "Ctrl+Shift+Z", fallback: "重" },
-              ],
-            },
-            {
-              buttons: [
-                {
-                  id: "collapseAll",
-                  icon: "chevrons-down-up",
-                  label: "折叠全部",
-                  fallback: "折",
-                },
-                {
-                  id: "expandAll",
-                  icon: "chevrons-up-down",
-                  label: "展开全部",
-                  fallback: "展",
-                },
-                { id: "fit", icon: "maximize", label: "缩放到适合窗口", fallback: "适" },
-                { id: "refresh", icon: "refresh-cw", label: "重新读取笔记", fallback: "刷" },
-              ],
-            },
-            {
-              pin: true,
-              buttons: [
-                { id: "help", icon: "help-circle", label: "操作与快捷键", fallback: "?" },
-              ],
-            },
-          ],
-        },
-        {
-          status: true,
-          groups: [
-            {
-              buttons: [
-                { id: "edit", icon: "pencil", label: "编辑节点", key: "F2 / 双击", fallback: "改" },
-                {
-                  id: "child",
-                  icon: "corner-down-right",
-                  label: "新建子级",
-                  key: "Tab",
-                  fallback: "子",
-                },
-                { id: "sibling", icon: "plus", label: "新建同级", key: "Enter", fallback: "同" },
-                {
-                  id: "outdent",
-                  icon: "corner-up-left",
-                  label: "提升一级",
-                  key: "Shift+Tab",
-                  fallback: "提",
-                },
-              ],
-            },
-            // 删除单独成组：破坏性操作不要和「新建 / 提升」贴在一起，
-            // 手指连点时误触的代价太大
-            {
-              buttons: [
-                { id: "delete", icon: "trash-2", label: "删除节点", key: "Delete", fallback: "删" },
-              ],
-            },
-          ],
-        },
-      ],
+      groups: GLOBAL_GROUPS,
       onAction: (id: ToolbarActionId) => this.onToolbar(id),
     });
 
@@ -383,6 +334,12 @@ export class MindmapView extends ItemView {
     svg.style.width = "100%";
     svg.style.height = "100%";
     this.svgEl = svg;
+
+    // 节点操作条挂在画布上（不是节点 DOM 里）：它的位置按卡片的屏幕坐标算，
+    // 不参与 SVG 的坐标系，缩放/平移都不用重算内部布局。
+    this.nodeBar = new NodeBar(canvas, { groups: NODE_GROUPS }, (id: ToolbarActionId) =>
+      this.onToolbar(id),
+    );
 
     this.observeLayout(svg);
     this.observeSize(canvas);
@@ -479,11 +436,14 @@ export class MindmapView extends ItemView {
     this.observer?.disconnect();
     this.observer = new MutationObserver((records: MutationRecord[]) => {
       let structural = false;
-      const moved = new Set<string>();
+      const moved = new Set<SVGGElement>();
 
       for (const rec of records) {
         if (rec.type === "childList") {
-          structural = true;
+          // 我们自己往节点 g 里插卡片/阴影/连线也会产生 childList。那不是
+          // 结构变化 —— 若当成结构变化，每次首次绘制都会再触发一次全量重绘，
+          // 折叠动画一开始就凭空多跑一遍。
+          if (!isOwnDecoration(rec)) structural = true;
           continue;
         }
         const target = rec.target;
@@ -493,12 +453,17 @@ export class MindmapView extends ItemView {
         ) {
           continue;
         }
-        const path = nodePathOf(target);
-        if (path) moved.add(path);
+        moved.add(target);
       }
 
-      if (structural) this.frames.request("all");
-      else if (moved.size > 0) this.frames.request("links", moved);
+      if (structural) {
+        this.frames.requestAll();
+      } else if (moved.size > 0) {
+        // 同步重绘，不走 rAF：d3 刚在这一帧的 rAF 回调里写完 transform，
+        // MutationObserver 回调紧跟着在微任务里跑 —— 此刻重画连线仍是同一帧，
+        // 线和节点一起落位。排到下一个 rAF 就会晚一帧，动画里看着线在追节点。
+        this.frames.paintMoved(moved);
+      }
     });
     this.observer.observe(svg, {
       childList: true,
@@ -698,33 +663,38 @@ export class MindmapView extends ItemView {
   }
 
   /**
-   * 同步按钮可用态与状态文字。
+   * 同步按钮可用态。
    *
    * 集中在这一处而不是散在各操作里：按钮该不该点亮只取决于「有没有选中节点」
    * 「能不能撤销」这两三个状态，散着写必然出现「删完了删除键还是亮的」这类不同步。
+   *
+   * 节点操作现在在浮动条上，可用态跟着它一起走 —— 没有选中节点时浮动条本身就
+   * 不出现，所以那排灰按钮的问题不存在了。
    */
   private syncToolbar(): void {
-    const t = this.toolbar;
-    if (!t) return;
-
     const src: SrcRef | null = this.nodeAt(this.selectedLine);
     // 根节点就是文件名本身：改不了、删不了、也无所谓缩进
     const onNode: boolean = src !== null && src.depth > 0;
-    t.setEnabled("edit", onNode);
-    t.setEnabled("child", src !== null);
-    t.setEnabled("sibling", src !== null);
-    t.setEnabled("outdent", onNode);
-    t.setEnabled("delete", onNode);
+    const onAny: boolean = src !== null;
 
+    const bar = this.nodeBar;
+    if (bar) {
+      bar.setEnabled("edit", onNode);
+      bar.setEnabled("child", onAny);
+      bar.setEnabled("sibling", onAny);
+      bar.setEnabled("outdent", onNode);
+      bar.setEnabled("delete", onNode);
+    }
+
+    const t = this.toolbar;
+    if (!t) return;
     t.setEnabled("undo", canUndo(this.history));
     t.setEnabled("redo", canRedo(this.history));
-
     const ready: boolean = this.mm !== null;
     t.setEnabled("fit", ready);
     t.setEnabled("collapseAll", ready);
     t.setEnabled("expandAll", ready);
-
-    t.setStatus(onNode && src ? `已选中：${clip(src.text)}` : "");
+    t.setEnabled("refresh", ready);
   }
 
   /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
@@ -811,10 +781,8 @@ export class MindmapView extends ItemView {
     walk(tree);
     if (!changed) return;
 
-    void this.applyTree(tree).then(() => {
-      this.paintSelection();
-      this.syncToolbar();
-    });
+    // 选中态与浮动条由 applyTree 自己在重建结束后挂回去
+    void this.applyTree(tree);
   }
 
   /**
@@ -1345,7 +1313,7 @@ export class MindmapView extends ItemView {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h));
     }
-    this.frames.request("all");
+    this.frames.requestAll();
     return true;
   }
 
@@ -1388,6 +1356,12 @@ export class MindmapView extends ItemView {
       mm.setOptions({ duration: prev });
       this.rt.setPhase("idle");
     }
+
+    // 重建换掉了整批 g：选中高亮和节点浮动条都要按行号重新挂回去。
+    // 不挂的话，折叠再展开、拖一次节点之后，「选中」在视觉上就凭空丢了，
+    // 而 selectedLine 其实还指着那一行 —— 用户按 Tab 会莫名其妙多出一个子级。
+    this.paintSelection();
+    this.syncToolbar();
   }
 
   /**
@@ -1726,14 +1700,25 @@ export class MindmapView extends ItemView {
     this.syncToolbar();
   }
 
-  /** 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class） */
+  /**
+   * 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class），
+   * 顺便把节点浮动条挂到选中的那个节点上。
+   *
+   * 浮动条每次重建后都要重新挂：markmap 的 setData 会换掉整批 g，
+   * 拿着旧元素等于指着一个已经掉出 DOM 的东西。
+   */
   private paintSelection(): void {
     const svg = this.svgEl;
-    if (!svg) return;
-    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
-      const on: boolean = this.srcOf(g)?.line === this.selectedLine;
-      g.classList.toggle("obmind-selected", on);
+    let hit: SVGGElement | null = null;
+    if (svg) {
+      for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+        const on: boolean =
+          this.selectedLine >= 0 && this.srcOf(g)?.line === this.selectedLine;
+        g.classList.toggle("obmind-selected", on);
+        if (on) hit = g;
+      }
     }
+    this.nodeBar?.attach(hit);
   }
 
   /**
@@ -2139,6 +2124,8 @@ export class MindmapView extends ItemView {
     this.selectedLine = -1;
     this.history = EMPTY_HISTORY;
     this.toolbar = null;
+    this.nodeBar?.destroy();
+    this.nodeBar = null;
     this.helpPanel = null;
     this.svgEl = null;
     this.canvasEl = null;

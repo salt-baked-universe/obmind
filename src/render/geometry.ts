@@ -85,12 +85,21 @@ export function nodePathOf(g: SVGGElement): string | null {
   return typeof path === "string" ? path : null;
 }
 
+/** 直接子元素里找指定标签。比 `querySelector(":scope > x")` 快得多 ——
+ *  折叠动画每帧要对几百个节点读几何，选择器解析的开销会累加出来。 */
+function directChild<T extends Element>(g: Element, tag: string): T | null {
+  for (let el = g.firstElementChild; el; el = el.nextElementSibling) {
+    if (el.tagName === tag) return el as unknown as T;
+  }
+  return null;
+}
+
 /** 从节点 g 读取几何信息，读不到（还没布局）返回 null */
 export function readNodeBox(g: SVGGElement): NodeBox | null {
   const path = nodePathOf(g);
   if (!path) return null;
 
-  const fo = g.querySelector<SVGForeignObjectElement>(":scope > foreignObject");
+  const fo = directChild<SVGForeignObjectElement>(g, "foreignObject");
   if (!fo) return null;
 
   const w = Number.parseFloat(fo.getAttribute("width") ?? "");
