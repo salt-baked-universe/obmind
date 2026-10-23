@@ -5,7 +5,7 @@
  * 原来第二行是「对选中节点」的操作（改 / 子 / 同 / 提 / 删）。这五个动作在
  * 没选中节点时全是灰的 —— 长期占着一行高度，却只有在选中后才有意义。
  * 而且两行图标靠一条竖线分组，视觉上像两个独立工具条叠在一起，很碎。
- * 现在它们搬到了 `ui/nodeBar.ts`，选中节点时浮在卡片下面（跟着上下文走）。
+ * 现在它们搬到了 `ui/nodeBar.ts`，选中单个节点时贴在画布右侧（固定位置）。
  *
  * 按钮的「图标 / 文案 / 快捷键」是数据不是流程 —— 声明成表之后，
  * 加一个操作就是加一行，不用再动事件绑定；可用态集中由 setEnabled 管，
@@ -19,6 +19,7 @@
 import { setIcon } from "obsidian";
 
 export type ToolbarActionId =
+  | "pin"
   | "undo"
   | "redo"
   | "collapseAll"
@@ -32,6 +33,7 @@ export type ToolbarActionId =
   | "sibling"
   | "outdent"
   | "delete"
+  | "newNote"
   | "help";
 
 export interface ToolbarButton {
@@ -49,6 +51,8 @@ export interface ToolbarButton {
    * 用户看到一排空白，还以为插件坏了。有兜底至少还能当文字按钮用。
    */
   fallback?: string;
+  /** 开关型按钮在「开启」时换用的图标（如 pin → pin-off 那一类） */
+  iconActive?: string;
 }
 
 export interface ToolbarGroup {
@@ -58,8 +62,12 @@ export interface ToolbarGroup {
 }
 
 export interface ToolbarSpec {
+  /** 行首的品牌位（logo 占位）：现在是一个字标，将来换成真图标不用动布局 */
+  brand?: string;
   /** 行首的额外控件（主题按钮）：由调用方创建，这里只负责摆放 */
   leading?: HTMLElement | null;
+  /** 行尾的只读信息（节点数 / 树深）：同样由调用方创建与更新 */
+  trailing?: HTMLElement | null;
   groups: readonly ToolbarGroup[];
   onAction: (id: ToolbarActionId) => void;
 }
@@ -68,6 +76,14 @@ export interface ToolbarHandle {
   el: HTMLElement;
   /** 切换某个按钮的可用态（不可用时保留图标与 tooltip，用户仍能看见它能做什么） */
   setEnabled(id: ToolbarActionId, on: boolean): void;
+  /**
+   * 切换某个按钮的**开启态**（钉住、锁定这类开关型动作）。
+   *
+   * 与 setEnabled 是两件事：disabled 是「现在点不了」，active 是「这个开关是开着的」。
+   * 顺手换 tooltip：同一个按钮在两种状态下要说两句不同的话（「钉住导图」/「取消钉住」），
+   * 光靠高亮色用户读不出来点一下会发生什么。
+   */
+  setActive(id: ToolbarActionId, on: boolean, label?: string): void;
 }
 
 /**
@@ -104,7 +120,10 @@ export function buildToolbar(parent: HTMLElement, spec: ToolbarSpec): ToolbarHan
   const el = parent.createDiv({ cls: "obmind-toolbars" });
   const rowEl = el.createDiv({ cls: "obmind-toolbar" });
   const buttons = new Map<ToolbarActionId, HTMLButtonElement>();
+  const specs = new Map<ToolbarActionId, ToolbarButton>();
 
+  // 品牌位在最左：它只是一块视觉锚点，不参与任何交互，所以不塞进领导控件里
+  if (spec.brand) rowEl.createSpan({ cls: "obmind-brand", text: spec.brand });
   if (spec.leading) rowEl.appendChild(spec.leading);
 
   let firstGroup = true;
@@ -117,9 +136,14 @@ export function buildToolbar(parent: HTMLElement, spec: ToolbarSpec): ToolbarHan
     }
     for (const item of group.buttons) {
       buttons.set(item.id, createIconButton(rowEl, item, spec.onAction));
+      specs.set(item.id, item);
     }
     firstGroup = false;
   }
+
+  // 统计放在**最后**（连 pin 的「帮助」之后）：它是只读信息，贴着右边缘
+  // 才像是「状态栏」；插在按钮中间会被误认为又是一个按钮。
+  if (spec.trailing) rowEl.appendChild(spec.trailing);
 
   return {
     el,
@@ -129,11 +153,31 @@ export function buildToolbar(parent: HTMLElement, spec: ToolbarSpec): ToolbarHan
       if (btn.disabled === !on) return;
       btn.disabled = !on;
     },
+    setActive(id: ToolbarActionId, on: boolean, label?: string): void {
+      const btn = buttons.get(id);
+      const item = specs.get(id);
+      if (!btn || !item) return;
+      const changed: boolean = btn.classList.contains("is-active") !== on;
+      if (!changed && !label) return;
+      if (changed) btn.classList.toggle("is-active", on);
+      // 开关型按钮的两个图标：钉住之后画「已钉住」那个，比只换颜色好认
+      if (changed && item.iconActive) setIcon(btn, on ? item.iconActive : item.icon);
+      btn.setAttribute(
+        "aria-label",
+        label ?? (item.key ? `${item.label}（${item.key}）` : item.label),
+      );
+    },
   };
 }
 
 /** 全局操作栏的按钮表（浮动条用的是另一份，见 nodeBar.ts） */
 export const GLOBAL_GROUPS: readonly ToolbarGroup[] = [
+  // 钉住排在最前：它决定「这张图跟着谁走」，比后面所有操作都更靠近「我在看哪篇」
+  {
+    buttons: [
+      { id: "pin", icon: "pin", label: "钉住当前导图", fallback: "钉" },
+    ],
+  },
   {
     buttons: [
       { id: "undo", icon: "undo-2", label: "撤销", key: "Ctrl+Z", fallback: "撤" },
@@ -163,6 +207,9 @@ export const NODE_GROUPS: readonly ToolbarGroup[] = [
     buttons: [
       { id: "child", icon: "corner-down-right", label: "新建子级", key: "Tab", fallback: "子" },
       { id: "sibling", icon: "plus", label: "新建同级", key: "Enter", fallback: "同" },
+      // 「建笔记」紧跟着两个「建节点」：用户心里它们是同一类动作（从这一行长出东西），
+      // 只是长出来的是节点还是一篇笔记。它只在节点还没有双链时出现（见 syncToolbar）。
+      { id: "newNote", icon: "file-plus", label: "新建笔记并双链", key: "Ctrl+N", fallback: "记" },
       { id: "edit", icon: "pencil", label: "编辑节点", key: "F2 / 双击", fallback: "改" },
       { id: "outdent", icon: "corner-up-left", label: "提升一级", key: "Shift+Tab", fallback: "提" },
     ],

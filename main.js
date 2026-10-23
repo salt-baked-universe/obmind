@@ -5496,13 +5496,46 @@ var NodePainter = class {
     this.indexReady = false;
   }
   /**
+   * 只同步透明度：给「markmap 改了 foreignObject 的 style.opacity」这条事件用。
+   *
+   * 为什么不能只在全量/增量绘制里读一次透明度：
+   * `renderData` 对 enter 节点是先写 `opacity: 0`、再起过渡到 1 的。我们正好在
+   * 中间那一瞬全量绘制，读完就把它写进卡片 → 一张「透明度 0」的卡片。
+   * 之后能不能恢复，全看这个节点还有没有 transform 写入恰好触发另一次绘制 ——
+   * 没有就永远不恢复（那一块图连卡片带底都没了，就是「只渲染了一半」）。
+   *
+   * 现在把「透明度变化」本身当成事件源：markmap 每帧写一次 opacity，我们每帧跟一次，
+   * 不依赖 transform、也不受重建期 blocked 的影响（这一步不读布局，随时都安全）。
+   */
+  syncFadeFor(els) {
+    for (const g of els) {
+      if (!g.isConnected)
+        continue;
+      const path2 = nodePathOf(g);
+      if (!path2)
+        continue;
+      const entry = this.entries.get(path2);
+      if (!entry || entry.g !== g)
+        continue;
+      const fo = entry.fo.isConnected ? entry.fo : g.querySelector(":scope > foreignObject");
+      if (!fo)
+        continue;
+      entry.fo = fo;
+      this.writeFade(entry, readOpacity(fo));
+    }
+  }
+  /**
    * 全量绘制：结构发生变化时调用。
    * 只在「重建导图 / 节点增删 / 主题切换」这类低频事件里跑。
+   *
+   * @returns 这一遍**没画成**的节点数（几何还读不到：markmap 刚 append、
+   *          内容尺寸还是 0）。>0 说明 DOM 还没长全，调用方应隔一帧再画一遍 ——
+   *          否则这些节点会永远没有卡片，看起来就是「只渲染了半张图」。
    */
   paintAll(svg, spec) {
-    const { boxes, byPath } = this.collect(svg);
+    const { boxes, byPath, skipped } = this.collect(svg);
     if (boxes.length === 0)
-      return;
+      return skipped || svg.querySelectorAll("g.markmap-node").length;
     const themeKey = `${spec.id}|${spec.dark ? 1 : 0}`;
     for (const box of boxes) {
       const entry = this.entryOf(box);
@@ -5518,6 +5551,7 @@ var NodePainter = class {
         this.applyLink(box, parent, entry, spec);
     }
     this.prune(boxes);
+    return skipped;
   }
   /**
    * 只处理「这一帧真的动了」的节点：折叠/展开的 180ms 动画里每帧调用一次。
@@ -5563,8 +5597,12 @@ var NodePainter = class {
       if (!box)
         continue;
       const entry = this.entryOf(box);
-      if (!entry.link)
+      if (!entry.link) {
         this.ensureLayers(box.g, entry);
+        this.applyStyle(box, entry, spec, `${spec.id}|${spec.dark ? 1 : 0}`);
+        this.applySize(box, entry);
+        this.applyCircle(box, entry);
+      }
       this.syncFade(box, entry);
       if (box.depth === 0)
         continue;
@@ -5606,17 +5644,20 @@ var NodePainter = class {
     const boxes = [];
     const byPath = /* @__PURE__ */ new Map();
     const index = /* @__PURE__ */ new Map();
+    let skipped = 0;
     for (const el of Array.from(svg.querySelectorAll("g.markmap-node"))) {
       const box = readNodeBox(el);
-      if (!box)
+      if (!box) {
+        skipped++;
         continue;
+      }
       boxes.push(box);
       byPath.set(box.path, box);
       index.set(box.path, el);
     }
     this.index = index;
     this.indexReady = index.size > 0;
-    return { boxes, byPath };
+    return { boxes, byPath, skipped };
   }
   /** 取（或重建）节点缓存。g 被 markmap 重建、元素掉出 DOM 时都要重置。 */
   entryOf(box) {
@@ -5843,6 +5884,8 @@ var FrameScheduler = class {
     this.painter = painter;
     this.source = source;
     this.frame = 0;
+    /** 全量绘制发现「还有节点没长全」时的重试计数，避免无限排帧 */
+    this.retries = 0;
   }
   /** 请求一次全量绘制（本帧内多次请求合并成一次） */
   requestAll() {
@@ -5867,7 +5910,16 @@ var FrameScheduler = class {
     const spec = this.source.spec();
     if (!svg || !spec)
       return;
-    this.painter.paintAll(svg, spec);
+    const pending = this.painter.paintAll(svg, spec);
+    if (pending > 0 && this.retries < 3 && !this.source.blocked()) {
+      this.retries++;
+      this.frame = window.requestAnimationFrame(() => {
+        this.frame = 0;
+        this.paintNow();
+      });
+      return;
+    }
+    this.retries = 0;
   }
   /**
    * 同步刷新「这一帧动了」的节点连线。
@@ -5889,9 +5941,20 @@ var FrameScheduler = class {
       this.frame = 0;
     }
   }
+  /**
+   * 同步透明度。
+   *
+   * 刻意**不看 blocked()**：这一步只把 foreignObject 的 opacity 抄到卡片/连线/收放点上，
+   * 不读任何布局，重建期间照抄也是对的；反过来放行让它被跳过，就会留下
+   * 「卡片停在 opacity: 0」的死局（见 NodePainter.syncFadeFor 的注释）。
+   */
+  syncFade(els) {
+    this.painter.syncFadeFor(els);
+  }
   /** 缓存全清（重建后元素引用全部作废） */
   reset() {
     this.cancel();
+    this.retries = 0;
     this.painter.reset();
   }
 };
@@ -5961,7 +6024,108 @@ function applyFolds(root2, folded) {
   walk(root2, "");
 }
 
+// src/domain/nav.ts
+function isFolded2(n) {
+  var _a;
+  const fold = (_a = n.payload) == null ? void 0 : _a.fold;
+  return typeof fold === "number" && fold > 0;
+}
+function visibleLeafRefs(root2) {
+  const out = [];
+  const walk = (n) => {
+    var _a, _b;
+    const kids = isFolded2(n) ? [] : (_a = n.children) != null ? _a : [];
+    if (kids.length > 0) {
+      for (const c of kids)
+        walk(c);
+      return;
+    }
+    const src = (_b = n.payload) == null ? void 0 : _b.src;
+    if (src && typeof src.line === "number")
+      out.push(src);
+  };
+  if (root2)
+    walk(root2);
+  return out;
+}
+function stepVisible(refs, line, dir) {
+  var _a;
+  if (refs.length === 0)
+    return null;
+  if (line < 0)
+    return dir > 0 ? refs[0] : refs[refs.length - 1];
+  const at = refs.findIndex((r) => r.line === line);
+  if (at >= 0) {
+    const next = at + dir;
+    return next < 0 || next >= refs.length ? null : refs[next];
+  }
+  if (dir > 0)
+    return (_a = refs.find((r) => r.line > line)) != null ? _a : null;
+  for (let i = refs.length - 1; i >= 0; i -= 1)
+    if (refs[i].line < line)
+      return refs[i];
+  return null;
+}
+function firstChildRef(nodes, line) {
+  const at = nodes.findIndex((n) => n.line === line);
+  if (at < 0)
+    return null;
+  const depth = nodes[at].depth;
+  for (let i = at + 1; i < nodes.length; i++) {
+    const d = nodes[i].depth;
+    if (d <= depth)
+      return null;
+    if (d === depth + 1)
+      return nodes[i];
+  }
+  return null;
+}
+
+// src/edit/text.ts
+function quoteOf(src) {
+  const m = /^(?:\s*>\s?)+/.exec(src.full);
+  return m ? m[0] : "";
+}
+function markOf(src) {
+  return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
+}
+function rewriteNode(src, text, checked, indent) {
+  const quote = quoteOf(src);
+  let mark = markOf(src);
+  const want = checked === void 0 ? src.checked : checked;
+  if (src.checked !== null && want !== src.checked) {
+    mark = mark.replace(/\[[ xX]\](?=\s*$)/, want ? "[x]" : "[ ]");
+  }
+  const nextIndent = indent === void 0 ? src.indent : indent;
+  return quote + nextIndent + mark + text + src.full.slice(src.bodyEnd);
+}
+function indentBy(src, delta, step) {
+  const unit = src.indent.includes("	") ? "	" : " ".repeat(Math.max(1, step));
+  if (delta > 0)
+    return src.indent + unit;
+  if (delta < 0) {
+    if (src.indent.length === 0)
+      return null;
+    return src.indent.slice(0, Math.max(0, src.indent.length - unit.length));
+  }
+  return src.indent;
+}
+function parseEditorValue(src, raw) {
+  let text = raw.trim();
+  let checked = src.checked;
+  if (src.checked !== null) {
+    const m = /^([☐☑])\s*/u.exec(text);
+    if (m) {
+      checked = m[1] === "\u2611";
+      text = text.slice(m[0].length).trim();
+    }
+  }
+  text = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  return { text, checked };
+}
+
 // src/edit/inlineText.ts
+var MIN_EDIT_COLS = 7;
 function cardPad(fo, card) {
   var _a, _b, _c, _d;
   const fw = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "0");
@@ -6008,7 +6172,8 @@ function openInlineEditor(options) {
   container.appendChild(ta);
   const svg = container.querySelector("svg");
   let done = false;
-  const prevOpacity = fo.style.opacity;
+  const prevVisibility = fo.style.visibility;
+  let lastKey = "";
   const place = () => {
     var _a2, _b2;
     const rect = fo.getBoundingClientRect();
@@ -6016,15 +6181,21 @@ function openInlineEditor(options) {
     const rawW = Number.parseFloat((_a2 = fo.getAttribute("width")) != null ? _a2 : "") || rect.width;
     const rawH = Number.parseFloat((_b2 = fo.getAttribute("height")) != null ? _b2 : "") || rect.height;
     const scale = rawW > 0 ? rect.width / rawW : 1;
+    const key = `${rect.left},${rect.top},${rawW},${rawH},${scale}|${ta.value}`;
+    if (key === lastKey)
+      return false;
+    lastKey = key;
     const pad = cardPad(fo, card);
     ta.style.left = `${rect.left - base.left - pad.x * scale}px`;
     ta.style.top = `${rect.top - base.top - pad.y * scale}px`;
-    ta.style.width = `${rawW + pad.x * 2 + 2}px`;
+    const minWidth = (Number.parseFloat(cs.fontSize) || 16) * MIN_EDIT_COLS;
+    ta.style.width = `${Math.max(rawW + pad.x * 2 + 2, minWidth)}px`;
     ta.style.padding = `${pad.y}px ${pad.x}px`;
     ta.style.transform = `scale(${scale})`;
     ta.style.height = "1px";
     const needed = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
+    return true;
   };
   let frame2 = 0;
   const reposition = () => {
@@ -6037,14 +6208,21 @@ function openInlineEditor(options) {
     });
   };
   let follow = 0;
+  let lastMoveAt = performance.now();
   const followUntil = performance.now() + 420;
   const followLoop = () => {
     if (done) {
       follow = 0;
       return;
     }
-    place();
-    follow = performance.now() < followUntil ? window.requestAnimationFrame(followLoop) : 0;
+    if (place())
+      lastMoveAt = performance.now();
+    const now2 = performance.now();
+    if (now2 - lastMoveAt > 240 || now2 >= followUntil) {
+      follow = 0;
+      return;
+    }
+    follow = window.requestAnimationFrame(followLoop);
   };
   follow = window.requestAnimationFrame(followLoop);
   const cleanup = () => {
@@ -6063,7 +6241,7 @@ function openInlineEditor(options) {
     ta.removeEventListener("wheel", stop);
     svg == null ? void 0 : svg.removeEventListener("wheel", reposition, true);
     window.removeEventListener("resize", reposition);
-    fo.style.opacity = prevOpacity;
+    fo.style.visibility = prevVisibility;
     ta.remove();
   };
   const finish = (action) => {
@@ -6101,12 +6279,9 @@ function openInlineEditor(options) {
     }
     if (e.key === "Tab") {
       e.preventDefault();
-      finish(e.shiftKey ? "outdent" : "indent");
+      e.stopPropagation();
+      finish(e.shiftKey ? "outdent" : "commit");
       return;
-    }
-    if (e.key === "Backspace" && ta.value.trim() === "") {
-      e.preventDefault();
-      finish("delete");
     }
   }
   ta.addEventListener("keydown", onKeyDown);
@@ -6116,7 +6291,7 @@ function openInlineEditor(options) {
   ta.addEventListener("wheel", stop);
   svg == null ? void 0 : svg.addEventListener("wheel", reposition, true);
   window.addEventListener("resize", reposition);
-  fo.style.opacity = "0";
+  fo.style.visibility = "hidden";
   place();
   ta.focus();
   if (options.selectAll)
@@ -6482,115 +6657,6 @@ function pathOf(g) {
   return typeof path2 === "string" ? path2 : "";
 }
 
-// src/edit/text.ts
-function quoteOf(src) {
-  const m = /^(?:\s*>\s?)+/.exec(src.full);
-  return m ? m[0] : "";
-}
-function markOf(src) {
-  return src.full.slice(quoteOf(src).length + src.indent.length, src.bodyStart);
-}
-function rewriteNode(src, text, checked, indent) {
-  const quote = quoteOf(src);
-  let mark = markOf(src);
-  const want = checked === void 0 ? src.checked : checked;
-  if (src.checked !== null && want !== src.checked) {
-    mark = mark.replace(/\[[ xX]\](?=\s*$)/, want ? "[x]" : "[ ]");
-  }
-  const nextIndent = indent === void 0 ? src.indent : indent;
-  return quote + nextIndent + mark + text + src.full.slice(src.bodyEnd);
-}
-function indentBy(src, delta, step) {
-  const unit = src.indent.includes("	") ? "	" : " ".repeat(Math.max(1, step));
-  if (delta > 0)
-    return src.indent + unit;
-  if (delta < 0) {
-    if (src.indent.length === 0)
-      return null;
-    return src.indent.slice(0, Math.max(0, src.indent.length - unit.length));
-  }
-  return src.indent;
-}
-function parseEditorValue(src, raw) {
-  let text = raw.trim();
-  let checked = src.checked;
-  if (src.checked !== null) {
-    const m = /^([☐☑])\s*/u.exec(text);
-    if (m) {
-      checked = m[1] === "\u2611";
-      text = text.slice(m[0].length).trim();
-    }
-  }
-  text = text.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
-  return { text, checked };
-}
-
-// src/edit/create.ts
-var MAX_HEADING = 6;
-var NEW_NODE_TEXT = "\u65B0\u8282\u70B9";
-function subtreeEndOf(src, nodes) {
-  let end = src.line;
-  for (const n of nodes) {
-    if (n.line <= src.line)
-      continue;
-    if (n.depth > src.depth) {
-      end = n.line;
-      continue;
-    }
-    break;
-  }
-  return end;
-}
-function resetOrdered(mark) {
-  return mark.replace(/^(\s*)\d{1,9}([.)]\s+)/, "$11$2");
-}
-function planCreate(input) {
-  var _a, _b;
-  const { src, nodes, step, unit, mode } = input;
-  const text = (_a = input.placeholder) != null ? _a : NEW_NODE_TEXT;
-  const insertAfterLine = subtreeEndOf(src, nodes);
-  const focusLine = insertAfterLine + 1;
-  if (mode === "sibling") {
-    const quote = quoteOf(src);
-    let mark2 = markOf(src);
-    if (!src.heading)
-      mark2 = resetOrdered(mark2);
-    return {
-      ok: true,
-      plan: { insertAfterLine, focusLine, line: quote + src.indent + mark2 + text }
-    };
-  }
-  if (src.heading) {
-    const level = ((_b = src.level) != null ? _b : 1) + 1;
-    if (level > MAX_HEADING) {
-      return { ok: false, reason: `\u6807\u9898\u6700\u591A ${MAX_HEADING} \u7EA7\uFF0C\u6CA1\u6CD5\u518D\u52A0\u5B50\u7EA7` };
-    }
-    const quote = quoteOf(src);
-    return {
-      ok: true,
-      plan: {
-        insertAfterLine,
-        focusLine,
-        line: `${quote}${"#".repeat(level)} ${text}`
-      }
-    };
-  }
-  const cols = colsOfIndent(src.indent) + Math.max(1, step);
-  const indent = indentOfCols(cols, unit);
-  let mark = markOf(src);
-  if (src.checked !== null)
-    mark = mark.replace(/\[[ xX]\]\s*$/, "[ ] ");
-  mark = resetOrdered(mark);
-  return {
-    ok: true,
-    plan: {
-      insertAfterLine,
-      focusLine,
-      line: quoteOf(src) + indent + mark + text
-    }
-  };
-}
-
 // src/edit/move.ts
 var HEADING_RE = /^(#{1,6})(\s+)/;
 var QUOTE_PREFIX = /^(?:\s*>\s?)+/;
@@ -6726,6 +6792,326 @@ function moveNode(input) {
   }
   return { ok: true, lines: rest };
 }
+function moveNodes(input) {
+  var _a;
+  const { lines, nodes, step, targetLine, mode, srcLines } = input;
+  const unit = (_a = input.unit) != null ? _a : "";
+  const tgtIdx = nodes.findIndex((n) => n.line === targetLine);
+  if (tgtIdx < 0)
+    return { ok: false, reason: "\u627E\u4E0D\u5230\u76EE\u6807\u8282\u70B9" };
+  const tgt = nodes[tgtIdx];
+  const tgtBlock = blockRange(nodes, tgtIdx);
+  const blocks = [];
+  for (const ln of srcLines) {
+    const i = nodes.findIndex((n) => n.line === ln);
+    if (i < 0)
+      continue;
+    const src = nodes[i];
+    if (src.depth === 0)
+      return { ok: false, reason: "\u6839\u8282\u70B9\u4E0D\u80FD\u79FB\u52A8" };
+    const sb = blockRange(nodes, i);
+    if (targetLine >= sb.start && targetLine <= sb.end) {
+      return { ok: false, reason: "\u4E0D\u80FD\u79FB\u5230\u81EA\u5DF1\u7684\u5B50\u8282\u70B9\u4E0B\u9762" };
+    }
+    if (src.heading && !tgt.heading) {
+      return { ok: false, reason: "\u6807\u9898\u4E0D\u80FD\u62D6\u5230\u6B63\u6587\u8282\u70B9\u4E0A" };
+    }
+    if (!src.heading && tgt.heading && mode !== "child") {
+      return { ok: false, reason: "\u6B63\u6587\u4E0D\u80FD\u548C\u6807\u9898\u5E73\u7EA7\uFF0C\u53EA\u80FD\u62D6\u5230\u6807\u9898\u4E0A\u5F53\u5B50\u8282\u70B9" };
+    }
+    blocks.push({ start: sb.start, end: sb.end, idx: i });
+  }
+  if (blocks.length === 0)
+    return { ok: false, reason: "\u627E\u4E0D\u5230\u6E90\u8282\u70B9" };
+  blocks.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < blocks.length; i++) {
+    if (blocks[i].start <= blocks[i - 1].end) {
+      return { ok: false, reason: "\u9009\u4E2D\u7684\u8282\u70B9\u5B58\u5728\u5D4C\u5957\uFF0C\u65E0\u6CD5\u6574\u4F53\u79FB\u52A8" };
+    }
+  }
+  const insertAfterHeading = mode === "child" && tgt.heading;
+  const rawInsertAt = insertAfterHeading ? tgt.line + 1 : mode === "before" ? tgt.line : Math.min(tgtBlock.end + 1, lines.length);
+  const extracted = blocks.map((b) => {
+    var _a2, _b;
+    const src = nodes[b.idx];
+    const block = lines.slice(b.start, b.end + 1);
+    if (src.heading) {
+      const srcLevel = (_a2 = src.level) != null ? _a2 : 1;
+      const tgtLevel = (_b = tgt.level) != null ? _b : 1;
+      const newLevel = mode === "child" ? tgtLevel + 1 : tgtLevel;
+      if (newLevel > 6)
+        return { block, bad: "\u6807\u9898\u5C42\u7EA7\u8D85\u8FC7 6 \u7EA7\u4E86" };
+      return { block: rewriteHeadingBlock(block, srcLevel, newLevel) };
+    }
+    const srcCols = colsOf(src.full);
+    const tgtCols = colsOf(tgt.full);
+    let newCols;
+    if (mode === "child") {
+      const childCols = childIndentCols(nodes, tgtIdx);
+      if (childCols !== null)
+        newCols = childCols;
+      else if (tgt.heading)
+        newCols = 0;
+      else
+        newCols = tgtCols + step;
+    } else {
+      newCols = tgtCols;
+    }
+    return { block: shiftBlock(block, newCols - srcCols, unit, step) };
+  });
+  for (const e of extracted) {
+    if (e.bad)
+      return { ok: false, reason: e.bad };
+  }
+  let rest = lines.slice();
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    rest.splice(blocks[i].start, blocks[i].end - blocks[i].start + 1);
+  }
+  let before = 0;
+  for (const b of blocks) {
+    for (let l = b.start; l <= b.end; l++)
+      if (l < rawInsertAt)
+        before++;
+  }
+  let insertAt = rawInsertAt - before;
+  if (insertAt < 0)
+    insertAt = 0;
+  const rewritten = extracted.map((e) => e.block).flat();
+  rest.splice(insertAt, 0, ...rewritten);
+  if (rest.join("\n") === lines.join("\n")) {
+    return { ok: false, reason: "\u4F4D\u7F6E\u6CA1\u6709\u53D8\u5316" };
+  }
+  return { ok: true, lines: rest };
+}
+
+// src/edit/boxSelect.ts
+var BOX_THRESHOLD = 5;
+var BoxSelectController = class {
+  constructor(svg, container, cb) {
+    this.layer = null;
+    this.box = null;
+    /** 是否在空白区按下了左键（起手） */
+    this.armed = false;
+    /** 位移超过阈值后才算真正框选 */
+    this.active = false;
+    this.startX = 0;
+    this.startY = 0;
+    this.endX = 0;
+    this.endY = 0;
+    this.additive = false;
+    // -------------------------------------------------------------------------
+    this.onAbort = () => {
+      if (this.armed)
+        this.reset();
+    };
+    this.onPointerDown = (e) => {
+      if (e.button !== 0)
+        return;
+      const el = e.target;
+      if (el.closest("g.markmap-node") || el.closest("a") || el.closest("circle"))
+        return;
+      this.armed = true;
+      this.active = false;
+      this.startX = e.clientX;
+      this.startY = e.clientY;
+      this.endX = e.clientX;
+      this.endY = e.clientY;
+      this.additive = e.ctrlKey || e.metaKey || e.shiftKey;
+      document.body.style.userSelect = "none";
+      document.body.style.webkitUserSelect = "none";
+    };
+    this.onPointerMove = (e) => {
+      if (!this.armed)
+        return;
+      this.endX = e.clientX;
+      this.endY = e.clientY;
+      if (!this.active) {
+        if (Math.hypot(e.clientX - this.startX, e.clientY - this.startY) < BOX_THRESHOLD)
+          return;
+        this.active = true;
+        this.ensureLayer();
+      }
+      this.renderBox();
+    };
+    this.onPointerUp = (e) => {
+      if (!this.armed)
+        return;
+      const wasActive = this.active;
+      this.reset();
+      if (!wasActive)
+        return;
+      e.preventDefault();
+      e.stopPropagation();
+      swallowNextClick2();
+      const lines = this.computeSelection();
+      this.cb.onSelect(lines, this.additive);
+    };
+    this.onKeyDown = (e) => {
+      if (e.key === "Escape" && this.armed)
+        this.reset();
+    };
+    this.svg = svg;
+    this.container = container;
+    this.cb = cb;
+    svg.addEventListener("pointerdown", this.onPointerDown, true);
+    window.addEventListener("pointermove", this.onPointerMove, true);
+    window.addEventListener("pointerup", this.onPointerUp, true);
+    window.addEventListener("keydown", this.onKeyDown, true);
+    window.addEventListener("blur", this.onAbort);
+    window.addEventListener("pointercancel", this.onAbort);
+  }
+  destroy() {
+    var _a;
+    this.svg.removeEventListener("pointerdown", this.onPointerDown, true);
+    window.removeEventListener("pointermove", this.onPointerMove, true);
+    window.removeEventListener("pointerup", this.onPointerUp, true);
+    window.removeEventListener("keydown", this.onKeyDown, true);
+    window.removeEventListener("blur", this.onAbort);
+    window.removeEventListener("pointercancel", this.onAbort);
+    this.reset();
+    (_a = this.layer) == null ? void 0 : _a.remove();
+    this.layer = null;
+  }
+  // -------------------------------------------------------------------------
+  reset() {
+    this.armed = false;
+    this.active = false;
+    document.body.style.userSelect = "";
+    document.body.style.webkitUserSelect = "";
+    if (this.box)
+      this.box.style.display = "none";
+  }
+  /** 节点卡片的外框（屏幕坐标），与 DragController 同款判定 */
+  cardBoxOf(g) {
+    var _a;
+    const card = g.querySelector(":scope > rect.obmind-node-card");
+    const el = (_a = card != null ? card : g.querySelector("foreignObject")) != null ? _a : g;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0)
+      return null;
+    return r;
+  }
+  /** 矩形与框选相交的节点行号 */
+  computeSelection() {
+    const x1 = Math.min(this.startX, this.endX);
+    const y1 = Math.min(this.startY, this.endY);
+    const x2 = Math.max(this.startX, this.endX);
+    const y2 = Math.max(this.startY, this.endY);
+    const out = [];
+    for (const g of Array.from(this.svg.querySelectorAll("g.markmap-node"))) {
+      const r = this.cardBoxOf(g);
+      if (!r)
+        continue;
+      if (r.right < x1 || r.left > x2 || r.bottom < y1 || r.top > y2)
+        continue;
+      const src = this.cb.srcOf(g);
+      if (src && src.line >= 0)
+        out.push(src.line);
+    }
+    return out;
+  }
+  ensureLayer() {
+    if (this.layer)
+      return;
+    const layer = document.createElement("div");
+    layer.className = "obmind-select-layer";
+    const box = document.createElement("div");
+    box.className = "obmind-select-box";
+    layer.appendChild(box);
+    this.container.appendChild(layer);
+    this.layer = layer;
+    this.box = box;
+  }
+  renderBox() {
+    const box = this.box;
+    if (!box)
+      return;
+    const base = this.container.getBoundingClientRect();
+    const left = Math.min(this.startX, this.endX) - base.left;
+    const top = Math.min(this.startY, this.endY) - base.top;
+    const width = Math.abs(this.endX - this.startX);
+    const height = Math.abs(this.endY - this.startY);
+    box.style.display = "block";
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+  }
+};
+function swallowNextClick2() {
+  const swallow = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  document.addEventListener("click", swallow, true);
+  window.setTimeout(() => document.removeEventListener("click", swallow, true), 0);
+}
+
+// src/edit/create.ts
+var MAX_HEADING = 6;
+var NEW_NODE_TEXT = "\u65B0\u8282\u70B9";
+function subtreeEndOf(src, nodes) {
+  let end = src.line;
+  for (const n of nodes) {
+    if (n.line <= src.line)
+      continue;
+    if (n.depth > src.depth) {
+      end = n.line;
+      continue;
+    }
+    break;
+  }
+  return end;
+}
+function resetOrdered(mark) {
+  return mark.replace(/^(\s*)\d{1,9}([.)]\s+)/, "$11$2");
+}
+function planCreate(input) {
+  var _a, _b;
+  const { src, nodes, step, unit, mode } = input;
+  const text = (_a = input.placeholder) != null ? _a : NEW_NODE_TEXT;
+  const insertAfterLine = subtreeEndOf(src, nodes);
+  const focusLine = insertAfterLine + 1;
+  if (mode === "sibling") {
+    const quote = quoteOf(src);
+    let mark2 = markOf(src);
+    if (!src.heading)
+      mark2 = resetOrdered(mark2);
+    return {
+      ok: true,
+      plan: { insertAfterLine, focusLine, line: quote + src.indent + mark2 + text }
+    };
+  }
+  if (src.heading) {
+    const level = ((_b = src.level) != null ? _b : 1) + 1;
+    if (level > MAX_HEADING) {
+      return { ok: false, reason: `\u6807\u9898\u6700\u591A ${MAX_HEADING} \u7EA7\uFF0C\u6CA1\u6CD5\u518D\u52A0\u5B50\u7EA7` };
+    }
+    const quote = quoteOf(src);
+    return {
+      ok: true,
+      plan: {
+        insertAfterLine,
+        focusLine,
+        line: `${quote}${"#".repeat(level)} ${text}`
+      }
+    };
+  }
+  const cols = colsOfIndent(src.indent) + Math.max(1, step);
+  const indent = indentOfCols(cols, unit);
+  let mark = markOf(src);
+  if (src.checked !== null)
+    mark = mark.replace(/\[[ xX]\]\s*$/, "[ ] ");
+  mark = resetOrdered(mark);
+  return {
+    ok: true,
+    plan: {
+      insertAfterLine,
+      focusLine,
+      line: quoteOf(src) + indent + mark + text
+    }
+  };
+}
 
 // src/app/EditService.ts
 var none2 = (reason) => ({ kind: "none", reason });
@@ -6751,9 +7137,9 @@ var EditService = class {
     return (_a = snap.nodes.find((n) => n.line === line)) != null ? _a : null;
   }
   /**
-   * 编辑框结束：改字 / 缩进 / 新建同级 / 删除。
+   * 编辑框结束：改字 / 缩进 / 新建同级 / 新建子级 / 删除。
    *
-   * 其中「新建同级」是最容易写错的一条：新行不能插在下一行，而要插在
+   * 其中「新建同级 / 子级」最容易写错的一条：新行不能插在下一行，而要插在
    * **整棵子树之后**。父节点有孩子时，下一行是它的第一个孩子 ——
    * 插在那里会被缩进规则判成孩子，越加越深。
    */
@@ -6763,18 +7149,15 @@ var EditService = class {
     if (action === "cancel")
       return none2("\u5DF2\u53D6\u6D88");
     const parsed = parseEditorValue(src, value);
-    if (parsed.text === "" && action !== "delete")
-      return none2("\u7A7A\u6587\u672C\u4E0D\u5199\u5165");
-    if (action === "delete") {
-      return { kind: "write", op: this.removeOp(snap, src) };
-    }
-    if (action === "sibling") {
+    if (parsed.text === "")
+      return none2("\u6587\u672C\u4E3A\u7A7A\uFF0C\u4FDD\u6301\u539F\u6837");
+    if (action === "sibling" || action === "child") {
       const plan = planCreate({
         src,
         nodes: snap.nodes,
         step: snap.step,
         unit: snap.unit,
-        mode: "sibling"
+        mode: action
       });
       if (!plan.ok)
         return error(plan.reason);
@@ -6880,18 +7263,89 @@ var EditService = class {
     };
   }
   /**
+   * 整体移动一组节点（框选后整体拖动）。
+   *
+   * 与单节点 move 一样整篇重写：一次移动多块，中间任何瞬间都不该出现「半截笔记」。
+   */
+  moveGroup(input) {
+    const res = moveNodes({
+      lines: input.snap.content.split("\n"),
+      nodes: [...input.snap.nodes],
+      step: input.snap.step,
+      unit: input.snap.unit,
+      srcLines: input.srcLines,
+      targetLine: input.targetLine,
+      mode: input.mode
+    });
+    if (!res.ok)
+      return error(res.reason);
+    return {
+      kind: "write",
+      op: {
+        kind: "whole",
+        content: res.lines.join("\n"),
+        expect: input.snap.content
+      }
+    };
+  }
+  /**
    * 删除节点（画布上按 Delete/Backspace）。
    *
    * 删的是**整棵子树**：一行 + 它下面所有更深缩进的行。只删一行的话，
    * 子节点会失去父节点、被缩进规则挂到更上层，导图结构在用户眼里就乱了。
+   *
+   * 这是**唯一的删除入口**：编辑框不产出删除（见 commit 里的说明）。
+   *
+   * @returns focusLine 删完之后该选中的行 —— 父节点。父节点在删除区间之前，
+   *          行号不受这次写入影响，可以原样用来恢复选中框。
    */
-  remove(input) {
-    const src = this.nodeAt(input.snap, input.line);
-    if (!src)
-      return error("\u627E\u4E0D\u5230\u8981\u5220\u9664\u7684\u8282\u70B9");
-    if (src.depth === 0)
-      return error("\u6839\u8282\u70B9\u662F\u7B14\u8BB0\u672C\u8EAB\uFF0C\u5220\u4E0D\u4E86");
-    return { kind: "write", op: this.removeOp(input.snap, src) };
+  removeGroup(input) {
+    const nodes = [...input.snap.nodes];
+    const lines = input.snap.content.split("\n");
+    const ranges = [];
+    for (const ln of input.lines) {
+      const idx = nodes.findIndex((n) => n.line === ln);
+      if (idx < 0)
+        continue;
+      const src = nodes[idx];
+      if (src.depth === 0)
+        continue;
+      const r = blockRange(nodes, idx);
+      ranges.push([r.start, r.end]);
+    }
+    if (ranges.length === 0)
+      return error("\u6CA1\u6709\u53EF\u5220\u9664\u7684\u8282\u70B9");
+    ranges.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1] + 1) {
+        last[1] = Math.max(last[1], r[1]);
+      } else {
+        merged.push([r[0], r[1]]);
+      }
+    }
+    const removeSet = /* @__PURE__ */ new Set();
+    for (const [s, e] of merged) {
+      for (let i = s; i <= e; i++)
+        removeSet.add(i);
+    }
+    const newLines = lines.filter((_2, i) => !removeSet.has(i));
+    if (newLines.join("\n") === lines.join("\n"))
+      return none2("\u5185\u5BB9\u6CA1\u6709\u53D8\u5316");
+    const firstRemoved = merged[0][0];
+    const parentLine = this.parentLineOf(input.snap, firstRemoved);
+    const nextLine = newLines.length > firstRemoved ? firstRemoved : -1;
+    const focusLine = parentLine >= 0 ? parentLine : nextLine;
+    return {
+      kind: "write",
+      op: {
+        kind: "whole",
+        content: newLines.join("\n"),
+        expect: input.snap.content
+      },
+      focusLine: focusLine >= 0 ? focusLine : void 0
+    };
   }
   /** 某个节点在树里的父节点行号；根节点返回 -1（删完用它把选中挪过去） */
   parentLineOf(snap, line) {
@@ -6913,26 +7367,6 @@ var EditService = class {
     if (!src)
       return 0;
     return subtreeEndOf(src, snap.nodes) - src.line + 1;
-  }
-  /**
-   * 删除用的行区间：从该行到子树最后一行。
-   *
-   * 首尾都要锚定：跨越多行时，中间任何一行被外部改过，写入都必须放弃，
-   * 否则会拿旧内容覆盖用户刚敲的字。
-   */
-  removeOp(snap, src) {
-    var _a;
-    const end = subtreeEndOf(src, snap.nodes);
-    const lines = snap.content.split("\n");
-    const span = {
-      start: src.line,
-      end: end + 1,
-      lines: [],
-      checkLine: src.line,
-      checkText: src.full,
-      checkEnd: end > src.line ? { line: end, text: (_a = lines[end]) != null ? _a : "" } : void 0
-    };
-    return { kind: "span", span };
   }
 };
 
@@ -7068,6 +7502,103 @@ var QueryService = class {
   }
 };
 
+// src/app/notePlan.ts
+var WIKILINK_RE = /\[\[[^\[\]]+\]\]/;
+function hasWikiLink(text) {
+  return WIKILINK_RE.test(text);
+}
+function plainTextOf(md) {
+  let s = md;
+  s = s.replace(/`([^`]*)`/g, "$1");
+  s = s.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1");
+  s = s.replace(/<\/?[a-zA-Z][^>]*>/g, "");
+  s = s.replace(/(\*\*|__)(.*?)\1/g, "$2");
+  s = s.replace(/~~(.*?)~~/g, "$1");
+  s = s.replace(/==(.*?)==/g, "$1");
+  s = s.replace(/(^|[^*])\*([^*]+)\*/g, "$1$2");
+  s = s.replace(/(^|[^_])_([^_]+)_/g, "$1$2");
+  s = s.replace(/\$([^$]+)\$/g, "$1");
+  s = s.replace(/^[☐☑]\s*/u, "");
+  return s.replace(/\s+/g, " ").trim();
+}
+var ILLEGAL_NAME_CHARS = /[\\/:*?"<>|#^[\]]/g;
+var MAX_NAME = 80;
+function sanitizeFileName(name) {
+  const out = name.replace(ILLEGAL_NAME_CHARS, " ").replace(/\s+/g, " ").trim().replace(/[. ]+$/g, "");
+  return out.length > MAX_NAME ? out.slice(0, MAX_NAME).trim() : out;
+}
+function noteTitleOf(md) {
+  return sanitizeFileName(plainTextOf(md));
+}
+function normalizeDir(path2) {
+  return (path2 != null ? path2 : "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+function resolveNoteFolder(input) {
+  if (input.location === "folder")
+    return normalizeDir(input.folder);
+  if (input.location === "current") {
+    const path2 = normalizeDir(input.currentPath);
+    const cut = path2.lastIndexOf("/");
+    return cut < 0 ? "" : path2.slice(0, cut);
+  }
+  return "";
+}
+function notePathOf(folder, title) {
+  const dir = normalizeDir(folder);
+  return dir === "" ? `${title}.md` : `${dir}/${title}.md`;
+}
+var DEFAULT_DATE_FORMAT = "YYYY-MM-DD";
+var DEFAULT_TIME_FORMAT = "HH:mm";
+function formatDate(d, fmt) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const table = {
+    YYYY: String(d.getFullYear()),
+    YY: String(d.getFullYear()).slice(-2),
+    MM: pad(d.getMonth() + 1),
+    M: String(d.getMonth() + 1),
+    DD: pad(d.getDate()),
+    D: String(d.getDate()),
+    HH: pad(d.getHours()),
+    H: String(d.getHours()),
+    mm: pad(d.getMinutes()),
+    m: String(d.getMinutes()),
+    ss: pad(d.getSeconds()),
+    s: String(d.getSeconds())
+  };
+  return fmt.replace(/YYYY|YY|MM|M|DD|D|HH|H|mm|m|ss|s/g, (t) => {
+    var _a;
+    return (_a = table[t]) != null ? _a : t;
+  });
+}
+var TOKEN_RE = /\{\{\s*(title|date|time|from)(?:\s*:\s*([^}]+?))?\s*\}\}/gi;
+function applyTemplate(raw, vars) {
+  var _a;
+  const now2 = (_a = vars.now) != null ? _a : /* @__PURE__ */ new Date();
+  return raw.replace(
+    TOKEN_RE,
+    (whole, name, fmt) => {
+      switch (name.toLowerCase()) {
+        case "title":
+          return vars.title;
+        case "from":
+          return vars.from ? linkLiteral(vars.from) : "";
+        case "date":
+          return formatDate(now2, (fmt == null ? void 0 : fmt.trim()) || DEFAULT_DATE_FORMAT);
+        case "time":
+          return formatDate(now2, (fmt == null ? void 0 : fmt.trim()) || DEFAULT_TIME_FORMAT);
+        default:
+          return whole;
+      }
+    }
+  );
+}
+function linkLiteral(title, alias) {
+  const shown = (alias != null ? alias : "").replace(/\|/g, "").trim();
+  if (shown === "" || shown === title)
+    return `[[${title}]]`;
+  return `[[${title}|${shown}]]`;
+}
+
 // src/app/History.ts
 var HISTORY_LIMIT = 40;
 var EMPTY_HISTORY = { past: [], future: [] };
@@ -7133,6 +7664,9 @@ function buildToolbar(parent, spec) {
   const el = parent.createDiv({ cls: "obmind-toolbars" });
   const rowEl = el.createDiv({ cls: "obmind-toolbar" });
   const buttons = /* @__PURE__ */ new Map();
+  const specs = /* @__PURE__ */ new Map();
+  if (spec.brand)
+    rowEl.createSpan({ cls: "obmind-brand", text: spec.brand });
   if (spec.leading)
     rowEl.appendChild(spec.leading);
   let firstGroup = true;
@@ -7145,9 +7679,12 @@ function buildToolbar(parent, spec) {
     }
     for (const item of group.buttons) {
       buttons.set(item.id, createIconButton(rowEl, item, spec.onAction));
+      specs.set(item.id, item);
     }
     firstGroup = false;
   }
+  if (spec.trailing)
+    rowEl.appendChild(spec.trailing);
   return {
     el,
     setEnabled(id2, on) {
@@ -7157,10 +7694,33 @@ function buildToolbar(parent, spec) {
       if (btn.disabled === !on)
         return;
       btn.disabled = !on;
+    },
+    setActive(id2, on, label) {
+      const btn = buttons.get(id2);
+      const item = specs.get(id2);
+      if (!btn || !item)
+        return;
+      const changed = btn.classList.contains("is-active") !== on;
+      if (!changed && !label)
+        return;
+      if (changed)
+        btn.classList.toggle("is-active", on);
+      if (changed && item.iconActive)
+        (0, import_obsidian2.setIcon)(btn, on ? item.iconActive : item.icon);
+      btn.setAttribute(
+        "aria-label",
+        label != null ? label : item.key ? `${item.label}\uFF08${item.key}\uFF09` : item.label
+      );
     }
   };
 }
 var GLOBAL_GROUPS = [
+  // 钉住排在最前：它决定「这张图跟着谁走」，比后面所有操作都更靠近「我在看哪篇」
+  {
+    buttons: [
+      { id: "pin", icon: "pin", label: "\u9489\u4F4F\u5F53\u524D\u5BFC\u56FE", fallback: "\u9489" }
+    ]
+  },
   {
     buttons: [
       { id: "undo", icon: "undo-2", label: "\u64A4\u9500", key: "Ctrl+Z", fallback: "\u64A4" },
@@ -7188,6 +7748,9 @@ var NODE_GROUPS = [
     buttons: [
       { id: "child", icon: "corner-down-right", label: "\u65B0\u5EFA\u5B50\u7EA7", key: "Tab", fallback: "\u5B50" },
       { id: "sibling", icon: "plus", label: "\u65B0\u5EFA\u540C\u7EA7", key: "Enter", fallback: "\u540C" },
+      // 「建笔记」紧跟着两个「建节点」：用户心里它们是同一类动作（从这一行长出东西），
+      // 只是长出来的是节点还是一篇笔记。它只在节点还没有双链时出现（见 syncToolbar）。
+      { id: "newNote", icon: "file-plus", label: "\u65B0\u5EFA\u7B14\u8BB0\u5E76\u53CC\u94FE", key: "Ctrl+N", fallback: "\u8BB0" },
       { id: "edit", icon: "pencil", label: "\u7F16\u8F91\u8282\u70B9", key: "F2 / \u53CC\u51FB", fallback: "\u6539" },
       { id: "outdent", icon: "corner-up-left", label: "\u63D0\u5347\u4E00\u7EA7", key: "Shift+Tab", fallback: "\u63D0" }
     ]
@@ -7204,34 +7767,29 @@ var NODE_GROUPS = [
   }
 ];
 
-// src/ui/nodeBar.ts
+// src/ui/nodeBarPosition.ts
 function nodeBarPosition(a) {
-  var _a, _b;
-  const gap = (_a = a.gap) != null ? _a : 6;
-  const margin = (_b = a.margin) != null ? _b : 4;
-  const { target, host, bar } = a;
-  const center = target.left + target.width / 2 - bar.width / 2;
-  const left = Math.min(
-    Math.max(center, margin),
-    Math.max(margin, host.width - bar.width - margin)
-  );
-  let top = target.bottom + gap;
-  if (top + bar.height > host.height - margin) {
-    const above = target.top - bar.height - gap;
-    top = above >= margin ? above : Math.max(margin, host.height - bar.height - margin);
-  }
-  return { left: Math.round(left), top: Math.round(top) };
+  var _a;
+  const margin = (_a = a.margin) != null ? _a : 8;
+  const { host, bar } = a;
+  const left = Math.max(margin, host.width - bar.width - margin);
+  const centered = Math.round((host.height - bar.height) / 2);
+  const maxTop = Math.max(margin, host.height - bar.height - margin);
+  const top = Math.min(Math.max(centered, margin), maxTop);
+  return { left: Math.round(left), top };
 }
+
+// src/ui/nodeBar.ts
 var CLS = "obmind-nodebar";
 var NodeBar = class {
   constructor(host, spec, onAction) {
-    this.target = null;
-    this.frame = 0;
+    this.visible = false;
     this.lastLeft = Number.NaN;
     this.lastTop = Number.NaN;
     this.barW = 0;
     this.barH = 0;
     this.buttons = /* @__PURE__ */ new Map();
+    var _a;
     this.host = host;
     this.el = host.createDiv({ cls: `${CLS} is-out` });
     let first = true;
@@ -7246,26 +7804,33 @@ var NodeBar = class {
       }
       first = false;
     }
-  }
-  /** 换一个目标节点；传 null 收起。同一个目标重复调用只重新定位（重建后 g 会换） */
-  attach(target) {
-    if (target === this.target) {
-      if (target)
+    this.observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => {
+      if (this.visible)
         this.place();
+    });
+    (_a = this.observer) == null ? void 0 : _a.observe(host);
+  }
+  /**
+   * 显示 / 收起。
+   *
+   * 只收一个布尔而不是目标节点：位置已经和「哪个节点」无关了。
+   * 多选时由调用方传 false（那五个动作语义都是「对这一个节点」）。
+   */
+  setVisible(on) {
+    if (on === this.visible)
       return;
-    }
-    this.target = target;
-    if (!target) {
-      this.close();
+    this.visible = on;
+    if (!on) {
+      this.el.removeClass("is-in");
+      this.el.addClass("is-out");
       return;
     }
     this.lastLeft = Number.NaN;
     this.lastTop = Number.NaN;
-    this.el.removeClass("is-out");
     this.measure();
     this.place();
+    this.el.removeClass("is-out");
     this.el.addClass("is-in");
-    this.start();
   }
   setEnabled(id2, on) {
     const btn = this.buttons.get(id2);
@@ -7275,73 +7840,52 @@ var NodeBar = class {
       return;
     btn.disabled = !on;
   }
+  /**
+   * 显隐某个按钮（不是置灰）。
+   *
+   * 「新建笔记」这类入口是**条件性**的：节点已经有双链时它没有任何意义，
+   * 留一个永久灰掉的图标在那里，用户只会反复点它试为什么不能点。
+   * 隐藏之后条子变窄，右对齐的位置要重算 —— 否则会偏离右边缘一格按钮的宽度。
+   */
+  setHidden(id2, on) {
+    const btn = this.buttons.get(id2);
+    if (!btn)
+      return;
+    if (btn.hasClass("is-gone") === on)
+      return;
+    btn.toggleClass("is-gone", on);
+    if (!this.visible)
+      return;
+    this.measure();
+    this.lastLeft = Number.NaN;
+    this.lastTop = Number.NaN;
+    this.place();
+  }
   destroy() {
-    this.stop();
-    this.target = null;
+    var _a;
+    (_a = this.observer) == null ? void 0 : _a.disconnect();
+    this.visible = false;
     this.el.remove();
   }
   /**
    * 尺寸只量一次。
    *
-   * 每帧都读 offsetWidth 会触发样式/布局重算；浮层内容和字号在生命周期内
-   * 不会变，量大一次就够。
+   * 每帧都读 offsetWidth 会触发样式/布局重算；条子内容是固定的五个图标，
+   * 字号变了也只会在下一轮 attach 时重新量。
    */
   measure() {
     this.barW = this.el.offsetWidth;
     this.barH = this.el.offsetHeight;
   }
-  close() {
-    this.stop();
-    this.el.removeClass("is-in");
-    this.el.addClass("is-out");
-  }
-  /**
-   * 跟随用 rAF 循环，而不是在各个地方挂监听。
-   *
-   * 会让卡片移动的东西太多了：滚轮缩放、拖动画布、折叠展开、重建、侧栏宽度变化。
-   * 每个都挂一遍必然漏掉某一个（之前编辑框就漏过折叠动画）。循环只在选中期间跑，
-   * 且位置没变就不写 style —— 静止时每帧只有一次 getBoundingClientRect。
-   */
-  start() {
-    if (this.frame !== 0)
-      return;
-    const loop = () => {
-      this.frame = window.requestAnimationFrame(loop);
-      this.place();
-    };
-    this.frame = window.requestAnimationFrame(loop);
-  }
-  stop() {
-    if (this.frame === 0)
-      return;
-    window.cancelAnimationFrame(this.frame);
-    this.frame = 0;
-  }
   place() {
-    const g = this.target;
-    if (!g)
+    if (!this.visible)
       return;
-    if (!g.isConnected) {
-      this.target = null;
-      this.close();
-      return;
-    }
-    const fo = g.querySelector(":scope > foreignObject");
-    if (!fo)
-      return;
-    const r = fo.getBoundingClientRect();
+    if (this.barW < 1 || this.barH < 1)
+      this.measure();
     const h2 = this.host.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1 || h2.width < 1)
+    if (h2.width < 1)
       return;
     const box = nodeBarPosition({
-      target: {
-        left: r.left - h2.left,
-        top: r.top - h2.top,
-        right: r.right - h2.left,
-        bottom: r.bottom - h2.top,
-        width: r.width,
-        height: r.height
-      },
       host: { width: h2.width, height: h2.height },
       bar: { width: this.barW, height: this.barH }
     });
@@ -7352,6 +7896,42 @@ var NodeBar = class {
     this.el.style.transform = `translate(${box.left}px, ${box.top}px)`;
   }
 };
+
+// src/ui/keyGuard.ts
+function isTypingTarget(target) {
+  if (!(target instanceof HTMLElement))
+    return false;
+  if (target.isContentEditable)
+    return true;
+  return target.closest(
+    "textarea, input, select, button, [contenteditable='true'], [role='button']"
+  ) !== null;
+}
+
+// src/domain/stats.ts
+function treeStats(tree) {
+  var _a;
+  if (!tree)
+    return { nodes: 0, depth: 0 };
+  let nodes = 0;
+  let depth = 0;
+  const stack = [{ node: tree, level: 1 }];
+  while (stack.length > 0) {
+    const { node, level } = stack.pop();
+    nodes++;
+    if (level > depth)
+      depth = level;
+    const children2 = (_a = node.children) != null ? _a : [];
+    for (const child of children2)
+      stack.push({ node: child, level: level + 1 });
+  }
+  return { nodes, depth };
+}
+function formatStats(s) {
+  if (s.nodes <= 0)
+    return "";
+  return `${s.nodes} \u8282\u70B9 \xB7 \u6DF1 ${s.depth}`;
+}
 
 // src/app/runtime.ts
 var ViewRuntime = class {
@@ -7619,15 +8199,29 @@ function inlineForeignStyles(source, clone) {
     }
   }
 }
+function stripHidden(source, clone) {
+  const srcEls = Array.from(source.querySelectorAll("*"));
+  const dstEls = Array.from(clone.querySelectorAll("*"));
+  const n = Math.min(srcEls.length, dstEls.length);
+  for (let i = 0; i < n; i++) {
+    if (getComputedStyle(srcEls[i]).display === "none")
+      dstEls[i].remove();
+  }
+}
 function buildSvgText(svg, box, opts = {}) {
   var _a;
   const clone = svg.cloneNode(true);
   inlineForeignStyles(svg, clone);
+  stripHidden(svg, clone);
+  for (const dot of Array.from(clone.querySelectorAll('g[class~="markmap-node"] > circle'))) {
+    dot.remove();
+  }
   for (const el of Array.from(clone.querySelectorAll(".obmind-selected"))) {
     el.classList.remove("obmind-selected");
   }
   for (const fo of Array.from(clone.querySelectorAll("foreignObject"))) {
     fo.style.opacity = "";
+    fo.style.visibility = "";
     if (fo.getAttribute("style") === "")
       fo.removeAttribute("style");
   }
@@ -7670,16 +8264,23 @@ ${xml}`;
 var MINDMAP_VIEW_TYPE = "obmind-view";
 var HELP_ROWS = [
   ["\u5355\u51FB", "\u9009\u4E2D\u8282\u70B9\uFF08\u4E4B\u540E\u53EF\u7528\u4E0B\u9762\u7684\u6309\u952E\uFF09"],
-  ["\u9009\u4E2D\u540E", "\u5361\u7247\u4E0B\u65B9\u6D6E\u51FA\u64CD\u4F5C\u6761\uFF1A\u65B0\u5EFA\u5B50\u7EA7 / \u540C\u7EA7\u3001\u7F16\u8F91\u3001\u63D0\u5347\u3001\u5220\u9664"],
-  ["\u53CC\u51FB / F2", "\u539F\u5730\u7F16\u8F91"],
+  ["\u9009\u4E2D\u540E", "\u753B\u5E03\u53F3\u4FA7\u6D6E\u51FA\u64CD\u4F5C\u6761\uFF1A\u65B0\u5EFA\u5B50\u7EA7 / \u540C\u7EA7\u3001\u65B0\u5EFA\u7B14\u8BB0\u3001\u7F16\u8F91\u3001\u63D0\u5347\u3001\u5220\u9664"],
+  ["\u53CC\u51FB / F2 / \u7A7A\u683C", "\u539F\u5730\u7F16\u8F91\uFF08\u7A7A\u683C\u4E0D\u9700\u8981\u5148\u7528\u9F20\u6807\u70B9\u8FDB\u753B\u5E03\uFF09"],
   ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
+  ["Ctrl/\u2318+N", "\u6309\u8282\u70B9\u6587\u5B57\u65B0\u5EFA\u4E00\u7BC7\u7B14\u8BB0\uFF0C\u8282\u70B9\u53D8\u6210\u6307\u5411\u5B83\u7684\u53CC\u94FE\uFF08\u53EF\u5957\u6A21\u677F\uFF09"],
+  ["\u2191 \u2193", "\u6362\u9009\u4E2D\uFF1A\u5728\u672B\u7EA7\u8282\u70B9\u4E4B\u95F4\u524D\u540E\u8D70\uFF08\u4E0D\u843D\u5230\u5206\u652F\u4E0A\uFF09"],
+  ["\u2190 \u2192", "\u6362\u9009\u4E2D\uFF1A\u7236\u7EA7 / \u5B50\u7EA7\uFF08\u6298\u53E0\u7740\u4F1A\u81EA\u52A8\u5C55\u5F00\uFF09"],
   ["Shift+Tab", "\u63D0\u5347\u4E00\u7EA7"],
-  ["Delete", "\u5220\u9664\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9"],
+  ["Delete", "\u5220\u9664\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9\uFF08\u53EA\u5728\u6CA1\u5728\u7F16\u8F91\u65F6\u751F\u6548\uFF09"],
   ["\u62D6\u52A8\u8282\u70B9", "\u6309\u4F4F\u5DE6\u952E\u62D6\u5230\u522B\u7684\u5361\u7247\u4E0A\u6539\u53D8\u7236\u5B50\u5173\u7CFB"],
-  ["Ctrl/\u2318+\u5355\u51FB", "\u6309\u8282\u70B9\u6587\u5B57\u6253\u5F00\u540C\u540D\u7B14\u8BB0"],
+  ["Ctrl/\u2318+\u5355\u51FB", "\u52A0\u9009 / \u51CF\u9009\uFF08\u70B9\u5728\u5DF2\u9009\u8282\u70B9\u4E0A\u5C31\u628A\u5B83\u53BB\u6389\uFF09"],
+  ["Shift+\u5355\u51FB", "\u9009\u4E2D\u540C\u7EA7\u533A\u95F4\uFF1A\u5148\u70B9\u9996\uFF0C\u518D Shift \u70B9\u5C3E"],
+  ["Alt+\u5355\u51FB", "\u6309\u8282\u70B9\u6587\u5B57\u6253\u5F00\u540C\u540D\u7B14\u8BB0"],
   ["Ctrl+Z / \u21E7Ctrl+Z", "\u64A4\u9500 / \u91CD\u505A"],
-  ["\u7F16\u8F91\u6846 Tab", "\u7F29\u8FDB / Shift+Tab \u53CD\u7F29\u8FDB"],
+  ["\u7F16\u8F91\u6846 \u21B5 / Tab", "\u63D0\u4EA4\u5E76\u9000\u51FA\uFF08\u7ED3\u675F\u8F93\u5165\u53EA\u505A\u8FD9\u4E00\u4EF6\u4E8B\uFF09"],
   ["\u7F16\u8F91\u6846 Ctrl+\u21B5", "\u63D0\u4EA4\u5E76\u65B0\u5EFA\u540C\u7EA7"],
+  ["\u7F16\u8F91\u6846 \u21E7+Tab", "\u63D0\u4EA4\u5E76\u63D0\u5347\u4E00\u7EA7"],
+  ["\u9489\u4F4F", "\u9501\u5B9A\u8FD9\u5F20\u56FE\uFF1A\u5207\u7B14\u8BB0\u3001\u70B9\u53CC\u94FE\uFF0C\u56FE\u90FD\u4E0D\u6362\uFF08\u7B14\u8BB0\u7A97\u53E3\u7167\u5E38\u6253\u5F00\uFF09"],
   ["Esc", "\u53D6\u6D88\u7F16\u8F91\u3001\u6536\u8D77\u9762\u677F\u6216\u53D6\u6D88\u9009\u4E2D"],
   ["\u70B9\u7A7A\u767D", "\u53D6\u6D88\u9009\u4E2D\uFF0C\u6536\u8D77\u8282\u70B9\u64CD\u4F5C\u6761"],
   ["\u5BFC\u51FA", "\u6574\u5F20\u56FE\u5B58\u6210 <\u7B14\u8BB0\u540D>.mindmap.svg\uFF08\u7B14\u8BB0\u540C\u76EE\u5F55\uFF09"]
@@ -7748,9 +8349,37 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.painter = new NodePainter(
       (path2, size) => this.branchSlot(path2, size)
     );
+    /** 内容尺寸变了的重排排队号（0 = 没排） */
+    this.reflowFrame = 0;
+    /**
+     * 重建收尾的「挡住淡入」窗口（时间戳，0 = 不管）。
+     *
+     * 插入/删除一行会让它**后面所有兄弟节点的 key 改变**（markmap 的 key 里带
+     * 孩子序号），d3 把它们当成新节点重新 enter：先写 `opacity: 0`，再起过渡。
+     * 即使 `duration: 0`，过渡依然**异步到下一帧** —— `setData` 内部那次 await
+     * 让出主线程时，浏览器画的就是「一排卡片有底色、没文字、连线也淡着」。
+     * 这就是「新建节点闪一下」。
+     *
+     * 重建期间本来就不该有淡入（位置是瞬间到位的），所以这段时间里凡是 markmap
+     * 往 foreignObject 上写 < 1 的 opacity，我们**当场抹掉**（写 `""`）。
+     * MutationObserver 回调在微任务里跑，赶在浏览器绘制之前，用户看不到那一帧。
+     */
+    this.fadeGuardUntil = 0;
     this.currentSpec = null;
     // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
     this.targetFile = null;
+    /**
+     * 「钉住」：导图不再跟随 Obsidian 的活动笔记。
+     *
+     * 和导航栈的区别：栈是「顺着双链潜进去了，记得回去的路」，钉住是「我就想一直看这篇」。
+     * 两者都不看活动笔记，但用途完全相反 —— 栈是临时的（一在别处切文件就作废），
+     * 钉住得撑到用户亲手解开，否则「钉了还在跟着笔记换」等于没钉。
+     *
+     * 钉住锁的是**这张图**，不是**导航本身**：用户在图里点双链，笔记窗口照常打开
+     * 那篇（链接不该变成死链），只是导图原地不动。所以钉住期间所有导航入口
+     * （点链接 / Alt+单击 / 面包屑 / 新建笔记）都走 `navigate`，由它分叉到 `openFileOnly`。
+     */
+    this.pinned = false;
     // 上一次成功投影的结果，下次刷新用它做 diff
     this.snapshot = null;
     this.editorHandle = null;
@@ -7766,8 +8395,27 @@ var MindmapView = class extends import_obsidian3.ItemView {
      * 缩放被重置会让人瞬间找不到自己在哪。用户主动切笔记则照旧适配。
      */
     this.keepViewport = false;
-    /** 当前选中的节点（记源行号，重建后仍能按行号恢复高亮） */
-    this.selectedLine = -1;
+    /**
+     * 当前选中集合（记源行号）。多选时多个节点同时高亮，批量删除 / 整体拖动都作用于它。
+     */
+    this.selectedLines = /* @__PURE__ */ new Set();
+    /** 主选中节点（最后交互的那个）：单节点操作（改字/缩进/删除）作用于它，也是框选/拖动锚点 */
+    this.primaryLine = -1;
+    /**
+     * Shift+单击 的区间起点，记的是「上一次不带 Shift 选中/加选的那个节点」。
+     *
+     * 区间选择的手感必须和文件管理器一致：先点首（定锚点），再 Shift 点尾，
+     * 中间整段一起选中；反复 Shift 点别的节点时锚点不动，区间跟着重算。
+     * 锚点用行号而不是 DOM，理由同 selectedLines。
+     */
+    this.anchorLine = -1;
+    /**
+     * 右键是否真的拖动过（区分「右键单击」与「右键拖动平移」）。
+     * 拖动过则在 contextmenu 时压下菜单，避免松手弹出浏览器默认菜单。
+     */
+    this.rightDragMoved = false;
+    this.rightDownX = 0;
+    this.rightDownY = 0;
     /**
      * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
      *
@@ -7786,9 +8434,13 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.leafSeq = 0;
     this.leafById = /* @__PURE__ */ new Map();
     this.drag = null;
+    /** 左键空白区拖拽框选（ctrl/shift 加选） */
+    this.boxSelect = null;
     /** 操作栏（图标按钮 + 主题按钮）。构建细节在 ui/toolbar.ts */
     this.toolbar = null;
-    /** 选中节点时浮在卡片下方的节点操作条（ui/nodeBar.ts） */
+    /** 操作栏尾端的规模统计（节点数 / 树深），每次刷新重写 */
+    this.statsEl = null;
+    /** 单选节点时贴在画布右侧的那条节点操作（ui/nodeBar.ts） */
     this.nodeBar = null;
     /** 快捷键说明面板（点「?」浮出） */
     this.helpPanel = null;
@@ -7828,6 +8480,21 @@ var MindmapView = class extends import_obsidian3.ItemView {
       blocked: () => this.rt.phase === "rebuilding"
     });
   }
+  /**
+   * 兼容旧调用：单值选中 = 只选一个。写入会同步 selectedLines（赋 -1 即清空集合）。
+   */
+  get selectedLine() {
+    return this.primaryLine;
+  }
+  set selectedLine(v2) {
+    const same = this.primaryLine === v2 && (v2 < 0 ? this.selectedLines.size === 0 : this.selectedLines.size === 1);
+    if (same)
+      return;
+    this.primaryLine = v2;
+    this.selectedLines = v2 >= 0 ? /* @__PURE__ */ new Set([v2]) : /* @__PURE__ */ new Set();
+    this.paintSelection();
+    this.syncToolbar();
+  }
   getViewType() {
     return MINDMAP_VIEW_TYPE;
   }
@@ -7856,8 +8523,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
     });
     this.themeBtn = themeBtn;
     this.syncThemeButton();
+    this.statsEl = header.createSpan({ cls: "obmind-stats" });
     this.toolbar = buildToolbar(header, {
+      // logo 占位：现在只有两个字，将来换成图标只要换这一个字段
+      brand: "\u4F4E\u5C71",
       leading: themeBtn,
+      trailing: this.statsEl,
       groups: GLOBAL_GROUPS,
       onAction: (id2) => this.onToolbar(id2)
     });
@@ -7869,6 +8540,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.canvasEl = canvas;
     canvas.setAttribute("tabindex", "0");
     canvas.addEventListener("keydown", (e) => this.onCanvasKeyDown(e));
+    this.registerDomEvent(
+      this.containerEl,
+      "keydown",
+      (e) => this.onViewKeyDown(e)
+    );
     const svg = canvas.createSvg("svg");
     svg.classList.add("markmap");
     svg.style.width = "100%";
@@ -7896,6 +8572,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
         var _a;
         if (!file || file.extension !== "md")
           return;
+        if (this.pinned)
+          return;
         if (file.path === ((_a = this.targetFile) == null ? void 0 : _a.path))
           return;
         this.resetNav();
@@ -7905,9 +8583,33 @@ var MindmapView = class extends import_obsidian3.ItemView {
     );
     svg.addEventListener("click", (e) => this.onNodeClick(e));
     svg.addEventListener("dblclick", (e) => this.onNodeDblClick(e), true);
+    this.registerDomEvent(canvas, "contextmenu", (e) => {
+      if (this.rightDragMoved) {
+        e.preventDefault();
+        this.rightDragMoved = false;
+      }
+    });
+    this.registerDomEvent(canvas, "pointerdown", (e) => {
+      if (e.button === 2) {
+        this.rightDragMoved = false;
+        this.rightDownX = e.clientX;
+        this.rightDownY = e.clientY;
+      }
+    });
+    this.registerDomEvent(canvas, "pointermove", (e) => {
+      if (e.buttons & 2) {
+        if (Math.hypot(e.clientX - this.rightDownX, e.clientY - this.rightDownY) > 4) {
+          this.rightDragMoved = true;
+        }
+      }
+    });
     this.drag = new DragController(svg, canvas, {
       srcOf: (g) => this.srcOf(g),
-      onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(srcLine, targetLine, mode)
+      onDrop: (srcLine, targetLine, mode) => this.onNodeDrop(this.groupOf(srcLine), targetLine, mode)
+    });
+    this.boxSelect = new BoxSelectController(svg, canvas, {
+      srcOf: (g) => this.srcOf(g),
+      onSelect: (lines, additive) => this.applySelection(lines, -1, additive)
     });
     this.registerDomEvent(
       canvas,
@@ -7919,6 +8621,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
     );
     this.renderBreadcrumb();
     this.registerDomEvent(document, "keydown", (e) => this.onGlobalKeyDown(e));
+    this.registerDomEvent(
+      document,
+      "keydown",
+      (e) => this.onHotkeyCapture(e),
+      true
+    );
     this.registerDomEvent(document, "click", (e) => {
       if (!this.helpPanel || this.helpPanel.hasClass("is-hidden"))
         return;
@@ -7928,6 +8636,24 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.helpPanel.addClass("is-hidden");
     });
     this.syncToolbar();
+  }
+  /**
+   * 当前是否处于「重建收尾、要挡掉 markmap 淡入」的窗口。
+   *
+   * 三种情况：
+   * - 重建中（`setData` 内部那几帧就是元凶，必须算在内）；
+   * - 重建刚结束的一小段时间（d3 的过渡可能晚一帧才写）；
+   * - **编辑态除外**：编辑期间不该去改 markmap 的属性。
+   *   注意编辑框藏原文用的是 `visibility` 而**不是** opacity（见 edit/inlineText.ts）——
+   *   用 opacity 会被下面的 faded 通道当成「淡出中」，把卡片和连线一起抄成透明，
+   *   编辑时整块图就只剩一个输入框了。
+   */
+  inFadeGuard() {
+    if (this.rt.phase === "editing")
+      return false;
+    if (this.rt.phase === "rebuilding")
+      return true;
+    return this.fadeGuardUntil !== 0 && performance.now() < this.fadeGuardUntil;
   }
   /**
    * 监听导图的布局变化，并按变化类型分流。
@@ -7953,6 +8679,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.observer = new MutationObserver((records) => {
       let structural = false;
       const moved = /* @__PURE__ */ new Set();
+      const recls = /* @__PURE__ */ new Set();
+      const faded = /* @__PURE__ */ new Set();
       for (const rec of records) {
         if (rec.type === "childList") {
           if (!isOwnDecoration(rec))
@@ -7960,6 +8688,23 @@ var MindmapView = class extends import_obsidian3.ItemView {
           continue;
         }
         const target = rec.target;
+        if (rec.attributeName === "class") {
+          if (target instanceof SVGGElement && target.classList.contains("markmap-node")) {
+            recls.add(target);
+          }
+          continue;
+        }
+        if (rec.attributeName === "style") {
+          const parent = target.parentElement;
+          if (target instanceof SVGForeignObjectElement && parent instanceof SVGGElement && parent.classList.contains("markmap-node")) {
+            if (this.inFadeGuard() && target.style.opacity !== "") {
+              target.style.opacity = "";
+              continue;
+            }
+            faded.add(parent);
+          }
+          continue;
+        }
         if (!(target instanceof SVGGElement) || !target.classList.contains("markmap-node")) {
           continue;
         }
@@ -7970,12 +8715,19 @@ var MindmapView = class extends import_obsidian3.ItemView {
       } else if (moved.size > 0) {
         this.frames.paintMoved(moved);
       }
+      if (recls.size > 0)
+        this.paintSelectionOn(recls);
+      if (faded.size > 0)
+        this.frames.syncFade(faded);
     });
     this.observer.observe(svg, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["transform"]
+      // class：markmap 重排会重写节点 class（会把选中态抹掉），
+      // style：节点文字的 opacity（淡入淡出），卡片要跟着淡。
+      // 都不含 width/height —— 那个它每帧都写一遍同值，听了就是每帧全量重绘。
+      attributeFilter: ["transform", "class", "style"]
     });
   }
   /**
@@ -8034,8 +8786,72 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.navStack = [];
       this.renderBreadcrumb();
     }
+    this.setPinned(false, true);
     if (file && file.extension === "md")
       this.targetFile = file;
+  }
+  /**
+   * 开关「钉住」。
+   *
+   * 只改状态和按钮，**自己不触发重绘**：解除钉住往往发生在 refresh 内部
+   * （目标文件被删那一路），在那里再调一次 refresh 会原地递归。
+   * 请调用方在需要立刻重画时自己 refresh。
+   *
+   * silent 用于非用户主动触发的解除（文件被删、命令重新打开视图）：
+   * 那些场合弹一句「已取消钉住」只会让人莫名其妙。
+   */
+  setPinned(on, silent = false) {
+    var _a, _b;
+    if (this.pinned === on) {
+      this.syncPinButton();
+      return;
+    }
+    this.pinned = on;
+    this.syncPinButton();
+    if (on) {
+      const name = (_b = (_a = this.targetFile) == null ? void 0 : _a.basename) != null ? _b : "\u5F53\u524D\u7B14\u8BB0";
+      new import_obsidian3.Notice(
+        `obmind\uFF1A\u5DF2\u9489\u4F4F\u300C${name}\u300D\uFF0C\u5207\u6362\u7B14\u8BB0\u65F6\u8FD9\u5F20\u56FE\u4FDD\u6301\u4E0D\u52A8\uFF08\u70B9\u53CC\u94FE\u53EA\u5207\u7B14\u8BB0\uFF09`,
+        4e3
+      );
+      return;
+    }
+    if (this.navStack.length > 0)
+      this.resetNav();
+    if (!silent)
+      new import_obsidian3.Notice("obmind\uFF1A\u5DF2\u53D6\u6D88\u9489\u4F4F\uFF0C\u5BFC\u56FE\u91CD\u65B0\u8DDF\u968F\u7B14\u8BB0", 3e3);
+  }
+  /** 工具栏上点钉住 */
+  togglePin() {
+    if (this.pinned) {
+      this.setPinned(false);
+      this.refresh();
+      return;
+    }
+    if (!this.targetFile) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5F53\u524D\u6CA1\u6709\u53EF\u9489\u4F4F\u7684\u7B14\u8BB0");
+      return;
+    }
+    this.setPinned(true);
+  }
+  /** 钉住期间该显示哪篇；目标没了就自动解除，免得钉在一片空白上 */
+  pinnedTarget() {
+    const file = this.targetFile;
+    if (file && this.app.vault.getAbstractFileByPath(file.path))
+      return file;
+    this.setPinned(false, true);
+    return null;
+  }
+  syncPinButton() {
+    const t = this.toolbar;
+    if (!t)
+      return;
+    t.setActive(
+      "pin",
+      this.pinned,
+      this.pinned ? "\u5DF2\u9489\u4F4F\uFF08\u70B9\u51FB\u6062\u590D\u8DDF\u968F\u7B14\u8BB0\uFF09" : "\u9489\u4F4F\u5F53\u524D\u5BFC\u56FE\uFF0C\u5207\u6362\u7B14\u8BB0\u65F6\u4E0D\u53D8"
+    );
+    t.setEnabled("pin", this.mm !== null || this.targetFile !== null);
   }
   /**
    * 结束一次导图内导航：清栈。
@@ -8120,6 +8936,9 @@ var MindmapView = class extends import_obsidian3.ItemView {
   /** 操作栏的唯一分发点：按钮只报 id，具体做什么集中在这里 */
   onToolbar(id2) {
     switch (id2) {
+      case "pin":
+        this.togglePin();
+        break;
       case "undo":
         void this.stepHistory("undo");
         break;
@@ -8143,7 +8962,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
         void this.exportSvg();
         break;
       case "deselect":
-        this.setSelectedLine(-1);
+        this.applySelection([], -1, false);
         break;
       case "edit":
         this.editSelected();
@@ -8154,6 +8973,9 @@ var MindmapView = class extends import_obsidian3.ItemView {
         break;
       case "outdent":
         this.outdentSelected();
+        break;
+      case "newNote":
+        void this.createNoteForSelected();
         break;
       case "delete":
         this.removeNode();
@@ -8172,6 +8994,22 @@ var MindmapView = class extends import_obsidian3.ItemView {
    * 节点操作现在在浮动条上，可用态跟着它一起走 —— 没有选中节点时浮动条本身就
    * 不出现，所以那排灰按钮的问题不存在了。
    */
+  /**
+   * 操作栏尾端的规模统计。
+   *
+   * 只在文案真的变了才写 DOM：这个方法在每次 refresh 都会跑（包括「只是移动
+   * 光标」的空转刷新），无脑 setText 会让工具条每秒重排好几次。
+   */
+  syncStats(tree) {
+    const el = this.statsEl;
+    if (!el)
+      return;
+    const text = tree ? formatStats(treeStats(tree)) : "";
+    if (el.textContent === text)
+      return;
+    el.setText(text);
+    el.toggleClass("is-empty", text === "");
+  }
   syncToolbar() {
     const src = this.nodeAt(this.selectedLine);
     const onNode = src !== null && src.depth > 0;
@@ -8183,6 +9021,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       bar.setEnabled("sibling", onAny);
       bar.setEnabled("outdent", onNode);
       bar.setEnabled("delete", onNode);
+      bar.setHidden("newNote", !this.canCreateNoteFor(src));
     }
     const t = this.toolbar;
     if (!t)
@@ -8190,10 +9029,32 @@ var MindmapView = class extends import_obsidian3.ItemView {
     t.setEnabled("undo", canUndo(this.history));
     t.setEnabled("redo", canRedo(this.history));
     const ready = this.mm !== null;
+    this.syncPinButton();
     t.setEnabled("fit", ready);
     t.setEnabled("collapseAll", ready);
     t.setEnabled("expandAll", ready);
     t.setEnabled("refresh", ready);
+  }
+  /**
+   * 判断这个节点该不该露出「新建笔记」入口。
+   *
+   * 判据是「有没有必要」而不是「能不能写回」：
+   * - 已经有双链的节点，点了也是白点；
+   * - 多行节点（软换行）写回只改首行，会把节点拆坏 —— 编辑也不允许改它；
+   * - 根节点就是这篇笔记自己，给它再建一篇同名笔记没有意义。
+   */
+  canCreateNoteFor(src) {
+    if (!src)
+      return false;
+    if (this.selectedLines.size !== 1)
+      return false;
+    if (src.depth === 0)
+      return false;
+    if (src.endLine > src.line)
+      return false;
+    if (hasWikiLink(src.text))
+      return false;
+    return noteTitleOf(src.text) !== "";
   }
   /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
   nodeAt(line) {
@@ -8236,6 +9097,118 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     }
     void this.applyPlan(file, out.op);
+  }
+  /**
+   * 给选中节点新建一篇笔记，并把这个节点改成指向它的双链（Ctrl+N / 浮动条）。
+   *
+   * 五步，顺序不能换：
+   * 1. 取名字：notePlan 的纯函数去掉行内标记、清掉文件名与双链语法的非法字符；
+   * 2. 算落地文件夹：复用 Obsidian 自己的「新建笔记存放位置」设置；
+   * 3. 建文件：已有同名笔记就直接用那一篇（撞名失败，不如顺势链过去）；
+   * 4. 把节点正文换成 `[[名字]]`（原文带行内样式时用别名形式，字面不变）；
+   * 5. openDoc 跳过去 —— 走的是导图内跳转那条路，所以面包屑自动带上
+   *    「从哪来」，点第一级就能跳回原来那篇。
+   *
+   * 公开是为了命令面板：万一 Ctrl+N 被别的插件占了、或者用户改过快捷键表，
+   * 还能在「快捷键」设置里给这个动作另绑一个组合。
+   */
+  async createNoteForSelected() {
+    const file = this.targetFile;
+    const src = this.nodeAt(this.primaryLine);
+    if (!file || !src) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u5EFA\u7B14\u8BB0\u7684\u8282\u70B9");
+      return;
+    }
+    if (!this.canCreateNoteFor(src)) {
+      new import_obsidian3.Notice(
+        hasWikiLink(src.text) ? "obmind\uFF1A\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u662F\u53CC\u94FE\u4E86" : "obmind\uFF1A\u8FD9\u4E2A\u8282\u70B9\u73B0\u5728\u4E0D\u80FD\u5EFA\u7B14\u8BB0\uFF08\u591A\u884C\u8282\u70B9 / \u53D6\u4E0D\u51FA\u540D\u5B57\uFF09"
+      );
+      return;
+    }
+    const title = noteTitleOf(src.text);
+    const folder = resolveNoteFolder({
+      location: this.vaultConfig("newFileLocation"),
+      folder: this.vaultConfig("newFileFolderPath"),
+      currentPath: file.path
+    });
+    let note = this.app.metadataCache.getFirstLinkpathDest(
+      title,
+      file.path
+    );
+    const reused = note !== null;
+    if (!note) {
+      note = await this.createNoteFile(folder, title, file);
+      if (!note)
+        return;
+    }
+    const raw = src.text.trim();
+    const link2 = linkLiteral(title, raw === title ? void 0 : raw);
+    const snap = this.editSnapshot();
+    if (snap) {
+      const out = this.editSvc.commit({ snap, src, action: "commit", value: link2 });
+      if (out.kind === "write")
+        await this.applyPlan(file, out.op);
+      else if (out.kind === "error") {
+        new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
+        return;
+      }
+    }
+    this.applySelection([], -1, false);
+    this.navigate(note);
+    new import_obsidian3.Notice(
+      `obmind\uFF1A\u5DF2${reused ? "\u94FE\u63A5\u5230\u5DF2\u6709\u7B14\u8BB0" : "\u65B0\u5EFA\u7B14\u8BB0"}\u300C${title}\u300D` + (this.pinned ? "\uFF08\u5BFC\u56FE\u4FDD\u6301\u9489\u4F4F\uFF09" : "")
+    );
+  }
+  /**
+   * 读 Obsidian 自己的库级设置（这里只用「新建笔记的存放位置」两项）。
+   *
+   * `Vault.getConfig` 运行时一直都在，但没写进公开的 d.ts —— 所以按可选能力探测：
+   * 拿不到就返回空串，resolveNoteFolder 会把空值当成「放库根」，
+   * 也就是 Obsidian 的默认行为。降级而不是抛错。
+   */
+  vaultConfig(key) {
+    const api = this.app.vault;
+    const value = typeof api.getConfig === "function" ? api.getConfig(key) : null;
+    return typeof value === "string" ? value : "";
+  }
+  /**
+   * 真正落盘：读模板 → vault.create。
+   *
+   * 失败只提示不抛：模板路径写错、目标文件夹被删这些都属于配置问题，
+   * 用户改一下设置就好，没必要让一次点击以异常栈收场。
+   */
+  async createNoteFile(folder, title, from) {
+    const path2 = notePathOf(folder, title);
+    const raw = await this.readTemplate();
+    const content = raw === "" ? "" : applyTemplate(raw, { title, from: from.basename });
+    try {
+      return await this.app.vault.create(path2, content);
+    } catch (err) {
+      const exist = this.app.vault.getAbstractFileByPath(path2);
+      if (exist instanceof import_obsidian3.TFile)
+        return exist;
+      new import_obsidian3.Notice(`obmind\uFF1A\u65B0\u5EFA\u7B14\u8BB0\u5931\u8D25\uFF1A${errText(err)}`);
+      return null;
+    }
+  }
+  /** 读模板原文；没配模板 / 文件不在了都返回 ""（= 建一篇空白笔记） */
+  async readTemplate() {
+    var _a, _b;
+    const path2 = ((_a = this.plugin.settings.noteTemplate) != null ? _a : "").trim();
+    if (path2 === "")
+      return "";
+    const abs2 = /\.md$/i.test(path2) ? path2 : `${path2}.md`;
+    const file = (_b = this.app.vault.getAbstractFileByPath((0, import_obsidian3.normalizePath)(abs2))) != null ? _b : this.app.metadataCache.getFirstLinkpathDest(path2, "");
+    if (!(file instanceof import_obsidian3.TFile)) {
+      new import_obsidian3.Notice(`obmind\uFF1A\u627E\u4E0D\u5230\u6A21\u677F\u7B14\u8BB0\u300C${path2}\u300D\uFF0C\u8FD9\u6B21\u65B0\u5EFA\u7684\u662F\u7A7A\u767D\u7B14\u8BB0`);
+      return "";
+    }
+    try {
+      return await this.app.vault.read(file);
+    } catch (err) {
+      console.error("[obmind] \u8BFB\u53D6\u6A21\u677F\u5931\u8D25", err);
+      return "";
+    }
   }
   /**
    * 「适配」按钮：无条件把内容缩放回可视区。
@@ -8404,6 +9377,13 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.targetFile = pinned;
       return pinned;
     }
+    if (this.pinned) {
+      const kept = this.pinnedTarget();
+      if (kept) {
+        this.targetFile = kept;
+        return kept;
+      }
+    }
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile && activeFile.extension === "md") {
       this.targetFile = activeFile;
@@ -8451,6 +9431,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.emptyEl = canvas.createDiv({ cls: "obmind-empty" });
     this.emptyEl.setText(text);
     this.emptyEl.show();
+    this.syncStats(null);
   }
   clearEmpty() {
     var _a;
@@ -8651,6 +9632,23 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const z = el == null ? void 0 : el.__zoom;
     return z && typeof z.k === "number" ? z.k : Number.NaN;
   }
+  /**
+   * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
+   * 右键(2)拖拽平移画布；滚轮缩放、触屏平移保持。
+   * setOptions 不会重建 zoom 行为对象，故创建后设一次即可。
+   */
+  applyZoomFilter() {
+    const mm = this.mm;
+    if (!mm)
+      return;
+    mm.zoom.filter((event) => {
+      if (event.type === "wheel")
+        return true;
+      if (event.type === "touchstart" || event.type === "touchmove")
+        return true;
+      return event.button === 2;
+    });
+  }
   nextFrame() {
     return new Promise((resolve) => {
       window.requestAnimationFrame(() => resolve());
@@ -8694,6 +9692,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const spec = resolveTheme(this.plugin.settings.theme, isDark);
     const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
     this.applyTheme(spec);
+    this.syncStats(tree);
     const sameFile = prev !== null && prev.path === file.path;
     const sameTheme = prev !== null && prev.themeKey === themeKey;
     const sameFilter = prev !== null && prev.filterFrontmatter === filter2;
@@ -8738,6 +9737,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const restructure = () => this.applyTree(tree);
     if (!this.mm) {
       this.mm = it.create(this.svgEl, this.buildOptions(spec));
+      this.applyZoomFilter();
       this.snapshot = {
         content,
         tree,
@@ -8751,6 +9751,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     } else {
       if (!sameTheme)
         this.mm.setOptions(this.buildOptions(spec));
+      this.applyZoomFilter();
       this.snapshot = {
         content,
         tree,
@@ -8788,7 +9789,9 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const box = (_b = (_a = fo == null ? void 0 : fo.firstElementChild) == null ? void 0 : _a.firstElementChild) != null ? _b : null;
     if (!fo || !box)
       return false;
-    box.innerHTML = content;
+    const changed = box.innerHTML !== content;
+    if (changed)
+      box.innerHTML = content;
     const data = g.__data__;
     if (data)
       data.content = content;
@@ -8798,8 +9801,53 @@ var MindmapView = class extends import_obsidian3.ItemView {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h2));
     }
-    this.frames.requestAll();
+    if (changed)
+      this.reflowSoon();
     return true;
+  }
+  /**
+   * 内容尺寸变了 → 立刻让 markmap 重排一次，别等它自己的 100ms 防抖。
+   *
+   * 「改一个字闪一下」就是这么来的：markmap 对每个节点的内容 div 挂了
+   * ResizeObserver，**防抖 100ms** 才跑 renderData；renderData 里的位置变化又走
+   * `options.duration`（180ms）的 transition。于是「卡片已经变宽、孩子/邻居那一列
+   * 还停在旧位置」的错位要持续约 280ms —— 肉眼就是压住一下再滑开。
+   * 实测（tmp/probeFlicker.ts）：改一个分支标题后，卡片互相压住从 8ms 一直到 233ms。
+   *
+   * 这里压到一帧：duration 置 0 主动 renderData（位置瞬间到位），再补画卡片和选中框。
+   * 代价是一次整树布局（两千节点的笔记几十毫秒），只在真的改了文字时跑；
+   * 而且本来 100ms 后 markmap 也要跑同一件事，只是那时带着 180ms 的滑动。
+   *
+   * 排到下一帧而不是立刻跑：previewText 与随后的 applyPatch 会在同一轮里各改一次，
+   * 合并成一次重排就够。
+   */
+  reflowSoon() {
+    if (this.reflowFrame !== 0)
+      return;
+    this.reflowFrame = window.requestAnimationFrame(() => {
+      this.reflowFrame = 0;
+      void this.reflowNow();
+    });
+  }
+  async reflowNow() {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg)
+      return;
+    if (this.rt.phase !== "idle")
+      return;
+    const prev = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.renderData();
+    } catch (e) {
+    } finally {
+      mm.setOptions({ duration: prev > 0 ? prev : 180 });
+    }
+    if (this.rt.phase !== "idle")
+      return;
+    this.frames.paintNow();
+    this.paintSelection();
   }
   /**
    * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
@@ -8823,11 +9871,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     this.syncBranchSlots(tree, (_b = (_a = this.currentSpec) == null ? void 0 : _a.colors.length) != null ? _b : 6);
     this.rt.setPhase("rebuilding");
+    this.fadeGuardUntil = performance.now() + 50;
     const prev = mm.options.duration;
     mm.setOptions({ duration: 0 });
     try {
       await mm.setData(tree);
       this.dropDetached();
+      this.clearFade();
+      this.measureMissing();
       this.frames.reset();
       this.frames.paintNow();
     } finally {
@@ -8836,6 +9887,61 @@ var MindmapView = class extends import_obsidian3.ItemView {
     }
     this.paintSelection();
     this.syncToolbar();
+  }
+  /**
+   * 把节点文字上残留的半透明清掉。
+   *
+   * 重建是 `duration: 0` 的瞬间到位，不该有任何淡入淡出。但 markmap 的
+   * enter/exit 过渡即使 duration 为 0 也异步到下一帧，`setData` 返回时
+   * 这些 `opacity: 0` 还挂在 DOM 上 —— 我们的全量绘制会把它们抄给卡片，
+   * 于是那一帧整排兄弟卡片是空的。
+   *
+   * 用 `removeProperty` 而不是写 `"1"`：属性没了，markmap 后面的过渡想插值
+   * 也能从默认值继续，不会被我留的 inline 值卡住。
+   */
+  clearFade() {
+    const svg = this.svgEl;
+    if (!svg)
+      return;
+    for (const fo of Array.from(
+      svg.querySelectorAll("g.markmap-node > foreignObject")
+    )) {
+      if (fo.style.opacity !== "")
+        fo.style.removeProperty("opacity");
+    }
+  }
+  /**
+   * 给「markmap 还没量过」的节点补一次尺寸。
+   *
+   * 全量绘制靠 foreignObject 的 width/height 属性算几何（刻意不读 getBBox）。
+   * 刚 enter 的节点这两个属性还是空的，于是那一帧它没有卡片 —— 屏幕上先是
+   * 一段裸文字，下一帧卡片才包上去。新建节点时这个「裸文字」特别显眼。
+   *
+   * 只处理缺失的节点：`scrollWidth` 会强制同步布局，对两千个节点逐个读
+   * 就是一次几十毫秒的卡顿，而正常情况下缺失的只有刚加的那一两个。
+   */
+  measureMissing() {
+    var _a, _b, _c;
+    const svg = this.svgEl;
+    if (!svg)
+      return;
+    for (const fo of Array.from(
+      svg.querySelectorAll("g.markmap-node > foreignObject")
+    )) {
+      const w = Number.parseFloat((_a = fo.getAttribute("width")) != null ? _a : "");
+      const h2 = Number.parseFloat((_b = fo.getAttribute("height")) != null ? _b : "");
+      if (w > 0 && h2 > 0)
+        continue;
+      const box = (_c = fo.firstElementChild) == null ? void 0 : _c.firstElementChild;
+      if (!box)
+        continue;
+      const bw = box.scrollWidth;
+      const bh = box.scrollHeight;
+      if (bw > 0 && bh > 0) {
+        fo.setAttribute("width", String(bw));
+        fo.setAttribute("height", String(bh));
+      }
+    }
   }
   /**
    * 删掉 setData 之后残留的、在新树里已经不存在的节点元素。
@@ -8868,8 +9974,54 @@ var MindmapView = class extends import_obsidian3.ItemView {
   // -------------------------------------------------------------------------
   // 点击 / 编辑 / 拖动
   // -------------------------------------------------------------------------
+  /**
+   * 导图内导航的统一入口：点双链 / Alt+单击 / 面包屑 / 新建笔记都走这里。
+   *
+   * 分叉只取决于钉住：
+   * - 没钉住 → `openDoc`：切换导图内容，并按 navSync 联动笔记窗口；
+   * - 钉住了 → `openFileOnly`：笔记窗口照常打开，导图留在原地。
+   *
+   * 为什么钉住时**不能**直接拦掉跳转：用户的动作是「点这个链接」，
+   * 链接的天职就是打开那篇。拦下来等于把双链在钉住期间做成死链，
+   * 而用户真正的诉求只是「这张图别跟着跑」。
+   */
+  navigate(file) {
+    if (this.pinned) {
+      this.openFileOnly(file);
+      return;
+    }
+    this.openDoc(file);
+  }
+  /**
+   * 钉住状态下的「只切笔记」：把文件呈现到 Obsidian 里，**不碰** targetFile / navStack。
+   *
+   * 三处刻意不动：
+   * - `targetFile`：钉住时「导图看哪篇」由它决定，改了就是换图；
+   * - `navStack`：栈是「导图内的浏览路径」，图没换，路就没变；
+   * - `leafId` 记账：那是为了回退时关闭标签，钉住期间没有回退。
+   *
+   * 也不 reveal 导图：这里用户要看的是笔记内容，把导图抢到前台等于把刚打开的
+   * 笔记又藏回标签栏（导图在侧栏时本来就互不影响）。
+   */
+  openFileOnly(file) {
+    var _a, _b, _c;
+    const target = forwardTarget(this.navSync());
+    if (target === "none") {
+      new import_obsidian3.Notice("obmind\uFF1A\u5BFC\u56FE\u5DF2\u9489\u4F4F\uFF0C\u4E14\u8BBE\u7F6E\u4E3A\u300C\u4EC5\u5BFC\u56FE\u8DF3\u8F6C\u300D\uFF0C\u7B14\u8BB0\u7A97\u53E3\u4E0D\u4F1A\u6253\u5F00", 3e3);
+      return;
+    }
+    if (target === "current") {
+      const previous = this.app.workspace.getActiveFile();
+      const leaf = (_c = (_b = this.leafShowing(previous)) != null ? _b : (_a = this.app.workspace.getActiveViewOfType(import_obsidian3.MarkdownView)) == null ? void 0 : _a.leaf) != null ? _c : null;
+      if (leaf) {
+        this.openInLeaf(leaf, file);
+        return;
+      }
+    }
+    this.openInLeaf(this.newNoteLeaf(), file);
+  }
   onNodeClick(e) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
     const target = e.target;
     const link2 = target.closest("a");
     if (link2) {
@@ -8887,7 +10039,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
         (_d = (_c = this.targetFile) == null ? void 0 : _c.path) != null ? _d : ""
       );
       if (dest instanceof import_obsidian3.TFile) {
-        this.openDoc(dest);
+        this.navigate(dest);
       }
       return;
     }
@@ -8895,11 +10047,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     const g = target.closest("g.markmap-node");
     if (!g) {
-      if (this.selectedLine >= 0)
-        this.setSelectedLine(-1);
+      if (this.selectedLines.size > 0)
+        this.applySelection([], -1, false);
       return;
     }
-    if (e.ctrlKey || e.metaKey) {
+    if (e.altKey) {
       const text = ((_e = g.textContent) != null ? _e : "").trim();
       if (!text)
         return;
@@ -8907,8 +10059,20 @@ var MindmapView = class extends import_obsidian3.ItemView {
         text,
         (_g = (_f = this.targetFile) == null ? void 0 : _f.path) != null ? _g : ""
       );
-      if (dest instanceof import_obsidian3.TFile)
-        this.openDoc(dest);
+      if (dest instanceof import_obsidian3.TFile) {
+        this.navigate(dest);
+      }
+      return;
+    }
+    const line = (_i = (_h = this.srcOf(g)) == null ? void 0 : _h.line) != null ? _i : -1;
+    if (e.shiftKey) {
+      this.selectSiblingRange(line, e.ctrlKey || e.metaKey);
+      (_j = this.canvasEl) == null ? void 0 : _j.focus({ preventScroll: true });
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      this.toggleSelection(line);
+      (_k = this.canvasEl) == null ? void 0 : _k.focus({ preventScroll: true });
       return;
     }
     this.selectNode(g);
@@ -9105,8 +10269,17 @@ var MindmapView = class extends import_obsidian3.ItemView {
       item.toggleClass("is-current", last);
       item.setAttribute("aria-label", entry.path);
       item.setAttribute("title", last ? entry.path : `${entry.path}\uFF08\u70B9\u51FB\u8FD4\u56DE\uFF09`);
-      if (!last)
-        item.addEventListener("click", () => this.goBackTo(i));
+      if (!last) {
+        item.addEventListener("click", () => {
+          if (this.pinned) {
+            const dest = this.app.vault.getAbstractFileByPath(entry.path);
+            if (dest instanceof import_obsidian3.TFile)
+              this.openFileOnly(dest);
+            return;
+          }
+          this.goBackTo(i);
+        });
+      }
     });
     el.scrollLeft = el.scrollWidth;
   }
@@ -9118,36 +10291,216 @@ var MindmapView = class extends import_obsidian3.ItemView {
    */
   selectNode(g) {
     var _a, _b, _c;
-    this.setSelectedLine(g ? (_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1 : -1);
+    const line = g ? (_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1 : -1;
+    this.selectedLine = line;
+    this.anchorLine = line;
     (_c = this.canvasEl) == null ? void 0 : _c.focus({ preventScroll: true });
   }
-  setSelectedLine(line) {
-    if (this.selectedLine === line)
+  /**
+   * 选中某一源行对应的节点，并把它带进视野。
+   *
+   * 键盘换选中必须顺手滚一下视图：连着按十几下方向键之后，选中框很可能已经在
+   * 画布外面了 —— 屏幕上看不出选中到了哪，等于键盘没法用。
+   * `ensureVisible` 只在节点真的出去时才平移，不会每按一下都把画面拽动一次。
+   */
+  selectByLine(line) {
+    const g = this.findNodeByLine(line);
+    if (!g)
       return;
-    this.selectedLine = line;
+    this.selectNode(g);
+    const data = g.__data__;
+    if (!data || !this.mm)
+      return;
+    const pad = 32;
+    void this.mm.ensureVisible(data, { left: pad, right: pad, top: pad, bottom: pad }).catch(() => void 0);
+  }
+  /**
+   * 方向键导航：两条轴各管一件事。
+   *
+   * 上下只走**末端节点**（没有孩子的、或折叠了的）：折叠的子树在屏幕上不存在，
+   * 让选中跳进去就是「按一下方向键，选中框凭空消失」；而中间那些带分支的容器
+   * 节点也不进这条序列 —— 上下要是能落到「B」这种还有子级的分支上，看起来就跟
+   * 在大纲里跳行不是一回事。层级只由左右负责。
+   *
+   * 起点本身不是末端（点中了一个分支标题、或按 ← 从子级退回来）时，上下按行号
+   * 找它之后 / 之前的第一个末端，所以不会是「按了没反应」。
+   *
+   * 序列本身由 `domain/nav.ts` 的纯函数算，用 Node 跑用例即可，不必等 DOM。
+   *
+   * 右侧遇到折叠的父节点：先展开再进长子。否则按右毫无反应，用户只能去点圆点。
+   */
+  moveSelection(key) {
+    var _a;
+    const snap = this.editSnapshot();
+    if (!snap)
+      return;
+    const cur = this.primaryLine;
+    if (key === "ArrowLeft") {
+      const parent = cur >= 0 ? this.editSvc.parentLineOf(snap, cur) : -1;
+      if (parent >= 0)
+        this.selectByLine(parent);
+      return;
+    }
+    if (key === "ArrowRight") {
+      if (cur < 0)
+        return;
+      const child = firstChildRef(snap.nodes, cur);
+      if (!child)
+        return;
+      if (this.findNodeByLine(child.line))
+        this.selectByLine(child.line);
+      else
+        void this.expandInto(cur, child.line);
+      return;
+    }
+    const refs = visibleLeafRefs(
+      (_a = this.mm) == null ? void 0 : _a.state.data
+    );
+    const next = stepVisible(refs, cur, key === "ArrowDown" ? 1 : -1);
+    if (next)
+      this.selectByLine(next.line);
+  }
+  /** 展开某个节点、再选中它的长子（右侧遇到折叠时用） */
+  async expandInto(line, childLine) {
+    var _a;
+    const g = this.findNodeByLine(line);
+    const data = g ? g.__data__ : void 0;
+    if (!data || !this.mm)
+      return;
+    const fold = (_a = data.payload) == null ? void 0 : _a.fold;
+    if (typeof fold !== "number" || fold <= 0)
+      return;
+    await this.mm.toggleNode(data);
+    this.selectByLine(childLine);
+  }
+  /** 直接设定整组选中（框选结果）；additive=true 时并入现有集合。 */
+  applySelection(lines, primary, additive) {
+    if (!additive)
+      this.selectedLines.clear();
+    for (const l of lines)
+      if (l >= 0)
+        this.selectedLines.add(l);
+    this.primaryLine = primary >= 0 ? primary : this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+    this.anchorLine = this.primaryLine;
     this.paintSelection();
     this.syncToolbar();
   }
   /**
-   * 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class），
-   * 顺便把节点浮动条挂到选中的那个节点上。
+   * Ctrl/⌘ + 单击：在选中集合里加一个 / 去掉一个。
    *
-   * 浮动条每次重建后都要重新挂：markmap 的 setData 会换掉整批 g，
-   * 拿着旧元素等于指着一个已经掉出 DOM 的东西。
+   * 去掉时不改锚点（用户是在「剔除」，没在指定新的起点）；
+   * 加入时把锚点挪到它上面，这样「Ctrl 点一圈、再 Shift 拉区间」的直觉成立。
+   */
+  toggleSelection(line) {
+    if (line < 0)
+      return;
+    if (this.selectedLines.has(line)) {
+      this.selectedLines.delete(line);
+      if (this.primaryLine === line) {
+        this.primaryLine = this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+      }
+    } else {
+      this.selectedLines.add(line);
+      this.primaryLine = line;
+      this.anchorLine = line;
+    }
+    this.paintSelection();
+    this.syncToolbar();
+  }
+  /**
+   * 某个节点所在「同级组」的全部行号（按文档顺序）。
+   *
+   * 判定只看 depth：从自己往前扫，比它浅的那一行就是父节点，组从这里开始；
+   * 往后扫到第一个比它浅的为止。同级之间夹着的后代（depth 更深）会被跳过，
+   * 但不影响组的边界 —— 这正是「同层兄弟」的定义。
+   */
+  siblingLines(line) {
+    var _a;
+    const nodes = (_a = this.snapshot) == null ? void 0 : _a.nodes;
+    if (!nodes)
+      return [line];
+    const at = nodes.findIndex((n) => n.line === line);
+    if (at < 0)
+      return [line];
+    const depth = nodes[at].depth;
+    let start2 = at;
+    while (start2 > 0 && nodes[start2 - 1].depth >= depth)
+      start2--;
+    let end = at;
+    while (end + 1 < nodes.length && nodes[end + 1].depth >= depth)
+      end++;
+    const out = [];
+    for (let i = start2; i <= end; i++) {
+      if (nodes[i].depth === depth)
+        out.push(nodes[i].line);
+    }
+    return out.length ? out : [line];
+  }
+  /**
+   * Shift + 单击：选中「锚点 → 这一下」之间的同层节点。
+   *
+   * 只处理同级区间（文件管理器的多选就是这么用的）。锚点不在同一组时
+   * （比如锚点在另一根分支上），退化成「只选这个」并把它设为新锚点 ——
+   * 跨父节点的区间没有明确含义，猜一个反而更像 bug。
+   *
+   * @param additive 同时按着 Ctrl/⌘：区间并入现有选中，不替换
+   */
+  selectSiblingRange(line, additive) {
+    if (line < 0)
+      return;
+    const group = this.siblingLines(line);
+    const from = group.indexOf(this.anchorLine);
+    const to = group.indexOf(line);
+    if (from < 0 || to < 0) {
+      this.applySelection([line], line, additive);
+      return;
+    }
+    const anchor = this.anchorLine;
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    this.applySelection(group.slice(lo, hi + 1), line, additive);
+    this.anchorLine = anchor;
+  }
+  /**
+   * 把选中态刷到当前 DOM 上：所有在 selectedLines 里的节点都加 obmind-selected 类。
+   *
+   * 浮动条只在**单选**时出现（它是画布右侧的固定操作区，不再跟着节点跑）。
+   * 那几个按钮（子 / 同 / 改 / 提 / 删）语义都是「对这一个节点」：作用到一堆节点上，
+   * 改文字没意义、删除是灾难。框选完一排卡片之后还留着一排按钮，看起来就像
+   * 「这些操作会作用于全部」—— 批量操作是另一套（整块拖动、批量删除走键盘），
+   * 不给一个含糊的入口。
    */
   paintSelection() {
-    var _a, _b;
+    var _a, _b, _c;
     const svg = this.svgEl;
-    let hit = null;
     if (svg) {
+      const sel = this.selectedLines;
       for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-        const on = this.selectedLine >= 0 && ((_a = this.srcOf(g)) == null ? void 0 : _a.line) === this.selectedLine;
+        const on = sel.has((_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1);
         g.classList.toggle("obmind-selected", on);
-        if (on)
-          hit = g;
       }
     }
-    (_b = this.nodeBar) == null ? void 0 : _b.attach(hit);
+    (_c = this.nodeBar) == null ? void 0 : _c.setVisible(this.selectedLines.size === 1);
+  }
+  /**
+   * 只修指定节点的选中 class。
+   *
+   * 由 MutationObserver 在「markmap 重写了节点 class」时调用：它重排一次就把
+   * `obmind-selected` 抹掉，而内存里的选中态还在 —— 用户看到的是选中框凭空消失。
+   * 这里只补「本该选中、现在没有」的节点；classList.toggle 写同值不产生新记录，
+   * 不会和观察器互相触发。
+   */
+  paintSelectionOn(els) {
+    var _a, _b;
+    const sel = this.selectedLines;
+    for (const g of els) {
+      if (!g.isConnected)
+        continue;
+      const on = sel.has((_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1);
+      if (on === g.classList.contains("obmind-selected"))
+        continue;
+      g.classList.toggle("obmind-selected", on);
+    }
   }
   /**
    * 画布上的键盘操作。
@@ -9185,12 +10538,18 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.createNode("sibling");
       return;
     }
+    if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      e.preventDefault();
+      e.stopPropagation();
+      this.moveSelection(e.key);
+      return;
+    }
     if (e.key === "Escape") {
       if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
         this.helpPanel.addClass("is-hidden");
         return;
       }
-      this.setSelectedLine(-1);
+      this.applySelection([], -1, false);
       return;
     }
     if (e.key === "Delete" || e.key === "Backspace") {
@@ -9210,6 +10569,79 @@ var MindmapView = class extends import_obsidian3.ItemView {
     }
   }
   /**
+   * 视图内的单键 / 组合键：空格进编辑、Ctrl+N 建笔记。
+   *
+   * 为什么挂在视图根节点上而不是画布上：画布的 keydown 要求 `target === canvas`，
+   * 而焦点很容易不在那儿 —— 点过工具栏图标、点过面包屑、一轮重建之后焦点落到
+   * body，这些时候按空格本意都是「改这个节点的字」，收不到就是「按了没反应」。
+   *
+   * 三种情况必须让路，否则空格会变成破坏性按键：
+   * - 编辑框 / 任何输入控件里的空格是打字；
+   * - 按钮（含 .clickable-icon）上的空格是「按下这个按钮」的无障碍语义，
+   *   抢过来等于「焦点在删除按钮上按空格，反而开始编辑」；
+   * - 组字中（中文输入法）的按键不是指令。
+   */
+  onViewKeyDown(e) {
+    if (e.defaultPrevented || e.isComposing)
+      return;
+    if (isTypingTarget(e.target))
+      return;
+    if (this.rt.phase !== "idle")
+      return;
+    if (this.tryNewNoteHotkey(e))
+      return;
+    const mod = e.ctrlKey || e.metaKey;
+    if (e.code !== "Space" && e.key !== " ")
+      return;
+    if (mod || e.altKey || e.shiftKey)
+      return;
+    const line = this.primaryLine;
+    if (line < 0)
+      return;
+    const g = this.findNodeByLine(line);
+    if (!g)
+      return;
+    e.preventDefault();
+    this.startEdit(g, false);
+  }
+  /**
+   * Ctrl/⌘ + N：给选中节点建笔记。
+   *
+   * 这个组合在 Obsidian 里是「新建笔记」，导图里必须抢过来并拦住默认行为 ——
+   * 否则会先在别处开出一篇空笔记，用户还得自己关掉。
+   *
+   * @returns 是否已经消费这次按键
+   */
+  tryNewNoteHotkey(e) {
+    if (e.isComposing)
+      return false;
+    if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey)
+      return false;
+    if (e.code !== "KeyN" && e.key.toLowerCase() !== "n")
+      return false;
+    if (isTypingTarget(e.target))
+      return false;
+    e.preventDefault();
+    e.stopPropagation();
+    void this.createNoteForSelected();
+    return true;
+  }
+  /**
+   * 导图视图内的全局热键（目前只有 Ctrl/⌘+N），挂在 document 捕获阶段。
+   *
+   * 只在焦点确实在这个视图里时才接管：别处的 Ctrl+N 仍归 Obsidian 的新建笔记。
+   * 与 onViewKeyDown 里的同名分支并存不冲突 —— 这里先跑并 stopPropagation，
+   * 那边第一行就因 defaultPrevented 退出了。
+   */
+  onHotkeyCapture(e) {
+    if (this.rt.phase !== "idle")
+      return;
+    const target = e.target;
+    if (!(target instanceof Node) || !this.containerEl.contains(target))
+      return;
+    this.tryNewNoteHotkey(e);
+  }
+  /**
    * 焦点不在画布上时的 Esc 兜底。
    *
    * 只做两件事：收起帮助面板、取消选中。**不拦默认行为也不阻断冒泡** ——
@@ -9227,8 +10659,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.helpPanel.addClass("is-hidden");
       return;
     }
-    if (this.selectedLine >= 0)
-      this.setSelectedLine(-1);
+    if (this.selectedLines.size > 0)
+      this.applySelection([], -1, false);
   }
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
   createNode(mode) {
@@ -9261,16 +10693,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
    * 所以它的行号不变，可以直接定位。这样才能连着删兄弟节点。
    */
   removeNode() {
-    const line = this.selectedLine;
-    if (line < 0)
+    const selected = [...this.selectedLines].filter((l) => l >= 0);
+    if (selected.length === 0)
       return;
     const file = this.targetFile;
     const snap = this.editSnapshot();
     if (!file || !snap)
       return;
-    const size = this.editSvc.subtreeSize(snap, line);
-    const parentLine = this.editSvc.parentLineOf(snap, line);
-    const out = this.editSvc.remove({ snap, line });
+    const out = this.editSvc.removeGroup({ snap, lines: selected });
     if (out.kind === "error") {
       new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
       return;
@@ -9278,10 +10708,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (out.kind === "none")
       return;
     this.pendingEditLine = -1;
-    this.selectedLine = parentLine;
+    const focus = out.focusLine;
+    if (focus !== void 0 && focus >= 0)
+      this.applySelection([focus], focus, false);
+    else
+      this.applySelection([], -1, false);
     void this.applyPlan(file, out.op);
-    if (size > 1) {
-      new import_obsidian3.Notice(`obmind\uFF1A\u5DF2\u5220\u9664\u8BE5\u8282\u70B9\u53CA\u5176 ${size - 1} \u4E2A\u5B50\u8282\u70B9`);
+    if (selected.length > 1) {
+      new import_obsidian3.Notice(`obmind\uFF1A\u5DF2\u5220\u9664 ${selected.length} \u4E2A\u8282\u70B9`);
     }
   }
   /** 双击节点进入原地编辑 */
@@ -9311,17 +10745,19 @@ var MindmapView = class extends import_obsidian3.ItemView {
    * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
    * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
    */
-  onNodeDrop(srcLine, targetLine, mode) {
+  onNodeDrop(srcLines, targetLine, mode) {
     const file = this.targetFile;
     const snap = this.editSnapshot();
     if (!file || !snap)
       return;
-    const dragSrc = this.editSnapshot() ? this.nodeAt(srcLine) : null;
-    if (dragSrc && dragSrc.endLine !== void 0 && dragSrc.endLine > dragSrc.line) {
-      new import_obsidian3.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u6682\u4E0D\u652F\u6301\u62D6\u52A8\uFF0C\u8BF7\u5728\u7B14\u8BB0\u4E2D\u8C03\u6574\u5C42\u7EA7");
-      return;
+    for (const srcLine of srcLines) {
+      const dragSrc = this.nodeAt(srcLine);
+      if (dragSrc && dragSrc.endLine !== void 0 && dragSrc.endLine > dragSrc.line) {
+        new import_obsidian3.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u6682\u4E0D\u652F\u6301\u62D6\u52A8\uFF0C\u8BF7\u5728\u7B14\u8BB0\u91CC\u8C03\u6574\u5C42\u7EA7");
+        return;
+      }
     }
-    const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
+    const out = srcLines.length === 1 ? this.editSvc.move({ snap, srcLine: srcLines[0], targetLine, mode }) : this.editSvc.moveGroup({ snap, srcLines, targetLine, mode });
     if (out.kind === "error") {
       new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
       return;
@@ -9329,6 +10765,29 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (out.kind === "none")
       return;
     void this.applyPlan(file, out.op);
+  }
+  /**
+   * 给定节点行号，返回拖动时应一起移动的行号集合：
+   * 若该节点属于 size>1 的选中集，取选中集里所有「不被其它选中节点子树覆盖」的顶层成员；
+   * 否则只返回它自己。
+   */
+  groupOf(line) {
+    const snap = this.editSnapshot();
+    if (!snap || this.selectedLines.size <= 1 || !this.selectedLines.has(line))
+      return [line];
+    const nodes = snap.nodes;
+    const selected = [...this.selectedLines];
+    const keep = [];
+    for (const s of selected) {
+      const si = nodes.findIndex((n) => n.line === s);
+      if (si < 0)
+        continue;
+      const end = blockRange(nodes, si).end;
+      const covered = selected.some((o) => o !== s && o > s && o <= end);
+      if (!covered)
+        keep.push(s);
+    }
+    return keep.length ? keep : [line];
   }
   /** 执行写入计划并刷新（拖动、新建节点这类不属于编辑框的操作走这里） */
   async applyPlan(file, op) {
@@ -9415,6 +10874,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
   async commitEdit(action, value, src) {
     var _a;
     let next;
+    let revertPreview = null;
     try {
       if (action === "cancel")
         return;
@@ -9422,19 +10882,30 @@ var MindmapView = class extends import_obsidian3.ItemView {
       const snap = this.editSnapshot();
       if (!file || !snap)
         return;
+      revertPreview = this.previewText(src, value);
       const out = this.editSvc.commit({ snap, src, action, value });
       if (out.kind === "error") {
+        revertPreview == null ? void 0 : revertPreview();
+        revertPreview = null;
         this.pendingEditLine = -1;
         new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
         return;
       }
-      if (out.kind === "none")
+      if (out.kind === "none") {
+        revertPreview == null ? void 0 : revertPreview();
+        revertPreview = null;
         return;
+      }
       if (out.focusLine !== void 0)
         this.pendingEditLine = out.focusLine;
       const res = await this.runWrite(file, out.op);
       next = res.next;
+      if (!res.ok)
+        revertPreview == null ? void 0 : revertPreview();
+      revertPreview = null;
     } catch (err) {
+      revertPreview == null ? void 0 : revertPreview();
+      revertPreview = null;
       this.pendingEditLine = -1;
       console.error("[obmind] \u5199\u56DE\u7B14\u8BB0\u5931\u8D25", err);
       new import_obsidian3.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
@@ -9462,6 +10933,57 @@ var MindmapView = class extends import_obsidian3.ItemView {
    */
   editorValueOf(src) {
     return src.checked === null ? src.text : `${src.checked ? "\u2611" : "\u2610"} ${src.text}`;
+  }
+  /**
+   * 提交即预览：把编辑框里的新文字直接铺到卡片上，不等文件写完。
+   *
+   * 用**同一个** renderInline 渲染，所以后面真实投影到达时 innerHTML 逐字节相同，
+   * applyPatch 会跳过赋值 —— 屏幕上文字一次都不跳。
+   *
+   * 不预览的两种情况：
+   * - 文本被清空（提交时会放弃这次修改，节点保持原样，没有新内容可预览）；
+   * - 内容没变（白白重排一次）。
+   *
+   * @returns 还原函数；写失败时调用，把卡片退回旧内容
+   */
+  previewText(src, raw) {
+    var _a, _b, _c;
+    const parsed = parseEditorValue(src, raw);
+    if (parsed.text === "")
+      return null;
+    if (parsed.text === src.text && parsed.checked === src.checked)
+      return null;
+    const g = this.findNodeByLine(src.line);
+    if (!g)
+      return null;
+    const fo = g.querySelector(":scope > foreignObject");
+    const box = (_a = fo == null ? void 0 : fo.firstElementChild) == null ? void 0 : _a.firstElementChild;
+    if (!fo || !box)
+      return null;
+    const shown = parsed.checked === null ? parsed.text : `${parsed.checked ? "\u2611" : "\u2610"} ${parsed.text}`;
+    const html = renderInline(shown);
+    const prevHtml = box.innerHTML;
+    const prevW = (_b = fo.getAttribute("width")) != null ? _b : "";
+    const prevH = (_c = fo.getAttribute("height")) != null ? _c : "";
+    if (prevHtml !== html)
+      box.innerHTML = html;
+    const w = box.scrollWidth;
+    const h2 = box.scrollHeight;
+    if (w > 0 && h2 > 0) {
+      fo.setAttribute("width", String(w));
+      fo.setAttribute("height", String(h2));
+    }
+    this.reflowSoon();
+    return () => {
+      if (!fo.isConnected || !box.isConnected)
+        return;
+      box.innerHTML = prevHtml;
+      if (prevW)
+        fo.setAttribute("width", prevW);
+      if (prevH)
+        fo.setAttribute("height", prevH);
+      this.reflowSoon();
+    };
   }
   /**
    * 执行一次写入计划。
@@ -9511,7 +11033,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     });
   }
   async onClose() {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g;
     this.rt.dispose();
     (_a = this.editorHandle) == null ? void 0 : _a.close();
     this.editorHandle = null;
@@ -9536,6 +11058,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.blockCache.clear();
     (_e = this.drag) == null ? void 0 : _e.destroy();
     this.drag = null;
+    (_f = this.boxSelect) == null ? void 0 : _f.destroy();
+    this.boxSelect = null;
     this.snapshot = null;
     this.navStack = [];
     this.leafById.clear();
@@ -9543,7 +11067,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.selectedLine = -1;
     this.history = EMPTY_HISTORY;
     this.toolbar = null;
-    (_f = this.nodeBar) == null ? void 0 : _f.destroy();
+    (_g = this.nodeBar) == null ? void 0 : _g.destroy();
     this.nodeBar = null;
     this.helpPanel = null;
     this.svgEl = null;
@@ -9558,7 +11082,8 @@ var import_obsidian4 = require("obsidian");
 var DEFAULT_SETTINGS = {
   theme: "follow",
   filterFrontmatter: true,
-  navSync: DEFAULT_NAV_SYNC
+  navSync: DEFAULT_NAV_SYNC,
+  noteTemplate: ""
 };
 var ObmindSettingTab = class extends import_obsidian4.PluginSettingTab {
   constructor(app, plugin) {
@@ -9593,6 +11118,15 @@ var ObmindSettingTab = class extends import_obsidian4.PluginSettingTab {
         const mode = normalizeNavSync(value);
         this.plugin.settings.navSync = mode;
         paintHint(mode);
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian4.Setting(containerEl).setName("\u65B0\u5EFA\u7B14\u8BB0\u6A21\u677F").setDesc(
+      "\u4ECE\u8282\u70B9\u65B0\u5EFA\u7B14\u8BB0\uFF08Ctrl+N\uFF09\u65F6\u5957\u7528\u8FD9\u7BC7\u6A21\u677F\u7684\u5185\u5BB9\uFF1B\u7559\u7A7A\u5219\u65B0\u5EFA\u4E00\u7BC7\u7A7A\u767D\u7B14\u8BB0\u3002\u53EF\u7528\u53D8\u91CF\uFF1A{{title}} \u7B14\u8BB0\u540D\u3001{{date}} \u4ECA\u5929\u3001{{time}} \u73B0\u5728\u3001{{from}} \u6765\u6E90\u7B14\u8BB0\u7684\u53CC\u94FE\u3002\u65E5\u671F\u65F6\u95F4\u53EF\u5E26\u683C\u5F0F\uFF0C\u5982 {{date:YYYY\u5E74MM\u6708DD\u65E5}}\u3002\u65B0\u5EFA\u7B14\u8BB0\u653E\u5728\u54EA\u91CC\uFF0C\u8DDF\u968F Obsidian \u8BBE\u7F6E\u91CC\u7684\u300C\u65B0\u5EFA\u7B14\u8BB0\u7684\u5B58\u653E\u4F4D\u7F6E\u300D\u3002"
+    ).addText((text) => {
+      text.inputEl.addClass("obmind-setting-input");
+      text.setPlaceholder("\u6A21\u677F/\u7B14\u8BB0\u6A21\u677F.md\uFF08\u7559\u7A7A = \u7A7A\u767D\u7B14\u8BB0\uFF09").setValue(this.plugin.settings.noteTemplate).onChange(async (value) => {
+        this.plugin.settings.noteTemplate = value.trim();
         await this.plugin.saveSettings();
       });
     });
@@ -9661,6 +11195,11 @@ var MindmapPlugin = class extends import_obsidian5.Plugin {
         id: "mindmap-reread",
         name: "\u91CD\u65B0\u8BFB\u53D6\u7B14\u8BB0\u5E76\u91CD\u7ED8\u5BFC\u56FE",
         callback: () => this.withMindmap((view) => void view.refresh())
+      });
+      this.addCommand({
+        id: "mindmap-create-note",
+        name: "\u4E3A\u9009\u4E2D\u8282\u70B9\u65B0\u5EFA\u7B14\u8BB0\u5E76\u53CC\u94FE",
+        callback: () => this.withMindmap((view) => void view.createNoteForSelected())
       });
     });
     this.safely("\u6DFB\u52A0\u8BBE\u7F6E\u9875", () => {

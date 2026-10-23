@@ -2,3 +2,6 @@ node_modules/
 main.js.map
 *.js.map
 .DS_Store
+# 回归测试的 esbuild 打包产物（由 npm test 生成）
+scripts/testBatch.mjs
+tmp/

@@ -1,13 +1,18 @@
 {
   "name": "obmind",
-  "version": "1.12.0",
+  "version": "1.17.3",
   "description": "Turn the current note's outline (filename as root, indentation as hierarchy) into an interactive mindmap.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node scripts/runTest.mjs"
   },
-  "keywords": ["obsidian", "mindmap", "outline"],
+  "keywords": [
+    "obsidian",
+    "mindmap",
+    "outline"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {

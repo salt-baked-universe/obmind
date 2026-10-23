@@ -120,12 +120,44 @@ export class NodePainter {
   }
 
   /**
+   * 只同步透明度：给「markmap 改了 foreignObject 的 style.opacity」这条事件用。
+   *
+   * 为什么不能只在全量/增量绘制里读一次透明度：
+   * `renderData` 对 enter 节点是先写 `opacity: 0`、再起过渡到 1 的。我们正好在
+   * 中间那一瞬全量绘制，读完就把它写进卡片 → 一张「透明度 0」的卡片。
+   * 之后能不能恢复，全看这个节点还有没有 transform 写入恰好触发另一次绘制 ——
+   * 没有就永远不恢复（那一块图连卡片带底都没了，就是「只渲染了一半」）。
+   *
+   * 现在把「透明度变化」本身当成事件源：markmap 每帧写一次 opacity，我们每帧跟一次，
+   * 不依赖 transform、也不受重建期 blocked 的影响（这一步不读布局，随时都安全）。
+   */
+  syncFadeFor(els: Iterable<SVGGElement>): void {
+    for (const g of els) {
+      if (!g.isConnected) continue;
+      const path = nodePathOf(g);
+      if (!path) continue;
+      const entry = this.entries.get(path);
+      if (!entry || entry.g !== g) continue;
+      const fo = entry.fo.isConnected
+        ? entry.fo
+        : g.querySelector<SVGForeignObjectElement>(":scope > foreignObject");
+      if (!fo) continue;
+      entry.fo = fo;
+      this.writeFade(entry, readOpacity(fo));
+    }
+  }
+
+  /**
    * 全量绘制：结构发生变化时调用。
    * 只在「重建导图 / 节点增删 / 主题切换」这类低频事件里跑。
+   *
+   * @returns 这一遍**没画成**的节点数（几何还读不到：markmap 刚 append、
+   *          内容尺寸还是 0）。>0 说明 DOM 还没长全，调用方应隔一帧再画一遍 ——
+   *          否则这些节点会永远没有卡片，看起来就是「只渲染了半张图」。
    */
-  paintAll(svg: SVGSVGElement, spec: ThemeSpec): void {
-    const { boxes, byPath } = this.collect(svg);
-    if (boxes.length === 0) return;
+  paintAll(svg: SVGSVGElement, spec: ThemeSpec): number {
+    const { boxes, byPath, skipped } = this.collect(svg);
+    if (boxes.length === 0) return skipped || svg.querySelectorAll("g.markmap-node").length;
 
     // 主题键提到循环外：折叠动画每帧都会走到这里，按节点拼一次字符串
     // 在两千节点的笔记上就是每秒几万次临时分配
@@ -145,6 +177,7 @@ export class NodePainter {
     }
 
     this.prune(boxes);
+    return skipped;
   }
 
   /**
@@ -194,7 +227,15 @@ export class NodePainter {
       if (!box) continue;
 
       const entry = this.entryOf(box);
-      if (!entry.link) this.ensureLayers(box.g, entry);
+      if (!entry.link) {
+        // 第一次在这个通道见到它（全量绘制时它还没几何）：只建图层不写尺寸的话，
+        // 会得到一堆宽高未设置的 <rect> —— 视觉上就是这张卡片消失了。
+        // 顺手把样式、尺寸、收放点一起补齐。
+        this.ensureLayers(box.g, entry);
+        this.applyStyle(box, entry, spec, `${spec.id}|${spec.dark ? 1 : 0}`);
+        this.applySize(box, entry);
+        this.applyCircle(box, entry);
+      }
       this.syncFade(box, entry);
 
       if (box.depth === 0) continue;
@@ -235,13 +276,19 @@ export class NodePainter {
   private collect(svg: SVGSVGElement): {
     boxes: NodeBox[];
     byPath: Map<string, NodeBox>;
+    /** 读不到几何的节点数（还没布局 / 尺寸为 0） */
+    skipped: number;
   } {
     const boxes: NodeBox[] = [];
     const byPath = new Map<string, NodeBox>();
     const index = new Map<string, SVGGElement>();
+    let skipped = 0;
     for (const el of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
       const box = readNodeBox(el);
-      if (!box) continue;
+      if (!box) {
+        skipped++;
+        continue;
+      }
       boxes.push(box);
       byPath.set(box.path, box);
       index.set(box.path, el);
@@ -249,7 +296,7 @@ export class NodePainter {
     // 全量绘制本来就要扫一遍，顺手把索引换成最新的
     this.index = index;
     this.indexReady = index.size > 0;
-    return { boxes, byPath };
+    return { boxes, byPath, skipped };
   }
 
   /** 取（或重建）节点缓存。g 被 markmap 重建、元素掉出 DOM 时都要重置。 */

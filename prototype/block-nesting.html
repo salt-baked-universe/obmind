@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>obmind · 块级语法能不能当节点的内容</title>
+<style>
+  :root{
+    --bg:#fbf7f9;
+    --panel:#ffffff;
+    --card:#fdeef4;
+    --card2:#fff8fb;
+    --edge:#f2d4e2;
+    --ink:#3d2b33;
+    --muted:#947d89;
+    --line:#d4568a;
+    --accent:#c2185b;
+    --code-bg:#2b2431;
+    --code-ink:#f4e8ef;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--ink);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    display:flex;flex-direction:column;overflow:hidden;
+  }
+
+  /* ---------- header ---------- */
+  header{
+    display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+    padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--edge);
+  }
+  .title{font-size:15px;font-weight:600;letter-spacing:.2px}
+  .title small{display:block;font-weight:400;font-size:12px;color:var(--muted);margin-top:2px}
+  nav{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+  nav button{
+    border:1px solid var(--edge);background:#fff;color:var(--muted);
+    padding:6px 12px;border-radius:999px;cursor:pointer;font:inherit;font-size:13px;
+    transition:.15s;
+  }
+  nav button:hover{border-color:#e7b7cd;color:var(--ink)}
+  nav button[aria-selected="true"]{
+    background:var(--accent);border-color:var(--accent);color:#fff;font-weight:500;
+  }
+  .toggle{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted);cursor:pointer;user-select:none}
+  .toggle input{accent-color:var(--accent)}
+
+  /* ---------- body ---------- */
+  main{flex:1;display:grid;grid-template-columns:400px 1fr;min-height:0}
+  .pane{display:flex;flex-direction:column;min-height:0;min-width:0}
+  .pane + .pane{border-left:1px solid var(--edge)}
+  .pane-title{
+    padding:9px 16px;font-size:12px;letter-spacing:.4px;color:var(--muted);
+    background:var(--panel);border-bottom:1px solid var(--edge);flex:none;
+  }
+  .pane-title b{color:var(--ink);font-weight:600}
+
+  /* ---------- markdown ---------- */
+  #md{flex:1;overflow:auto;padding:10px 0 24px;background:var(--panel);font:13px/1.85 ui-monospace,Consolas,"Cascadia Code",monospace}
+  .ln{display:flex;padding:0 14px 0 0;border-left:3px solid transparent}
+  .ln .no{flex:none;width:38px;text-align:right;padding-right:12px;color:#c9b6c0;user-select:none}
+  .ln .tx{white-space:pre;color:#43303a}
+  .ln.m-code{border-left-color:#7c5cff;background:#f7f4ff}
+  .ln.m-quote{border-left-color:var(--line);background:#fdf3f8}
+  .ln.m-table{border-left-color:#2f9e9e;background:#f1fafa}
+  .m-quote{color:var(--accent);font-style:normal}
+  .m-fence{color:#7c5cff}
+  .m-bar{color:#2f9e9e}
+
+  /* ---------- canvas ---------- */
+  .canvas-wrap{background:#fdfbfc;
+    background-image:radial-gradient(#efe3ea 1px,transparent 1px);
+    background-size:18px 18px;}
+  #viewport{flex:1;overflow:auto;padding:20px;min-height:0;
+    display:flex;align-items:center;justify-content:center}
+  #center{position:relative;flex:none}
+  #stage{position:absolute;left:0;top:0;transform-origin:0 0}
+  #links{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+  #links path{fill:none;stroke:var(--line);stroke-width:1.8;stroke-opacity:.8}
+
+  .card{
+    position:absolute;background:linear-gradient(180deg,#fff7fa,#fdeaf3);
+    border:1px solid var(--edge);border-radius:10px;
+    padding:8px 12px;box-shadow:0 1px 2px rgba(180,120,150,.10),0 4px 14px rgba(180,120,150,.06);
+    color:var(--ink);
+  }
+  .card.is-block{border-color:#e9c3d5}
+  .card.in-quote{border-left:3px solid rgba(194,24,91,.45);
+    background:linear-gradient(180deg,#fff3f8,#fde4ef)}
+  .card.is-frame{box-shadow:0 0 0 2px rgba(194,24,91,.16),0 4px 14px rgba(180,120,150,.08)}
+  .card.is-frame::after{
+    content:"引用块";position:absolute;top:-9px;right:9px;
+    background:var(--accent);color:#fff;font-size:10px;letter-spacing:.3px;
+    padding:1px 6px;border-radius:6px;
+  }
+  .card-text{font-size:13.5px;line-height:1.45;word-break:break-word}
+  .card-text.root{font-weight:600;font-size:14.5px;color:#8e1e4c}
+
+  .blk{margin-top:7px;border-radius:8px;overflow:hidden}
+  .blk-code{background:var(--code-bg);color:var(--code-ink);
+    font:12px/1.6 ui-monospace,Consolas,monospace}
+  .blk-code .head{
+    font:11px/1 ui-monospace,Consolas,monospace;color:#c8a9bd;
+    padding:6px 10px 5px;border-bottom:1px solid rgba(255,255,255,.10);
+  }
+  .blk-code pre{margin:0;padding:8px 10px;overflow:auto;white-space:pre}
+  .blk-quote{
+    border-left:3px solid var(--accent);background:#fff3f8;
+    padding:6px 10px;color:#6b4a58;font-size:12.5px;line-height:1.6;
+  }
+  .blk-table{font-size:12px}
+  .blk-table table{border-collapse:collapse;width:100%}
+  .blk-table th,.blk-table td{border:1px solid #efcade;padding:3px 8px;text-align:left}
+  .blk-table th{background:#fbe4ef;font-weight:600}
+  .blk-table tr:nth-child(even) td{background:#fff8fb}
+  .pill{
+    margin-top:7px;display:inline-flex;align-items:center;gap:6px;
+    background:#fbe4ef;border:1px solid #efcade;border-radius:7px;
+    padding:3px 9px;font-size:11.5px;color:#a4486f;white-space:nowrap;
+  }
+  .pill i{font-style:normal;opacity:.7}
+  .ghost{
+    margin-top:6px;font-size:11.5px;color:#b08fa0;font-style:italic;
+    border-left:2px dashed #e4c8d6;padding-left:8px;
+  }
+
+  /* ---------- footer ---------- */
+  footer{
+    flex:none;background:var(--panel);border-top:1px solid var(--edge);
+    padding:10px 20px 12px;font-size:12.5px;color:var(--muted);
+    display:flex;gap:22px;flex-wrap:wrap;
+  }
+  footer .item{display:flex;gap:7px;align-items:baseline;max-width:52ch}
+  footer .k{flex:none;color:#c2185b;font-weight:600}
+  footer .item.warn .k{color:#b0723a}
+
+  @media (max-width:900px){
+    main{grid-template-columns:1fr;grid-template-rows:38% 1fr}
+    .pane + .pane{border-left:none;border-top:1px solid var(--edge)}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title">块级语法能不能当「节点的内容」
+    <small>左边是你写的 Markdown，右边是导图会呈现的样子</small>
+  </div>
+  <nav id="tabs"></nav>
+  <label class="toggle"><input type="checkbox" id="fold" checked> 内容块折叠成一行</label>
+</header>
+
+<main>
+  <section class="pane">
+    <div class="pane-title">Markdown 写法 · <b id="mdname"></b></div>
+    <div id="md"></div>
+  </section>
+  <section class="pane canvas-wrap">
+    <div class="pane-title">导图结果</div>
+    <div id="viewport"><div id="center"><div id="stage"><svg id="links"></svg></div></div></div>
+  </section>
+</main>
+
+<footer id="notes"></footer>
+
+<script>
+/* ============================================================
+   数据：每个方案 = 一份 Markdown（逐行，带块标记）+ 一棵期望的树
+   ============================================================ */
+const L = (t, m) => ({ t, m });
+
+const CODE = [
+  "def search(q):",
+  "    return index.lookup(q)",
+];
+
+const DATA = {
+  rec: {
+    tab: "A+B · 推荐",
+    name: "块归节点 + 引用整块",
+    md: [
+      L("- 检索流程"),
+      L("  - 代码示例"),
+      L("    ```python", "code"),
+      L("    " + CODE[0], "code"),
+      L("    " + CODE[1], "code"),
+      L("    ```", "code"),
+      L("    - 这段负责向量召回"),
+      L("    - 参数在 config.yaml"),
+      L("  - 引用"),
+      L("    > 引用的第一行", "quote"),
+      L("    > 引用的第二行", "quote"),
+      L("  - 对比表"),
+      L("    | 方案 | 延迟 |", "table"),
+      L("    |---|---|", "table"),
+      L("    | IVF-PQ | 12ms |", "table"),
+      L("    | HNSW | 8ms |", "table"),
+    ],
+    tree: {
+      text: "检索流程", root: true,
+      children: [
+        {
+          text: "代码示例",
+          block: { kind: "code", lang: "python", lines: CODE },
+          children: [
+            { text: "这段负责向量召回" },
+            { text: "参数在 config.yaml" },
+          ],
+        },
+        {
+          text: "引用",
+          block: { kind: "quote", lines: ["引用的第一行", "引用的第二行"] },
+        },
+        {
+          text: "对比表",
+          block: { kind: "table", head: ["方案", "延迟"], rows: [["IVF-PQ", "12ms"], ["HNSW", "8ms"]] },
+        },
+      ],
+    },
+    notes: [
+      { k: "规则", v: "块紧跟在节点行后面、缩进 ≥ 该节点 → 算这个节点的内容；缩进再深一层的才是子节点。" },
+      { k: "好处", v: "节点仍是「一行文字」：有行坐标、能编辑、能拖、能继续当父节点。" },
+      { k: "代价", v: "移动节点必须连块一起搬；块本身只读，改代码要双击进原笔记或另开入口。" },
+    ],
+  },
+
+  now: {
+    tab: "现状",
+    name: "块被当成子节点",
+    md: [
+      L("- 检索流程"),
+      L("  - 代码示例"),
+      L("    ```python", "code"),
+      L("    " + CODE[0], "code"),
+      L("    ```", "code"),
+      L("  - 引用"),
+      L("    > 第一行引用", "quote"),
+      L("    > 第二行引用", "quote"),
+      L("    > - 引用里的列表项", "quote"),
+    ],
+    tree: {
+      text: "检索流程", root: true,
+      children: [
+        {
+          text: "代码示例",
+          children: [{ text: "代码块 · python · 2 行", ghost: true }],
+        },
+        { text: "引用" },
+        { text: "第一行引用", ghost: true },
+        { text: "第二行引用", ghost: true },
+        { text: "引用里的列表项", ghost: true },
+      ],
+    },
+    notes: [
+      { k: "问题 1", v: "多行引用被拆成每行一个同级节点 —— 引用这个「块」的边界没了，看着像三四条互不相干的并列项。", warn: true },
+      { k: "问题 2", v: "代码块 / 表格变成了上一个节点的子节点，卡片里只剩一句占位文案；它们还没有行坐标，不能编辑、不能拖。", warn: true },
+      { k: "问题 3", v: "> ```js 这种「引用里的代码块」直接碎成四行（块识别发生在剥 > 之前）。", warn: true },
+    ],
+  },
+
+  b: {
+    tab: "B · 引用整块",
+    name: "引用当成一个块",
+    md: [
+      L("- 检索流程"),
+      L("  - 引用"),
+      L("    > 第一行引用", "quote"),
+      L("    > 第二行引用", "quote"),
+      L("    > 第三行引用", "quote"),
+      L("  - 下一个节点"),
+    ],
+    tree: {
+      text: "检索流程", root: true,
+      children: [
+        {
+          text: "引用",
+          block: { kind: "quote", lines: ["第一行引用", "第二行引用", "第三行引用"] },
+        },
+        { text: "下一个节点" },
+      ],
+    },
+    notes: [
+      { k: "规则", v: "连续的 > 行合成一个节点，卡片里按引用样式整块渲染。" },
+      { k: "好处", v: "改动最小，只解决「引用被拍平」这一件事，不碰父子关系。" },
+      { k: "代价", v: "引用**内部**的列表、代码不再进导图 —— 它们被收进块里，只有视觉上的层级。" },
+    ],
+  },
+
+  c: {
+    tab: "C · 引用容器",
+    name: "引用当透明的壳",
+    md: [
+      L("- 检索流程"),
+      L("  > 引用标题", "quote"),
+      L("  > - 项一", "quote"),
+      L("  > - 项二", "quote"),
+      L("  - 普通节点"),
+    ],
+    tree: {
+      text: "检索流程", root: true,
+      children: [
+        {
+          text: "引用标题",
+          quoteFrame: true,
+          children: [{ text: "项一", inQuote: true }, { text: "项二", inQuote: true }],
+        },
+        { text: "普通节点" },
+      ],
+    },
+    notes: [
+      { k: "规则", v: "> 只是前缀，剥掉之后按引用内部的缩进建树 —— 引用里的列表项成为真正的子节点。" },
+      { k: "好处", v: "唯一能保住「引用内部结构」的方案，写笔记时引用就是一层容器。" },
+      { k: "代价", v: "回写要按祖先的引用层级重建 > 前缀，缩进还得在引用内部重新起算；工作量约是 A+B 的两倍。" },
+    ],
+  },
+};
+
+/* ============================================================
+   渲染：Markdown 面板
+   ============================================================ */
+const esc = (s) =>
+  String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function hi(line) {
+  let s = esc(line);
+  s = s.replace(/^(\s*)((?:&gt;\s?)+)/, (m, ws, q) => ws + `<i class="m-quote">${q}</i>`);
+  s = s.replace(/^(\s*)((?:`{3,}|~{3,})\S*)/, (m, ws, f) => ws + `<i class="m-fence">${f}</i>`);
+  s = s.replace(/^(\s*)(\|)/, (m, ws, b) => ws + `<i class="m-bar">${b}</i>`);
+  return s;
+}
+
+function renderMd(rows) {
+  document.getElementById("md").innerHTML = rows
+    .map((r, i) => {
+      const cls = r.m ? ` m-${r.m}` : "";
+      return `<div class="ln${cls}"><span class="no">${i + 1}</span><span class="tx">${hi(r.t) || " "}</span></div>`;
+    })
+    .join("");
+}
+
+/* ============================================================
+   渲染：导图
+   ============================================================ */
+const GAP_X = 66;
+const GAP_Y = 16;
+const PAD = 24;
+
+function cardHTML(n, fold) {
+  let h = `<div class="card-text${n.root ? " root" : ""}">${esc(n.text)}</div>`;
+  if (n.ghost) h += `<div class="ghost">（占位，不可编辑）</div>`;
+  if (n.block) h += blockHTML(n.block, fold);
+  return h;
+}
+
+function blockHTML(b, fold) {
+  if (fold) {
+    const label =
+      b.kind === "code" ? `${b.lang} · ${b.lines.length} 行`
+      : b.kind === "quote" ? `引用 · ${b.lines.length} 行`
+      : `表格 · ${b.head.length} 列 · ${b.rows.length} 行`;
+    return `<div class="pill"><i>▤</i>${esc(label)}</div>`;
+  }
+  if (b.kind === "code") {
+    return `<div class="blk blk-code"><div class="head">${esc(b.lang)}</div><pre>${esc(b.lines.join("\n"))}</pre></div>`;
+  }
+  if (b.kind === "quote") {
+    return `<div class="blk blk-quote">${b.lines.map(esc).join("<br>")}</div>`;
+  }
+  const head = b.head.map((c) => `<th>${esc(c)}</th>`).join("");
+  const body = b.rows
+    .map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`)
+    .join("");
+  return `<div class="blk blk-table"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+let fitScale = 1;
+
+function draw(tree, fold) {
+  const stage = document.getElementById("stage");
+  const svg = document.getElementById("links");
+  const viewport = document.getElementById("viewport");
+
+  stage.querySelectorAll(".card").forEach((e) => e.remove());
+  svg.innerHTML = "";
+
+  const cards = [];
+  const layers = [];
+
+  // 1) 先按内容宽度建卡片（max-content），供测量
+  (function walk(n, depth) {
+    const el = document.createElement("div");
+    let cls = "card";
+    if (n.block || n.ghost) cls += " is-block";
+    if (n.inQuote) cls += " in-quote";
+    if (n.quoteFrame) cls += " is-frame";
+    el.className = cls;
+    el.innerHTML = cardHTML(n, fold);
+    el.style.width = "max-content";
+    el.style.maxWidth = "340px";
+    el.style.left = "0px";
+    el.style.top = "0px";
+    stage.appendChild(el);
+    n.__el = el;
+    (layers[depth] = layers[depth] || []).push(el);
+    cards.push({ n, el, depth });
+    (n.children || []).forEach((c) => walk(c, depth + 1));
+  })(tree, 0);
+
+  // 2) 同一层统一宽度（导图看起来才齐）。用 scrollWidth 兜底：
+  //    卡片里有 nowrap 的 pill 时，offsetWidth 会小于内容真实需要的宽度。
+  const widths = layers.map((list) =>
+    Math.max(...list.map((el) => Math.max(el.offsetWidth, el.scrollWidth))),
+  );
+  const xs = [];
+  let x = PAD;
+  widths.forEach((w) => { xs.push(x); x += w + GAP_X; });
+
+  cards.forEach((c) => {
+    c.el.style.maxWidth = "none";
+    c.el.style.width = widths[c.depth] + "px";
+    c.el.style.left = xs[c.depth] + "px";
+  });
+
+  // 3) 纵向布局：叶子按顺序排，父节点落在子节点区间的中心
+  let cursor = PAD;
+  (function place(n) {
+    const el = n.__el;
+    const h = el.offsetHeight;
+    const kids = n.children || [];
+    if (!kids.length) {
+      el.style.top = cursor + "px";
+      cursor += h + GAP_Y;
+      return;
+    }
+    const start = cursor;
+    kids.forEach(place);
+    const end = cursor - GAP_Y;
+    el.style.top = Math.round((start + end) / 2 - h / 2) + "px";
+  })(tree);
+
+  // 4) 连线（父右中 → 子左中，三次贝塞尔）
+  let maxR = 0, maxB = 0;
+  cards.forEach(({ n, el }) => {
+    const r = box(el);
+    maxR = Math.max(maxR, r.right);
+    maxB = Math.max(maxB, r.bottom);
+    (n.children || []).forEach((c) => {
+      const q = box(c.__el);
+      maxR = Math.max(maxR, q.right);
+      maxB = Math.max(maxB, q.bottom);
+      const x1 = r.right, y1 = r.cy, x2 = q.left, y2 = q.cy;
+      const mx = x1 + (x2 - x1) / 2;
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
+      svg.appendChild(p);
+    });
+  });
+
+  // 引用容器：这里不改画法，靠卡片的 in-quote / is-frame 样式表达
+
+  const w = maxR + PAD;
+  const h = maxB + PAD;
+  stage.style.width = w + "px";
+  stage.style.height = h + "px";
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+
+  fit(viewport, w, h);
+}
+
+function box(el) {
+  const l = el.offsetLeft, t = el.offsetTop, w = el.offsetWidth, h = el.offsetHeight;
+  return { left: l, right: l + w, top: t, bottom: t + h, cy: t + h / 2 };
+}
+
+function fit(viewport, w, h) {
+  const availW = viewport.clientWidth - 40;
+  const availH = viewport.clientHeight - 40;
+  // 上限 1.25：图本来就小的时候放大一点更好读，但别放到失真
+  const k = Math.max(0.45, Math.min(1.25, availW / w, availH / h));
+  fitScale = k;
+  const center = document.getElementById("center");
+  const stage = document.getElementById("stage");
+  stage.style.transform = `scale(${k})`;
+  // 外层 center 承担缩放后的真实占位，flex 居中才算得对
+  center.style.width = w * k + "px";
+  center.style.height = h * k + "px";
+}
+
+/* ============================================================
+   交互
+   ============================================================ */
+let current = "rec";
+
+function renderNotes(notes) {
+  document.getElementById("notes").innerHTML = notes
+    .map((n) => `<div class="item${n.warn ? " warn" : ""}"><span class="k">${esc(n.k)}</span><span>${esc(n.v)}</span></div>`)
+    .join("");
+}
+
+function renderTabs() {
+  const nav = document.getElementById("tabs");
+  nav.innerHTML = "";
+  Object.entries(DATA).forEach(([key, d]) => {
+    const b = document.createElement("button");
+    b.textContent = d.tab;
+    b.setAttribute("aria-selected", key === current ? "true" : "false");
+    b.onclick = () => { current = key; renderTabs(); paint(); };
+    nav.appendChild(b);
+  });
+}
+
+function paint() {
+  const d = DATA[current];
+  const fold = document.getElementById("fold").checked;
+  document.getElementById("mdname").textContent = d.name;
+  renderMd(d.md);
+  renderNotes(d.notes);
+  // 等 Markdown 面板回流后再画图，避免读 offsetHeight 读到 0
+  requestAnimationFrame(() => draw(d.tree, fold));
+}
+
+document.getElementById("fold").addEventListener("change", paint);
+window.addEventListener("resize", () => {
+  const d = DATA[current];
+  draw(d.tree, document.getElementById("fold").checked);
+});
+
+renderTabs();
+paint();
+</script>
+</body>
+</html>

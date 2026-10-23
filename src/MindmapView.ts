@@ -14,7 +14,7 @@ import {
 import type { WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
-import { collectBlocks } from "./parser";
+import { collectBlocks, renderInline } from "./parser";
 import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
 import { resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
@@ -23,10 +23,15 @@ import { BranchColors, branchKey, branchPathOf, hash32 } from "./render/colors";
 import { FrameScheduler } from "./render/frame";
 import { waitStableSize } from "./render/viewport";
 import { applyFolds, collectFolds } from "./edit/folds";
+import { firstChildRef, stepVisible, visibleLeafRefs } from "./domain/nav";
+import type { NavNode } from "./domain/nav";
+import { parseEditorValue } from "./edit/text";
 import { openInlineEditor } from "./edit/inlineText";
 import type { EditorAction, InlineEditorHandle } from "./edit/inlineText";
 import { applyOp, findEditor } from "./edit/writer";
 import { DragController } from "./edit/drag";
+import { blockRange } from "./edit/move";
+import { BoxSelectController } from "./edit/boxSelect";
 import { EditService } from "./app/EditService";
 import type { EditSnapshot } from "./app/EditService";
 import { pushEntry, pushEntryDetailed, topOf, truncateTo } from "./app/NavStack";
@@ -39,11 +44,21 @@ import {
 } from "./app/NavPolicy";
 import type { ForwardTarget, NavSyncMode } from "./app/NavPolicy";
 import { QueryService } from "./app/QueryService";
+import {
+  applyTemplate,
+  hasWikiLink,
+  linkLiteral,
+  notePathOf,
+  noteTitleOf,
+  resolveNoteFolder,
+} from "./app/notePlan";
 import { canRedo, canUndo, EMPTY_HISTORY, record, redo, undo } from "./app/History";
 import type { HistoryState } from "./app/History";
 import { buildToolbar, GLOBAL_GROUPS, NODE_GROUPS } from "./ui/toolbar";
 import type { ToolbarActionId, ToolbarHandle } from "./ui/toolbar";
 import { NodeBar } from "./ui/nodeBar";
+import { isTypingTarget } from "./ui/keyGuard";
+import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
 import { planProjection } from "./app/plan";
 import {
@@ -65,16 +80,23 @@ type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
 /** 快捷键说明面板的内容。改一处就够，不必再维护标记里的长 tooltip。 */
 const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["单击", "选中节点（之后可用下面的按键）"],
-  ["选中后", "卡片下方浮出操作条：新建子级 / 同级、编辑、提升、删除"],
-  ["双击 / F2", "原地编辑"],
+  ["选中后", "画布右侧浮出操作条：新建子级 / 同级、新建笔记、编辑、提升、删除"],
+  ["双击 / F2 / 空格", "原地编辑（空格不需要先用鼠标点进画布）"],
   ["Tab / Enter", "新建子级 / 新建同级"],
+  ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
+  ["↑ ↓", "换选中：在末级节点之间前后走（不落到分支上）"],
+  ["← →", "换选中：父级 / 子级（折叠着会自动展开）"],
   ["Shift+Tab", "提升一级"],
-  ["Delete", "删除节点及其全部子节点"],
+  ["Delete", "删除节点及其全部子节点（只在没在编辑时生效）"],
   ["拖动节点", "按住左键拖到别的卡片上改变父子关系"],
-  ["Ctrl/⌘+单击", "按节点文字打开同名笔记"],
+  ["Ctrl/⌘+单击", "加选 / 减选（点在已选节点上就把它去掉）"],
+  ["Shift+单击", "选中同级区间：先点首，再 Shift 点尾"],
+  ["Alt+单击", "按节点文字打开同名笔记"],
   ["Ctrl+Z / ⇧Ctrl+Z", "撤销 / 重做"],
-  ["编辑框 Tab", "缩进 / Shift+Tab 反缩进"],
+  ["编辑框 ↵ / Tab", "提交并退出（结束输入只做这一件事）"],
   ["编辑框 Ctrl+↵", "提交并新建同级"],
+  ["编辑框 ⇧+Tab", "提交并提升一级"],
+  ["钉住", "锁定这张图：切笔记、点双链，图都不换（笔记窗口照常打开）"],
   ["Esc", "取消编辑、收起面板或取消选中"],
   ["点空白", "取消选中，收起节点操作条"],
   ["导出", "整张图存成 <笔记名>.mindmap.svg（笔记同目录）"],
@@ -196,11 +218,39 @@ export class MindmapView extends ItemView {
     this.branchSlot(path, size),
   );
   private readonly frames: FrameScheduler;
+  /** 内容尺寸变了的重排排队号（0 = 没排） */
+  private reflowFrame = 0;
+  /**
+   * 重建收尾的「挡住淡入」窗口（时间戳，0 = 不管）。
+   *
+   * 插入/删除一行会让它**后面所有兄弟节点的 key 改变**（markmap 的 key 里带
+   * 孩子序号），d3 把它们当成新节点重新 enter：先写 `opacity: 0`，再起过渡。
+   * 即使 `duration: 0`，过渡依然**异步到下一帧** —— `setData` 内部那次 await
+   * 让出主线程时，浏览器画的就是「一排卡片有底色、没文字、连线也淡着」。
+   * 这就是「新建节点闪一下」。
+   *
+   * 重建期间本来就不该有淡入（位置是瞬间到位的），所以这段时间里凡是 markmap
+   * 往 foreignObject 上写 < 1 的 opacity，我们**当场抹掉**（写 `""`）。
+   * MutationObserver 回调在微任务里跑，赶在浏览器绘制之前，用户看不到那一帧。
+   */
+  private fadeGuardUntil = 0;
   /** 状态闸门 + 重建串行化（替代原来的 refreshing / pending / rebuilding / pendingRefresh） */
   private readonly rt: ViewRuntime;
   private currentSpec: ThemeSpec | null = null;
   // 当前要渲染的笔记。缓存它，避免焦点跑到导图视图上时拿不到活跃笔记。
   private targetFile: TFile | null = null;
+  /**
+   * 「钉住」：导图不再跟随 Obsidian 的活动笔记。
+   *
+   * 和导航栈的区别：栈是「顺着双链潜进去了，记得回去的路」，钉住是「我就想一直看这篇」。
+   * 两者都不看活动笔记，但用途完全相反 —— 栈是临时的（一在别处切文件就作废），
+   * 钉住得撑到用户亲手解开，否则「钉了还在跟着笔记换」等于没钉。
+   *
+   * 钉住锁的是**这张图**，不是**导航本身**：用户在图里点双链，笔记窗口照常打开
+   * 那篇（链接不该变成死链），只是导图原地不动。所以钉住期间所有导航入口
+   * （点链接 / Alt+单击 / 面包屑 / 新建笔记）都走 `navigate`，由它分叉到 `openFileOnly`。
+   */
+  private pinned = false;
   // 上一次成功投影的结果，下次刷新用它做 diff
   private snapshot: Snapshot | null = null;
   private editorHandle: InlineEditorHandle | null = null;
@@ -216,8 +266,42 @@ export class MindmapView extends ItemView {
    * 缩放被重置会让人瞬间找不到自己在哪。用户主动切笔记则照旧适配。
    */
   private keepViewport = false;
-  /** 当前选中的节点（记源行号，重建后仍能按行号恢复高亮） */
-  private selectedLine = -1;
+  /**
+   * 当前选中集合（记源行号）。多选时多个节点同时高亮，批量删除 / 整体拖动都作用于它。
+   */
+  private selectedLines: Set<number> = new Set();
+  /** 主选中节点（最后交互的那个）：单节点操作（改字/缩进/删除）作用于它，也是框选/拖动锚点 */
+  private primaryLine = -1;
+  /**
+   * Shift+单击 的区间起点，记的是「上一次不带 Shift 选中/加选的那个节点」。
+   *
+   * 区间选择的手感必须和文件管理器一致：先点首（定锚点），再 Shift 点尾，
+   * 中间整段一起选中；反复 Shift 点别的节点时锚点不动，区间跟着重算。
+   * 锚点用行号而不是 DOM，理由同 selectedLines。
+   */
+  private anchorLine = -1;
+  /**
+   * 右键是否真的拖动过（区分「右键单击」与「右键拖动平移」）。
+   * 拖动过则在 contextmenu 时压下菜单，避免松手弹出浏览器默认菜单。
+   */
+  private rightDragMoved = false;
+  private rightDownX = 0;
+  private rightDownY = 0;
+
+  /**
+   * 兼容旧调用：单值选中 = 只选一个。写入会同步 selectedLines（赋 -1 即清空集合）。
+   */
+  private get selectedLine(): number { return this.primaryLine; }
+  private set selectedLine(v: number) {
+    const same: boolean =
+      this.primaryLine === v &&
+      (v < 0 ? this.selectedLines.size === 0 : this.selectedLines.size === 1);
+    if (same) return;
+    this.primaryLine = v;
+    this.selectedLines = v >= 0 ? new Set([v]) : new Set();
+    this.paintSelection();
+    this.syncToolbar();
+  }
   /**
    * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
    *
@@ -236,9 +320,13 @@ export class MindmapView extends ItemView {
   private leafSeq = 0;
   private readonly leafById = new Map<number, WorkspaceLeaf>();
   private drag: DragController | null = null;
+  /** 左键空白区拖拽框选（ctrl/shift 加选） */
+  private boxSelect: BoxSelectController | null = null;
   /** 操作栏（图标按钮 + 主题按钮）。构建细节在 ui/toolbar.ts */
   private toolbar: ToolbarHandle | null = null;
-  /** 选中节点时浮在卡片下方的节点操作条（ui/nodeBar.ts） */
+  /** 操作栏尾端的规模统计（节点数 / 树深），每次刷新重写 */
+  private statsEl: HTMLElement | null = null;
+  /** 单选节点时贴在画布右侧的那条节点操作（ui/nodeBar.ts） */
   private nodeBar: NodeBar | null = null;
   /** 快捷键说明面板（点「?」浮出） */
   private helpPanel: HTMLElement | null = null;
@@ -329,8 +417,15 @@ export class MindmapView extends ItemView {
     this.themeBtn = themeBtn;
     this.syncThemeButton();
 
+    // 尾端的规模统计：先造好元素再交给 buildToolbar 摆到最右，
+    // 内容由 syncStats 在每次刷新后写入（树变了才有必要重写）
+    this.statsEl = header.createSpan({ cls: "obmind-stats" });
+
     this.toolbar = buildToolbar(header, {
+      // logo 占位：现在只有两个字，将来换成图标只要换这一个字段
+      brand: "低山",
       leading: themeBtn,
+      trailing: this.statsEl,
       groups: GLOBAL_GROUPS,
       onAction: (id: ToolbarActionId) => this.onToolbar(id),
     });
@@ -349,6 +444,13 @@ export class MindmapView extends ItemView {
     // 点击节点时会主动 focus，键盘操作才有落点。
     canvas.setAttribute("tabindex", "0");
     canvas.addEventListener("keydown", (e: KeyboardEvent) => this.onCanvasKeyDown(e));
+    // 空格进编辑：挂在整个视图上，而不是只挂画布。
+    // 画布的 keydown 只在「焦点正好在画布上」才收得到，而点过工具栏、拖过框选、
+    // 或者一轮重建之后，焦点经常落在别处 —— 那时按空格毫无反应，用户只会觉得
+    // 「选中了却改不了字」。挂在容器上，焦点在这个视图里的任何位置都算数。
+    this.registerDomEvent(this.containerEl, "keydown", (e: KeyboardEvent) =>
+      this.onViewKeyDown(e),
+    );
     const svg = canvas.createSvg("svg");
     // markmap 基础样式挂在 .markmap 上（文字色/字体变量），需手动补类
     svg.classList.add("markmap");
@@ -384,6 +486,10 @@ export class MindmapView extends ItemView {
     this.registerEvent(
       this.app.workspace.on("file-open", (file: TFile | null) => {
         if (!file || file.extension !== "md") return;
+        // 钉住期间：别人换文件跟我无关。这里**不能**走下面的 resetNav ——
+        // 钉住时用户在图里可能已经潜了几层，去别的笔记翻一下就清栈，
+        // 回来时面包屑已经没了，等于把「钉住」做成了「每次都被重置」。
+        if (this.pinned) return;
         // 导图自己打开的笔记（面包屑前进/后退）也会触发 file-open。
         // 判据：打开的正是导图当前显示的那篇 —— 那就是 obmind 自己干的，不能清栈。
         // 只是移动光标、或者切回同一篇，也走这条短路。
@@ -401,11 +507,42 @@ export class MindmapView extends ItemView {
     // 并调用了 stopPropagation，冒泡阶段收不到。
     svg.addEventListener("dblclick", (e: MouseEvent) => this.onNodeDblClick(e), true);
 
+    // 右键拖拽平移画布（d3-zoom 过滤器已设为「仅右键触发平移」）：
+    // 这里负责在「右键拖动过」之后压下 contextmenu，避免松手弹出浏览器菜单；
+    // 右键单击（没拖动）仍照常弹出菜单。
+    this.registerDomEvent(canvas, "contextmenu", (e: MouseEvent) => {
+      if (this.rightDragMoved) {
+        e.preventDefault();
+        this.rightDragMoved = false;
+      }
+    });
+    this.registerDomEvent(canvas, "pointerdown", (e: PointerEvent) => {
+      if (e.button === 2) {
+        this.rightDragMoved = false;
+        this.rightDownX = e.clientX;
+        this.rightDownY = e.clientY;
+      }
+    });
+    this.registerDomEvent(canvas, "pointermove", (e: PointerEvent) => {
+      if (e.buttons & 2) {
+        if (Math.hypot(e.clientX - this.rightDownX, e.clientY - this.rightDownY) > 4) {
+          this.rightDragMoved = true;
+        }
+      }
+    });
+
     // 拖动改变父子关系
     this.drag = new DragController(svg, canvas, {
       srcOf: (g: SVGGElement) => this.srcOf(g),
       onDrop: (srcLine: number, targetLine: number, mode: DropMode) =>
-        this.onNodeDrop(srcLine, targetLine, mode),
+        this.onNodeDrop(this.groupOf(srcLine), targetLine, mode),
+    });
+
+    // 左键在空白区拖拽 = 框选（ctrl/shift 加选）；命中节点的拖动交给 DragController。
+    this.boxSelect = new BoxSelectController(svg, canvas, {
+      srcOf: (g: SVGGElement) => this.srcOf(g),
+      onSelect: (lines: number[], additive: boolean) =>
+        this.applySelection(lines, -1, additive),
     });
 
     // 用户滚轮缩放过之后，就不要再跟着容器尺寸自动适配了 ——
@@ -427,6 +564,16 @@ export class MindmapView extends ItemView {
     // 点过侧栏、或者切过窗口之后焦点就不在了 —— 那时浮动条关不掉。
     this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => this.onGlobalKeyDown(e));
 
+    // Ctrl/⌘+N 必须挂在 document 的**捕获**阶段 —— Obsidian 的快捷键表把这个组合
+    // 绑成了「新建笔记」，它在 document 冒泡阶段处理；我们排在其后就会晚一步，
+    // 等收到时一篇空笔记已经开出去了。捕获阶段跑在所有元素监听之前（见 onHotkeyCapture）。
+    this.registerDomEvent(
+      document,
+      "keydown",
+      (e: KeyboardEvent) => this.onHotkeyCapture(e),
+      true,
+    );
+
     // 点面板外面就收起快捷键说明。
     // 忽略工具栏内的点击，否则点「?」的同一个事件会立刻把它关掉。
     this.registerDomEvent(document, "click", (e: MouseEvent) => {
@@ -437,6 +584,23 @@ export class MindmapView extends ItemView {
     });
 
     this.syncToolbar();
+  }
+
+  /**
+   * 当前是否处于「重建收尾、要挡掉 markmap 淡入」的窗口。
+   *
+   * 三种情况：
+   * - 重建中（`setData` 内部那几帧就是元凶，必须算在内）；
+   * - 重建刚结束的一小段时间（d3 的过渡可能晚一帧才写）；
+   * - **编辑态除外**：编辑期间不该去改 markmap 的属性。
+   *   注意编辑框藏原文用的是 `visibility` 而**不是** opacity（见 edit/inlineText.ts）——
+   *   用 opacity 会被下面的 faded 通道当成「淡出中」，把卡片和连线一起抄成透明，
+   *   编辑时整块图就只剩一个输入框了。
+   */
+  private inFadeGuard(): boolean {
+    if (this.rt.phase === "editing") return false;
+    if (this.rt.phase === "rebuilding") return true;
+    return this.fadeGuardUntil !== 0 && performance.now() < this.fadeGuardUntil;
   }
 
   /**
@@ -462,6 +626,10 @@ export class MindmapView extends ItemView {
     this.observer = new MutationObserver((records: MutationRecord[]) => {
       let structural = false;
       const moved = new Set<SVGGElement>();
+      /** markmap 重写 class 的节点（选中 class 会被它原地抹掉） */
+      const recls = new Set<SVGGElement>();
+      /** foreignObject 透明度变了的节点 g（淡入淡出，要跟着一起淡） */
+      const faded = new Set<SVGGElement>();
 
       for (const rec of records) {
         if (rec.type === "childList") {
@@ -471,7 +639,43 @@ export class MindmapView extends ItemView {
           if (!isOwnDecoration(rec)) structural = true;
           continue;
         }
+
         const target = rec.target;
+
+        // markmap 的 renderData 里有一句 `w.attr("class", ...)` —— 它把每个节点的
+        // class 重写一遍。**内存里的选中态不会变**，但 DOM 上的 obmind-selected
+        // 被抹掉了，表现就是「编辑完（或过一会儿）选中框自己没了」，
+        // 而 selectedLine 还指着那一行：再按 Tab 会凭空多出一个子级。
+        // 它每次重排都会触发（内容尺寸变化 → 它自己的 ResizeObserver → 100ms 后重排），
+        // 所以必须当成事件来跟，不能只在重建后补一次。
+        if (rec.attributeName === "class") {
+          if (target instanceof SVGGElement && target.classList.contains("markmap-node")) {
+            recls.add(target);
+          }
+          continue;
+        }
+
+        // 节点内文字的透明度：markmap 折叠/展开时每帧写一次。
+        // 我们的卡片/连线/收放点是自绘的，得跟着它一起淡，否则「字淡没了、方块还在飞」。
+        if (rec.attributeName === "style") {
+          const parent = target.parentElement;
+          if (
+            target instanceof SVGForeignObjectElement &&
+            parent instanceof SVGGElement &&
+            parent.classList.contains("markmap-node")
+          ) {
+            // 重建收尾这一小段里，< 1 的 opacity 是 d3 的 enter 过渡（不是折叠动画）。
+            // duration 0 的重建本该瞬间到位，可过渡仍然异步到下一帧 —— 那一帧画出来
+            // 就是「新建节点时整排兄弟卡片没字」。这里当场抹掉，赶在绘制之前。
+            if (this.inFadeGuard() && target.style.opacity !== "") {
+              target.style.opacity = "";
+              continue;
+            }
+            faded.add(parent);
+          }
+          continue;
+        }
+
         if (
           !(target instanceof SVGGElement) ||
           !target.classList.contains("markmap-node")
@@ -489,12 +693,17 @@ export class MindmapView extends ItemView {
         // 线和节点一起落位。排到下一个 rAF 就会晚一帧，动画里看着线在追节点。
         this.frames.paintMoved(moved);
       }
+      if (recls.size > 0) this.paintSelectionOn(recls);
+      if (faded.size > 0) this.frames.syncFade(faded);
     });
     this.observer.observe(svg, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["transform"],
+      // class：markmap 重排会重写节点 class（会把选中态抹掉），
+      // style：节点文字的 opacity（淡入淡出），卡片要跟着淡。
+      // 都不含 width/height —— 那个它每帧都写一遍同值，听了就是每帧全量重绘。
+      attributeFilter: ["transform", "class", "style"],
     });
   }
 
@@ -555,7 +764,76 @@ export class MindmapView extends ItemView {
       this.navStack = [];
       this.renderBreadcrumb();
     }
+    // 同理，钉住也一起解除：命令的名字就是「打开**当前笔记**的导图」，
+    // 钉着不动会让这条命令看起来失效。
+    this.setPinned(false, true);
     if (file && file.extension === "md") this.targetFile = file;
+  }
+
+  /**
+   * 开关「钉住」。
+   *
+   * 只改状态和按钮，**自己不触发重绘**：解除钉住往往发生在 refresh 内部
+   * （目标文件被删那一路），在那里再调一次 refresh 会原地递归。
+   * 请调用方在需要立刻重画时自己 refresh。
+   *
+   * silent 用于非用户主动触发的解除（文件被删、命令重新打开视图）：
+   * 那些场合弹一句「已取消钉住」只会让人莫名其妙。
+   */
+  private setPinned(on: boolean, silent = false): void {
+    if (this.pinned === on) {
+      this.syncPinButton();
+      return;
+    }
+    this.pinned = on;
+    this.syncPinButton();
+
+    if (on) {
+      const name: string = this.targetFile?.basename ?? "当前笔记";
+      new Notice(
+        `obmind：已钉住「${name}」，切换笔记时这张图保持不动（点双链只切笔记）`,
+        4000,
+      );
+      return;
+    }
+
+    // 解除钉住 = 重新跟随。栈里可能还停着一篇「潜入」的子笔记，
+    // 不清掉的话导图会继续显示它，看起来像没解除成功。
+    if (this.navStack.length > 0) this.resetNav();
+    if (!silent) new Notice("obmind：已取消钉住，导图重新跟随笔记", 3000);
+  }
+
+  /** 工具栏上点钉住 */
+  private togglePin(): void {
+    if (this.pinned) {
+      this.setPinned(false);
+      this.refresh();
+      return;
+    }
+    if (!this.targetFile) {
+      new Notice("obmind：当前没有可钉住的笔记");
+      return;
+    }
+    this.setPinned(true);
+  }
+
+  /** 钉住期间该显示哪篇；目标没了就自动解除，免得钉在一片空白上 */
+  private pinnedTarget(): TFile | null {
+    const file: TFile | null = this.targetFile;
+    if (file && this.app.vault.getAbstractFileByPath(file.path)) return file;
+    this.setPinned(false, true);
+    return null;
+  }
+
+  private syncPinButton(): void {
+    const t = this.toolbar;
+    if (!t) return;
+    t.setActive(
+      "pin",
+      this.pinned,
+      this.pinned ? "已钉住（点击恢复跟随笔记）" : "钉住当前导图，切换笔记时不变",
+    );
+    t.setEnabled("pin", this.mm !== null || this.targetFile !== null);
   }
 
   /**
@@ -648,6 +926,9 @@ export class MindmapView extends ItemView {
   /** 操作栏的唯一分发点：按钮只报 id，具体做什么集中在这里 */
   private onToolbar(id: ToolbarActionId): void {
     switch (id) {
+      case "pin":
+        this.togglePin();
+        break;
       case "undo":
         void this.stepHistory("undo");
         break;
@@ -672,7 +953,7 @@ export class MindmapView extends ItemView {
         void this.exportSvg();
         break;
       case "deselect":
-        this.setSelectedLine(-1);
+        this.applySelection([], -1, false);
         break;
       case "edit":
         this.editSelected();
@@ -683,6 +964,9 @@ export class MindmapView extends ItemView {
         break;
       case "outdent":
         this.outdentSelected();
+        break;
+      case "newNote":
+        void this.createNoteForSelected();
         break;
       case "delete":
         this.removeNode();
@@ -702,6 +986,21 @@ export class MindmapView extends ItemView {
    * 节点操作现在在浮动条上，可用态跟着它一起走 —— 没有选中节点时浮动条本身就
    * 不出现，所以那排灰按钮的问题不存在了。
    */
+  /**
+   * 操作栏尾端的规模统计。
+   *
+   * 只在文案真的变了才写 DOM：这个方法在每次 refresh 都会跑（包括「只是移动
+   * 光标」的空转刷新），无脑 setText 会让工具条每秒重排好几次。
+   */
+  private syncStats(tree: IPureNode | null): void {
+    const el = this.statsEl;
+    if (!el) return;
+    const text: string = tree ? formatStats(treeStats(tree)) : "";
+    if (el.textContent === text) return;
+    el.setText(text);
+    el.toggleClass("is-empty", text === "");
+  }
+
   private syncToolbar(): void {
     const src: SrcRef | null = this.nodeAt(this.selectedLine);
     // 根节点就是文件名本身：改不了、删不了、也无所谓缩进
@@ -715,6 +1014,9 @@ export class MindmapView extends ItemView {
       bar.setEnabled("sibling", onAny);
       bar.setEnabled("outdent", onNode);
       bar.setEnabled("delete", onNode);
+      // 「新建笔记」不是置灰而是隐藏：节点已经有双链时它没有任何意义，
+      // 留一个灰图标在那儿，用户只会反复点它试为什么点不动（见 canCreateNoteFor）
+      bar.setHidden("newNote", !this.canCreateNoteFor(src));
     }
 
     const t = this.toolbar;
@@ -722,10 +1024,28 @@ export class MindmapView extends ItemView {
     t.setEnabled("undo", canUndo(this.history));
     t.setEnabled("redo", canRedo(this.history));
     const ready: boolean = this.mm !== null;
+    this.syncPinButton();
     t.setEnabled("fit", ready);
     t.setEnabled("collapseAll", ready);
     t.setEnabled("expandAll", ready);
     t.setEnabled("refresh", ready);
+  }
+
+  /**
+   * 判断这个节点该不该露出「新建笔记」入口。
+   *
+   * 判据是「有没有必要」而不是「能不能写回」：
+   * - 已经有双链的节点，点了也是白点；
+   * - 多行节点（软换行）写回只改首行，会把节点拆坏 —— 编辑也不允许改它；
+   * - 根节点就是这篇笔记自己，给它再建一篇同名笔记没有意义。
+   */
+  private canCreateNoteFor(src: SrcRef | null): boolean {
+    if (!src) return false;
+    if (this.selectedLines.size !== 1) return false;
+    if (src.depth === 0) return false;
+    if (src.endLine > src.line) return false;
+    if (hasWikiLink(src.text)) return false;
+    return noteTitleOf(src.text) !== "";
   }
 
   /** 当前行号对应的节点坐标（不动 EditService，视图侧只需只读查询） */
@@ -769,6 +1089,141 @@ export class MindmapView extends ItemView {
       return;
     }
     void this.applyPlan(file, out.op);
+  }
+
+  /**
+   * 给选中节点新建一篇笔记，并把这个节点改成指向它的双链（Ctrl+N / 浮动条）。
+   *
+   * 五步，顺序不能换：
+   * 1. 取名字：notePlan 的纯函数去掉行内标记、清掉文件名与双链语法的非法字符；
+   * 2. 算落地文件夹：复用 Obsidian 自己的「新建笔记存放位置」设置；
+   * 3. 建文件：已有同名笔记就直接用那一篇（撞名失败，不如顺势链过去）；
+   * 4. 把节点正文换成 `[[名字]]`（原文带行内样式时用别名形式，字面不变）；
+   * 5. openDoc 跳过去 —— 走的是导图内跳转那条路，所以面包屑自动带上
+   *    「从哪来」，点第一级就能跳回原来那篇。
+   *
+   * 公开是为了命令面板：万一 Ctrl+N 被别的插件占了、或者用户改过快捷键表，
+   * 还能在「快捷键」设置里给这个动作另绑一个组合。
+   */
+  async createNoteForSelected(): Promise<void> {
+    const file = this.targetFile;
+    const src = this.nodeAt(this.primaryLine);
+    if (!file || !src) {
+      new Notice("obmind：先左键点一下要建笔记的节点");
+      return;
+    }
+    if (!this.canCreateNoteFor(src)) {
+      // 按钮已经隐藏了，能走到这儿只有快捷键：说清为什么不做，别静默
+      new Notice(
+        hasWikiLink(src.text)
+          ? "obmind：这个节点已经是双链了"
+          : "obmind：这个节点现在不能建笔记（多行节点 / 取不出名字）",
+      );
+      return;
+    }
+
+    const title: string = noteTitleOf(src.text);
+    const folder: string = resolveNoteFolder({
+      location: this.vaultConfig("newFileLocation"),
+      folder: this.vaultConfig("newFileFolderPath"),
+      currentPath: file.path,
+    });
+
+    // 同名笔记已经有了就不再新建：Obsidian 的双链按名字解析，
+    // 库里多出一篇同名笔记，`[[标题]]` 指向哪一篇就变成说不准的事。
+    let note: TFile | null = this.app.metadataCache.getFirstLinkpathDest(
+      title,
+      file.path,
+    );
+    const reused: boolean = note !== null;
+    if (!note) {
+      note = await this.createNoteFile(folder, title, file);
+      if (!note) return;
+    }
+
+    // 先建文件、再改节点：反过来一旦建文件失败，节点上就留了一条连不到东西的红链。
+    const raw: string = src.text.trim();
+    const link: string = linkLiteral(title, raw === title ? undefined : raw);
+    const snap = this.editSnapshot();
+    if (snap) {
+      const out = this.editSvc.commit({ snap, src, action: "commit", value: link });
+      if (out.kind === "write") await this.applyPlan(file, out.op);
+      else if (out.kind === "error") {
+        new Notice(`obmind：${out.reason}`);
+        return;
+      }
+    }
+
+    // 选中集记的是上一篇的行号，换文件之后会指着无关的节点，先清掉
+    this.applySelection([], -1, false);
+
+    // 钉住时笔记照常打开，只是导图不跟着换 —— 钉住锁的是「这张图」，
+    // 不是「不许看别的笔记」。走 navigate 就自动分好叉。
+    this.navigate(note);
+    new Notice(
+      `obmind：已${reused ? "链接到已有笔记" : "新建笔记"}「${title}」` +
+        (this.pinned ? "（导图保持钉住）" : ""),
+    );
+  }
+
+  /**
+   * 读 Obsidian 自己的库级设置（这里只用「新建笔记的存放位置」两项）。
+   *
+   * `Vault.getConfig` 运行时一直都在，但没写进公开的 d.ts —— 所以按可选能力探测：
+   * 拿不到就返回空串，resolveNoteFolder 会把空值当成「放库根」，
+   * 也就是 Obsidian 的默认行为。降级而不是抛错。
+   */
+  private vaultConfig(key: string): string {
+    const api = this.app.vault as unknown as { getConfig?: (k: string) => unknown };
+    const value: unknown = typeof api.getConfig === "function" ? api.getConfig(key) : null;
+    return typeof value === "string" ? value : "";
+  }
+
+  /**
+   * 真正落盘：读模板 → vault.create。
+   *
+   * 失败只提示不抛：模板路径写错、目标文件夹被删这些都属于配置问题，
+   * 用户改一下设置就好，没必要让一次点击以异常栈收场。
+   */
+  private async createNoteFile(
+    folder: string,
+    title: string,
+    from: TFile,
+  ): Promise<TFile | null> {
+    const path: string = notePathOf(folder, title);
+    const raw: string = await this.readTemplate();
+    const content: string =
+      raw === "" ? "" : applyTemplate(raw, { title, from: from.basename });
+    try {
+      return await this.app.vault.create(path, content);
+    } catch (err) {
+      // 索引还没跟上（刚建的文件、或大小写不同的同名）会走到这儿：
+      // 目标确实在就直接复用，比抛一句 “File already exists” 有用
+      const exist = this.app.vault.getAbstractFileByPath(path);
+      if (exist instanceof TFile) return exist;
+      new Notice(`obmind：新建笔记失败：${errText(err)}`);
+      return null;
+    }
+  }
+
+  /** 读模板原文；没配模板 / 文件不在了都返回 ""（= 建一篇空白笔记） */
+  private async readTemplate(): Promise<string> {
+    const path: string = (this.plugin.settings.noteTemplate ?? "").trim();
+    if (path === "") return "";
+    const abs: string = /\.md$/i.test(path) ? path : `${path}.md`;
+    const file: unknown =
+      this.app.vault.getAbstractFileByPath(normalizePath(abs)) ??
+      this.app.metadataCache.getFirstLinkpathDest(path, "");
+    if (!(file instanceof TFile)) {
+      new Notice(`obmind：找不到模板笔记「${path}」，这次新建的是空白笔记`);
+      return "";
+    }
+    try {
+      return await this.app.vault.read(file);
+    } catch (err) {
+      console.error("[obmind] 读取模板失败", err);
+      return "";
+    }
   }
 
   /**
@@ -952,6 +1407,16 @@ export class MindmapView extends ItemView {
       return pinned;
     }
 
+    // 钉住了就完全不看活动笔记：用户就是想在切来切去的时候一直看这张图
+    if (this.pinned) {
+      const kept: TFile | null = this.pinnedTarget();
+      if (kept) {
+        this.targetFile = kept;
+        return kept;
+      }
+      // 目标没了 → 已经自动解除钉住，往下走正常流程
+    }
+
     const activeFile: TFile | null = this.app.workspace.getActiveFile();
     if (activeFile && activeFile.extension === "md") {
       this.targetFile = activeFile;
@@ -998,6 +1463,8 @@ export class MindmapView extends ItemView {
     if (!this.emptyEl) this.emptyEl = canvas.createDiv({ cls: "obmind-empty" });
     this.emptyEl.setText(text);
     this.emptyEl.show();
+    // 没有导图就没有规模可言，右下角挂着一个旧数字只会误导
+    this.syncStats(null);
   }
 
   private clearEmpty(): void {
@@ -1218,6 +1685,22 @@ export class MindmapView extends ItemView {
     return z && typeof z.k === "number" ? z.k : Number.NaN;
   }
 
+  /**
+   * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
+   * 右键(2)拖拽平移画布；滚轮缩放、触屏平移保持。
+   * setOptions 不会重建 zoom 行为对象，故创建后设一次即可。
+   */
+  private applyZoomFilter(): void {
+    const mm = this.mm;
+    if (!mm) return;
+    mm.zoom.filter((event: any): boolean => {
+      if (event.type === "wheel") return true;
+      if (event.type === "touchstart" || event.type === "touchmove") return true;
+      // 仅右键（button 2）拖拽平移
+      return event.button === 2;
+    });
+  }
+
   private nextFrame(): Promise<void> {
     return new Promise<void>((resolve) => {
       window.requestAnimationFrame(() => resolve());
@@ -1278,6 +1761,9 @@ export class MindmapView extends ItemView {
     const spec = resolveTheme(this.plugin.settings.theme, isDark);
     const themeKey = `${spec.id}:${spec.dark ? "d" : "l"}`;
     this.applyTheme(spec);
+    // 规模统计跟着树走：放在 applyTheme 之后、所有早退分支之前，
+    // 这样「只是移动光标」这类空转刷新也不会让数字停在旧值上
+    this.syncStats(tree);
 
     const sameFile = prev !== null && prev.path === file.path;
     const sameTheme = prev !== null && prev.themeKey === themeKey;
@@ -1343,6 +1829,7 @@ export class MindmapView extends ItemView {
       // 直接 fit 一次，而 fit 带 180ms 过渡动画，打开视图时会看到画面缩一下。
       // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
       this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
+      this.applyZoomFilter();
       this.snapshot = {
         content,
         tree,
@@ -1357,6 +1844,7 @@ export class MindmapView extends ItemView {
       // 主题变了才需要换一整套绘制选项（线宽、字号、maxWidth）。
       // setOptions 只合并选项、不渲染，但会重绑一次 zoom 手势，没必要每次重建都调。
       if (!sameTheme) this.mm.setOptions(this.buildOptions(spec));
+      this.applyZoomFilter();
       this.snapshot = {
         content,
         tree,
@@ -1399,7 +1887,10 @@ export class MindmapView extends ItemView {
     const box = fo?.firstElementChild?.firstElementChild ?? null;
     if (!fo || !box) return false;
 
-    box.innerHTML = content;
+    // 内容已经一样就别再赋值：innerHTML 赋值会把内部 DOM 全部重建一遍，
+    // 视觉上就是文字闪一下（「提交即预览」已经把新文字画上去了，这里多数时候是同值）。
+    const changed: boolean = box.innerHTML !== content;
+    if (changed) box.innerHTML = content;
 
     // 同步写回 markmap 手里的节点数据：后续拖动等逻辑读的是 DOM，
     // 但下次结构重建前若有其它代码看 state.data，内容不能是旧的。
@@ -1415,8 +1906,61 @@ export class MindmapView extends ItemView {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h));
     }
-    this.frames.requestAll();
+    // 幂等：内容没换（提交即预览已经铺过）就不必再排一次整树布局
+    if (changed) this.reflowSoon();
     return true;
+  }
+
+  /**
+   * 内容尺寸变了 → 立刻让 markmap 重排一次，别等它自己的 100ms 防抖。
+   *
+   * 「改一个字闪一下」就是这么来的：markmap 对每个节点的内容 div 挂了
+   * ResizeObserver，**防抖 100ms** 才跑 renderData；renderData 里的位置变化又走
+   * `options.duration`（180ms）的 transition。于是「卡片已经变宽、孩子/邻居那一列
+   * 还停在旧位置」的错位要持续约 280ms —— 肉眼就是压住一下再滑开。
+   * 实测（tmp/probeFlicker.ts）：改一个分支标题后，卡片互相压住从 8ms 一直到 233ms。
+   *
+   * 这里压到一帧：duration 置 0 主动 renderData（位置瞬间到位），再补画卡片和选中框。
+   * 代价是一次整树布局（两千节点的笔记几十毫秒），只在真的改了文字时跑；
+   * 而且本来 100ms 后 markmap 也要跑同一件事，只是那时带着 180ms 的滑动。
+   *
+   * 排到下一帧而不是立刻跑：previewText 与随后的 applyPatch 会在同一轮里各改一次，
+   * 合并成一次重排就够。
+   */
+  private reflowSoon(): void {
+    if (this.reflowFrame !== 0) return;
+    this.reflowFrame = window.requestAnimationFrame(() => {
+      this.reflowFrame = 0;
+      void this.reflowNow();
+    });
+  }
+
+  private async reflowNow(): Promise<void> {
+    const mm = this.mm;
+    const svg = this.svgEl;
+    if (!mm || !svg) return;
+
+    // 撞上重建就别插手：这一帧的 DOM 正在被 setData 换掉，再调一次 renderData
+    // 只会把半成品重排一遍（还会重写 opacity/class）。重建结束的 paintNow 会做同一件事。
+    if (this.rt.phase !== "idle") return;
+
+    const prev: number = mm.options.duration;
+    mm.setOptions({ duration: 0 });
+    try {
+      await mm.renderData();
+    } catch {
+      // 布局失败不影响已经画上去的内容；下一次真实刷新会再算一遍
+    } finally {
+      // prev 可能已经是 0（上一次重排还没收尾）：退回默认值，别把动画永久关掉
+      mm.setOptions({ duration: prev > 0 ? prev : 180 });
+    }
+
+    // 等 renderData 的这几帧里可能又开始了一轮重建：别用刚被换掉的 DOM 去画
+    if (this.rt.phase !== "idle") return;
+    // 节点位置变了，卡片/连线要按新几何重新摆；renderData 同时会把每个节点的
+    // class 整段重写（attr("class", …)），选中标记会被抹掉，所以顺手补回。
+    this.frames.paintNow();
+    this.paintSelection();
   }
 
   /**
@@ -1443,6 +1987,11 @@ export class MindmapView extends ItemView {
     this.syncBranchSlots(tree, this.currentSpec?.colors.length ?? 6);
 
     this.rt.setPhase("rebuilding");
+    // 挡住这一轮重建的淡入（见 fadeGuardUntil）：`setData` 内部的 await 会让出
+    // 一两帧给浏览器，那几帧若不挡，用户看到的就是「整排兄弟卡片文字消失」。
+    // 窗口只要覆盖「重建中 + 重建后 d3 收尾那一两帧」，别开太长 ——
+    // 这段时间里用户去点收放点折叠，淡出也会被一起抹掉。
+    this.fadeGuardUntil = performance.now() + 50;
     const prev: number = mm.options.duration;
     mm.setOptions({ duration: 0 });
     try {
@@ -1451,6 +2000,13 @@ export class MindmapView extends ItemView {
       // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
       // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
       this.dropDetached();
+      // 重建期间没挡住的残余（比如 observer 还没跑到的那几条记录）在这里清掉：
+      // 位置已经是瞬间到位的，任何 < 1 的透明度都不该留下来。
+      this.clearFade();
+      // 刚 enter 的节点 markmap 还没来得及写 width/height（它下一次 renderData 才量），
+      // 此刻全量绘制会读不到几何 → 新节点第一帧**没有卡片**，只有裸文字。
+      // 缺尺寸的才去量（scrollWidth 会强制同步布局，不能对所有节点做）。
+      this.measureMissing();
       // 结构变了，缓存的 g/元素引用可能已经对应到别的节点上，全部作废重来
       this.frames.reset();
       this.frames.paintNow();
@@ -1464,6 +2020,57 @@ export class MindmapView extends ItemView {
     // 而 selectedLine 其实还指着那一行 —— 用户按 Tab 会莫名其妙多出一个子级。
     this.paintSelection();
     this.syncToolbar();
+  }
+
+  /**
+   * 把节点文字上残留的半透明清掉。
+   *
+   * 重建是 `duration: 0` 的瞬间到位，不该有任何淡入淡出。但 markmap 的
+   * enter/exit 过渡即使 duration 为 0 也异步到下一帧，`setData` 返回时
+   * 这些 `opacity: 0` 还挂在 DOM 上 —— 我们的全量绘制会把它们抄给卡片，
+   * 于是那一帧整排兄弟卡片是空的。
+   *
+   * 用 `removeProperty` 而不是写 `"1"`：属性没了，markmap 后面的过渡想插值
+   * 也能从默认值继续，不会被我留的 inline 值卡住。
+   */
+  private clearFade(): void {
+    const svg = this.svgEl;
+    if (!svg) return;
+    for (const fo of Array.from(
+      svg.querySelectorAll<SVGForeignObjectElement>("g.markmap-node > foreignObject"),
+    )) {
+      if (fo.style.opacity !== "") fo.style.removeProperty("opacity");
+    }
+  }
+
+  /**
+   * 给「markmap 还没量过」的节点补一次尺寸。
+   *
+   * 全量绘制靠 foreignObject 的 width/height 属性算几何（刻意不读 getBBox）。
+   * 刚 enter 的节点这两个属性还是空的，于是那一帧它没有卡片 —— 屏幕上先是
+   * 一段裸文字，下一帧卡片才包上去。新建节点时这个「裸文字」特别显眼。
+   *
+   * 只处理缺失的节点：`scrollWidth` 会强制同步布局，对两千个节点逐个读
+   * 就是一次几十毫秒的卡顿，而正常情况下缺失的只有刚加的那一两个。
+   */
+  private measureMissing(): void {
+    const svg = this.svgEl;
+    if (!svg) return;
+    for (const fo of Array.from(
+      svg.querySelectorAll<SVGForeignObjectElement>("g.markmap-node > foreignObject"),
+    )) {
+      const w: number = Number.parseFloat(fo.getAttribute("width") ?? "");
+      const h: number = Number.parseFloat(fo.getAttribute("height") ?? "");
+      if (w > 0 && h > 0) continue;
+      const box = fo.firstElementChild?.firstElementChild as HTMLElement | null;
+      if (!box) continue;
+      const bw: number = box.scrollWidth;
+      const bh: number = box.scrollHeight;
+      if (bw > 0 && bh > 0) {
+        fo.setAttribute("width", String(bw));
+        fo.setAttribute("height", String(bh));
+      }
+    }
   }
 
   /**
@@ -1496,6 +2103,59 @@ export class MindmapView extends ItemView {
   // 点击 / 编辑 / 拖动
   // -------------------------------------------------------------------------
 
+  /**
+   * 导图内导航的统一入口：点双链 / Alt+单击 / 面包屑 / 新建笔记都走这里。
+   *
+   * 分叉只取决于钉住：
+   * - 没钉住 → `openDoc`：切换导图内容，并按 navSync 联动笔记窗口；
+   * - 钉住了 → `openFileOnly`：笔记窗口照常打开，导图留在原地。
+   *
+   * 为什么钉住时**不能**直接拦掉跳转：用户的动作是「点这个链接」，
+   * 链接的天职就是打开那篇。拦下来等于把双链在钉住期间做成死链，
+   * 而用户真正的诉求只是「这张图别跟着跑」。
+   */
+  private navigate(file: TFile): void {
+    if (this.pinned) {
+      this.openFileOnly(file);
+      return;
+    }
+    this.openDoc(file);
+  }
+
+  /**
+   * 钉住状态下的「只切笔记」：把文件呈现到 Obsidian 里，**不碰** targetFile / navStack。
+   *
+   * 三处刻意不动：
+   * - `targetFile`：钉住时「导图看哪篇」由它决定，改了就是换图；
+   * - `navStack`：栈是「导图内的浏览路径」，图没换，路就没变；
+   * - `leafId` 记账：那是为了回退时关闭标签，钉住期间没有回退。
+   *
+   * 也不 reveal 导图：这里用户要看的是笔记内容，把导图抢到前台等于把刚打开的
+   * 笔记又藏回标签栏（导图在侧栏时本来就互不影响）。
+   */
+  private openFileOnly(file: TFile): void {
+    const target: ForwardTarget = forwardTarget(this.navSync());
+    if (target === "none") {
+      // map-only 本来就是「不动笔记窗口」：钉住后再点链接就什么都不发生了，
+      // 不说一句会像卡了。
+      new Notice("obmind：导图已钉住，且设置为「仅导图跳转」，笔记窗口不会打开", 3000);
+      return;
+    }
+
+    if (target === "current") {
+      const previous: TFile | null = this.app.workspace.getActiveFile();
+      const leaf: WorkspaceLeaf | null =
+        this.leafShowing(previous) ??
+        this.app.workspace.getActiveViewOfType(MarkdownView)?.leaf ??
+        null;
+      if (leaf) {
+        this.openInLeaf(leaf, file);
+        return;
+      }
+    }
+    this.openInLeaf(this.newNoteLeaf(), file);
+  }
+
   onNodeClick(e: MouseEvent): void {
     const target = e.target as Element;
 
@@ -1516,7 +2176,8 @@ export class MindmapView extends ItemView {
         this.targetFile?.path ?? "",
       );
       if (dest instanceof TFile) {
-        this.openDoc(dest);
+        // 外链照常开浏览器；站内链接进 navigate —— 钉住时只切笔记、图不动
+        this.navigate(dest);
       }
       return;
     }
@@ -1529,23 +2190,49 @@ export class MindmapView extends ItemView {
     // 这是关掉浮动条最自然的手势；之前这里直接 return，于是「一旦选中就再也
     // 关不掉」—— 只能去点另一个节点，浮动条永远挂在某个卡片下面。
     if (!g) {
-      if (this.selectedLine >= 0) this.setSelectedLine(-1);
+      if (this.selectedLines.size > 0) this.applySelection([], -1, false);
       return;
     }
 
-    // 4) Ctrl/⌘ + 单击节点：把节点文字当笔记名打开（原行为保留）
-    if (e.ctrlKey || e.metaKey) {
+    // 4) Alt + 单击节点：把节点文字当笔记名打开（原 Ctrl+单击 的行为）。
+    //    这个功能必须让位给选择：Ctrl/⌘ + 单击是「加选 / 减选」的通用手势，
+    //    被「按名字开笔记」占着，用户想多选一个节点时点到的是跳转 —— 等于
+    //    这个手势在导图里根本用不了。Alt 一次性、好记、不抢标准手势。
+    if (e.altKey) {
       const text: string = (g.textContent ?? "").trim();
       if (!text) return;
       const dest = this.app.metadataCache.getFirstLinkpathDest(
         text,
         this.targetFile?.path ?? "",
       );
-      if (dest instanceof TFile) this.openDoc(dest);
+      if (dest instanceof TFile) {
+        this.navigate(dest);
+      }
       return;
     }
 
-    // 5) 普通左键单击 = 选中。选中之后 Tab 建子级、Enter 建同级才有基准。
+    const line: number = this.srcOf(g)?.line ?? -1;
+
+    // 5) Shift + 单击 = 选中「同级区间」：锚点 → 这一下之间，同层的节点全选上。
+    //    先判 Shift 再判 Ctrl：Ctrl+Shift 是「把这一段并进已有选中」，
+    //    顺序反过来的话会被 Ctrl 那条吃掉，变成「只切换这一个」。
+    if (e.shiftKey) {
+      this.selectSiblingRange(line, e.ctrlKey || e.metaKey);
+      this.canvasEl?.focus({ preventScroll: true });
+      return;
+    }
+
+    // 6) Ctrl/⌘ + 单击 = 加选 / 减选（点在已选中的节点上就把它剔出去）。
+    //    必须在这一层拦下：漏过去就会落到「普通单击 = 只选这一个」，
+    //    前面的选中集当场被清空 —— 就是「Ctrl 点第二个节点，第一个没了」。
+    if (e.ctrlKey || e.metaKey) {
+      this.toggleSelection(line);
+      this.canvasEl?.focus({ preventScroll: true });
+      return;
+    }
+
+    // 7) 普通左键单击 = 只选这一个（并把它设为下次 Shift 的锚点）。
+    //    选中之后 Tab 建子级、Enter 建同级才有基准。
     this.selectNode(g);
   }
 
@@ -1780,7 +2467,19 @@ export class MindmapView extends ItemView {
       item.toggleClass("is-current", last);
       item.setAttribute("aria-label", entry.path);
       item.setAttribute("title", last ? entry.path : `${entry.path}（点击返回）`);
-      if (!last) item.addEventListener("click", () => this.goBackTo(i));
+      // 面包屑也是导航：钉住时只把笔记窗口切到那一级，导图不动（见 navigate）。
+      // 非钉住仍走 goBackTo —— 它要裁剪栈、按策略关掉当初为下级开的标签，
+      // 这些都不是「打开一个文件」能覆盖的。
+      if (!last) {
+        item.addEventListener("click", () => {
+          if (this.pinned) {
+            const dest = this.app.vault.getAbstractFileByPath(entry.path);
+            if (dest instanceof TFile) this.openFileOnly(dest);
+            return;
+          }
+          this.goBackTo(i);
+        });
+      }
     });
 
     // 当前项永远在最后。路径一长默认滚到最左，用户只看得到最早的几级 ——
@@ -1795,38 +2494,220 @@ export class MindmapView extends ItemView {
    * 存引用等于存了个已经断掉的东西。行号在重建后仍然有效，重新挂 class 就行。
    */
   private selectNode(g: SVGGElement | null): void {
-    this.setSelectedLine(g ? (this.srcOf(g)?.line ?? -1) : -1);
+    const line: number = g ? (this.srcOf(g)?.line ?? -1) : -1;
+    this.selectedLine = line;
+    this.anchorLine = line;
     // 画布拿到焦点，后面的 Tab / Enter 才有人接
     this.canvasEl?.focus({ preventScroll: true });
   }
 
-  private setSelectedLine(line: number): void {
-    if (this.selectedLine === line) return;
-    this.selectedLine = line;
+  /**
+   * 选中某一源行对应的节点，并把它带进视野。
+   *
+   * 键盘换选中必须顺手滚一下视图：连着按十几下方向键之后，选中框很可能已经在
+   * 画布外面了 —— 屏幕上看不出选中到了哪，等于键盘没法用。
+   * `ensureVisible` 只在节点真的出去时才平移，不会每按一下都把画面拽动一次。
+   */
+  private selectByLine(line: number): void {
+    const g = this.findNodeByLine(line);
+    if (!g) return;
+    this.selectNode(g);
+
+    const data = (g as SVGGElement & { __data__?: INode }).__data__;
+    if (!data || !this.mm) return;
+    const pad = 32;
+    void this.mm
+      .ensureVisible(data, { left: pad, right: pad, top: pad, bottom: pad })
+      .catch(() => undefined);
+  }
+
+  /**
+   * 方向键导航：两条轴各管一件事。
+   *
+   * 上下只走**末端节点**（没有孩子的、或折叠了的）：折叠的子树在屏幕上不存在，
+   * 让选中跳进去就是「按一下方向键，选中框凭空消失」；而中间那些带分支的容器
+   * 节点也不进这条序列 —— 上下要是能落到「B」这种还有子级的分支上，看起来就跟
+   * 在大纲里跳行不是一回事。层级只由左右负责。
+   *
+   * 起点本身不是末端（点中了一个分支标题、或按 ← 从子级退回来）时，上下按行号
+   * 找它之后 / 之前的第一个末端，所以不会是「按了没反应」。
+   *
+   * 序列本身由 `domain/nav.ts` 的纯函数算，用 Node 跑用例即可，不必等 DOM。
+   *
+   * 右侧遇到折叠的父节点：先展开再进长子。否则按右毫无反应，用户只能去点圆点。
+   */
+  private moveSelection(key: string): void {
+    const snap = this.editSnapshot();
+    if (!snap) return;
+    const cur: number = this.primaryLine;
+
+    if (key === "ArrowLeft") {
+      // 父节点是根（文件名）时不动：根既不能编辑也不能删，选中它只是让
+      // 操作条上的按钮全部变灰。
+      const parent: number = cur >= 0 ? this.editSvc.parentLineOf(snap, cur) : -1;
+      if (parent >= 0) this.selectByLine(parent);
+      return;
+    }
+
+    if (key === "ArrowRight") {
+      if (cur < 0) return;
+      const child: SrcRef | null = firstChildRef(snap.nodes, cur);
+      if (!child) return;
+      if (this.findNodeByLine(child.line)) this.selectByLine(child.line);
+      else void this.expandInto(cur, child.line);
+      return;
+    }
+
+    const refs: SrcRef[] = visibleLeafRefs(
+      this.mm?.state.data as unknown as NavNode | undefined,
+    );
+    const next: SrcRef | null = stepVisible(refs, cur, key === "ArrowDown" ? 1 : -1);
+    if (next) this.selectByLine(next.line);
+  }
+
+  /** 展开某个节点、再选中它的长子（右侧遇到折叠时用） */
+  private async expandInto(line: number, childLine: number): Promise<void> {
+    const g = this.findNodeByLine(line);
+    const data = g ? (g as SVGGElement & { __data__?: INode }).__data__ : undefined;
+    if (!data || !this.mm) return;
+
+    const fold = data.payload?.fold;
+    if (typeof fold !== "number" || fold <= 0) return;
+    // toggleNode 是 markmap 自己折叠圆点走的那条路：就地改 payload.fold 再重排，
+    // 不去碰笔记。await 之后子节点的 DOM 才存在。
+    await this.mm.toggleNode(data);
+    this.selectByLine(childLine);
+  }
+
+  /** 直接设定整组选中（框选结果）；additive=true 时并入现有集合。 */
+  private applySelection(lines: number[], primary: number, additive: boolean): void {
+    if (!additive) this.selectedLines.clear();
+    for (const l of lines) if (l >= 0) this.selectedLines.add(l);
+    this.primaryLine =
+      primary >= 0 ? primary : this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+    // 整组替换后，锚点跟着新的主选中走 —— 否则接着 Shift 单击会从一个
+    // 早就不在选中集里的老节点开始算区间
+    this.anchorLine = this.primaryLine;
     this.paintSelection();
-    // 选中态决定第二行按钮能不能点，状态一变就得同步
     this.syncToolbar();
   }
 
   /**
-   * 把选中态刷到当前 DOM 上（卡片描边由 CSS 负责，这里只管 class），
-   * 顺便把节点浮动条挂到选中的那个节点上。
+   * Ctrl/⌘ + 单击：在选中集合里加一个 / 去掉一个。
    *
-   * 浮动条每次重建后都要重新挂：markmap 的 setData 会换掉整批 g，
-   * 拿着旧元素等于指着一个已经掉出 DOM 的东西。
+   * 去掉时不改锚点（用户是在「剔除」，没在指定新的起点）；
+   * 加入时把锚点挪到它上面，这样「Ctrl 点一圈、再 Shift 拉区间」的直觉成立。
+   */
+  private toggleSelection(line: number): void {
+    if (line < 0) return;
+    if (this.selectedLines.has(line)) {
+      this.selectedLines.delete(line);
+      // 剔掉的正好是主选中：主选中退到剩下里行号最大的那个，操作条跟着走
+      if (this.primaryLine === line) {
+        this.primaryLine = this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+      }
+    } else {
+      this.selectedLines.add(line);
+      this.primaryLine = line;
+      this.anchorLine = line;
+    }
+    this.paintSelection();
+    this.syncToolbar();
+  }
+
+  /**
+   * 某个节点所在「同级组」的全部行号（按文档顺序）。
+   *
+   * 判定只看 depth：从自己往前扫，比它浅的那一行就是父节点，组从这里开始；
+   * 往后扫到第一个比它浅的为止。同级之间夹着的后代（depth 更深）会被跳过，
+   * 但不影响组的边界 —— 这正是「同层兄弟」的定义。
+   */
+  private siblingLines(line: number): number[] {
+    const nodes = this.snapshot?.nodes;
+    if (!nodes) return [line];
+    const at: number = nodes.findIndex((n) => n.line === line);
+    if (at < 0) return [line];
+    const depth: number = nodes[at].depth;
+
+    let start = at;
+    while (start > 0 && nodes[start - 1].depth >= depth) start--;
+    let end = at;
+    while (end + 1 < nodes.length && nodes[end + 1].depth >= depth) end++;
+
+    const out: number[] = [];
+    for (let i = start; i <= end; i++) {
+      if (nodes[i].depth === depth) out.push(nodes[i].line);
+    }
+    return out.length ? out : [line];
+  }
+
+  /**
+   * Shift + 单击：选中「锚点 → 这一下」之间的同层节点。
+   *
+   * 只处理同级区间（文件管理器的多选就是这么用的）。锚点不在同一组时
+   * （比如锚点在另一根分支上），退化成「只选这个」并把它设为新锚点 ——
+   * 跨父节点的区间没有明确含义，猜一个反而更像 bug。
+   *
+   * @param additive 同时按着 Ctrl/⌘：区间并入现有选中，不替换
+   */
+  private selectSiblingRange(line: number, additive: boolean): void {
+    if (line < 0) return;
+    const group: number[] = this.siblingLines(line);
+    const from: number = group.indexOf(this.anchorLine);
+    const to: number = group.indexOf(line);
+
+    if (from < 0 || to < 0) {
+      this.applySelection([line], line, additive);
+      return;
+    }
+    // 锚点在算完区间后要原样留着：区间选择是「锚点不动、尾巴随便点」，
+    // 每按一次 Shift 都从同一个起点重算。applySelection 会把锚点挪到新的
+    // 主选中上（框选那条路需要），所以这里存一下再放回去。
+    const anchor: number = this.anchorLine;
+    const lo: number = Math.min(from, to);
+    const hi: number = Math.max(from, to);
+    // 主选中 = 这一下点中的那个（浮动条挂它，跟着鼠标走）
+    this.applySelection(group.slice(lo, hi + 1), line, additive);
+    this.anchorLine = anchor;
+  }
+
+  /**
+   * 把选中态刷到当前 DOM 上：所有在 selectedLines 里的节点都加 obmind-selected 类。
+   *
+   * 浮动条只在**单选**时出现（它是画布右侧的固定操作区，不再跟着节点跑）。
+   * 那几个按钮（子 / 同 / 改 / 提 / 删）语义都是「对这一个节点」：作用到一堆节点上，
+   * 改文字没意义、删除是灾难。框选完一排卡片之后还留着一排按钮，看起来就像
+   * 「这些操作会作用于全部」—— 批量操作是另一套（整块拖动、批量删除走键盘），
+   * 不给一个含糊的入口。
    */
   private paintSelection(): void {
     const svg = this.svgEl;
-    let hit: SVGGElement | null = null;
     if (svg) {
+      const sel = this.selectedLines;
       for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
-        const on: boolean =
-          this.selectedLine >= 0 && this.srcOf(g)?.line === this.selectedLine;
+        const on: boolean = sel.has(this.srcOf(g)?.line ?? -1);
         g.classList.toggle("obmind-selected", on);
-        if (on) hit = g;
       }
     }
-    this.nodeBar?.attach(hit);
+    this.nodeBar?.setVisible(this.selectedLines.size === 1);
+  }
+
+  /**
+   * 只修指定节点的选中 class。
+   *
+   * 由 MutationObserver 在「markmap 重写了节点 class」时调用：它重排一次就把
+   * `obmind-selected` 抹掉，而内存里的选中态还在 —— 用户看到的是选中框凭空消失。
+   * 这里只补「本该选中、现在没有」的节点；classList.toggle 写同值不产生新记录，
+   * 不会和观察器互相触发。
+   */
+  private paintSelectionOn(els: Iterable<SVGGElement>): void {
+    const sel = this.selectedLines;
+    for (const g of els) {
+      if (!g.isConnected) continue;
+      const on: boolean = sel.has(this.srcOf(g)?.line ?? -1);
+      if (on === g.classList.contains("obmind-selected")) continue;
+      g.classList.toggle("obmind-selected", on);
+    }
   }
 
   /**
@@ -1867,13 +2748,28 @@ export class MindmapView extends ItemView {
       return;
     }
 
+    // 方向键换选中：上/下 = 文档顺序前一个/后一个，左 = 父，右 = 长子。
+    // 用的是「看得见的节点」序列，折叠起来的子树不参与 —— 否则选中会跑到
+    // 一个没有 DOM 的行上，屏幕上就是「框突然没了」。
+    if (
+      e.key === "ArrowUp" ||
+      e.key === "ArrowDown" ||
+      e.key === "ArrowLeft" ||
+      e.key === "ArrowRight"
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.moveSelection(e.key);
+      return;
+    }
+
     if (e.key === "Escape") {
       // 帮助面板开着时，Esc 先收面板（它盖住了画布，先关它更符合直觉）
       if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
         this.helpPanel.addClass("is-hidden");
         return;
       }
-      this.setSelectedLine(-1);
+      this.applySelection([], -1, false);
       return;
     }
 
@@ -1897,6 +2793,76 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 视图内的单键 / 组合键：空格进编辑、Ctrl+N 建笔记。
+   *
+   * 为什么挂在视图根节点上而不是画布上：画布的 keydown 要求 `target === canvas`，
+   * 而焦点很容易不在那儿 —— 点过工具栏图标、点过面包屑、一轮重建之后焦点落到
+   * body，这些时候按空格本意都是「改这个节点的字」，收不到就是「按了没反应」。
+   *
+   * 三种情况必须让路，否则空格会变成破坏性按键：
+   * - 编辑框 / 任何输入控件里的空格是打字；
+   * - 按钮（含 .clickable-icon）上的空格是「按下这个按钮」的无障碍语义，
+   *   抢过来等于「焦点在删除按钮上按空格，反而开始编辑」；
+   * - 组字中（中文输入法）的按键不是指令。
+   */
+  private onViewKeyDown(e: KeyboardEvent): void {
+    if (e.defaultPrevented || e.isComposing) return;
+    if (isTypingTarget(e.target)) return;
+    // 编辑中 / 重建中（g 马上要换掉）都不接：这时候的行号随时会失效
+    if (this.rt.phase !== "idle") return;
+
+    if (this.tryNewNoteHotkey(e)) return;
+
+    const mod: boolean = e.ctrlKey || e.metaKey;
+    if (e.code !== "Space" && e.key !== " ") return;
+    if (mod || e.altKey || e.shiftKey) return;
+
+    const line: number = this.primaryLine;
+    if (line < 0) return;
+    const g = this.findNodeByLine(line);
+    if (!g) return;
+
+    // 必须拦默认：否则空格会把侧栏/页面往下滚一格，编辑框跟着跳
+    e.preventDefault();
+    this.startEdit(g, false);
+  }
+
+  /**
+   * Ctrl/⌘ + N：给选中节点建笔记。
+   *
+   * 这个组合在 Obsidian 里是「新建笔记」，导图里必须抢过来并拦住默认行为 ——
+   * 否则会先在别处开出一篇空笔记，用户还得自己关掉。
+   *
+   * @returns 是否已经消费这次按键
+   */
+  private tryNewNoteHotkey(e: KeyboardEvent): boolean {
+    if (e.isComposing) return false;
+    if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return false;
+    if (e.code !== "KeyN" && e.key.toLowerCase() !== "n") return false;
+    // 编辑框 / 输入控件里，Ctrl+N 仍归 Obsidian 自己
+    if (isTypingTarget(e.target)) return false;
+
+    e.preventDefault();
+    e.stopPropagation();
+    void this.createNoteForSelected();
+    return true;
+  }
+
+  /**
+   * 导图视图内的全局热键（目前只有 Ctrl/⌘+N），挂在 document 捕获阶段。
+   *
+   * 只在焦点确实在这个视图里时才接管：别处的 Ctrl+N 仍归 Obsidian 的新建笔记。
+   * 与 onViewKeyDown 里的同名分支并存不冲突 —— 这里先跑并 stopPropagation，
+   * 那边第一行就因 defaultPrevented 退出了。
+   */
+  private onHotkeyCapture(e: KeyboardEvent): void {
+    if (this.rt.phase !== "idle") return;
+    const target = e.target;
+    if (!(target instanceof Node) || !this.containerEl.contains(target)) return;
+    this.tryNewNoteHotkey(e);
+  }
+
+  /**
    * 焦点不在画布上时的 Esc 兜底。
    *
    * 只做两件事：收起帮助面板、取消选中。**不拦默认行为也不阻断冒泡** ——
@@ -1913,7 +2879,7 @@ export class MindmapView extends ItemView {
       this.helpPanel.addClass("is-hidden");
       return;
     }
-    if (this.selectedLine >= 0) this.setSelectedLine(-1);
+    if (this.selectedLines.size > 0) this.applySelection([], -1, false);
   }
 
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
@@ -1947,30 +2913,31 @@ export class MindmapView extends ItemView {
    * 所以它的行号不变，可以直接定位。这样才能连着删兄弟节点。
    */
   private removeNode(): void {
-    const line: number = this.selectedLine;
-    if (line < 0) return;
+    const selected: number[] = [...this.selectedLines].filter((l) => l >= 0);
+    if (selected.length === 0) return;
 
     const file = this.targetFile;
     const snap = this.editSnapshot();
     if (!file || !snap) return;
 
-    const size: number = this.editSvc.subtreeSize(snap, line);
-    const parentLine: number = this.editSvc.parentLineOf(snap, line);
-    const out = this.editSvc.remove({ snap, line });
+    const out = this.editSvc.removeGroup({ snap, lines: selected });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
       return;
     }
     if (out.kind === "none") return;
 
-    // 不再等新节点的编辑框；选中改到父节点（根节点就取消选中）
+    // 选中交给父节点：删除后行号整体前移，选中框要么消失、要么指到别人身上，
+    // 用户看到的是「删完一个就断了，得重新点」。父节点在删除区间之前，
+    // 行号不受影响，直接用它恢复选中框（没有父节点 = 删的是顶层，就取消选中）。
     this.pendingEditLine = -1;
-    this.selectedLine = parentLine;
+    const focus: number | undefined = out.focusLine;
+    if (focus !== undefined && focus >= 0) this.applySelection([focus], focus, false);
+    else this.applySelection([], -1, false);
     void this.applyPlan(file, out.op);
 
-    // 一次删掉整棵分支时给个反馈：没有编辑器就没有 Ctrl+Z 兜底，用户要心里有数
-    if (size > 1) {
-      new Notice(`obmind：已删除该节点及其 ${size - 1} 个子节点`);
+    if (selected.length > 1) {
+      new Notice(`obmind：已删除 ${selected.length} 个节点`);
     }
   }
 
@@ -2006,19 +2973,24 @@ export class MindmapView extends ItemView {
    * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
    * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
    */
-  private onNodeDrop(srcLine: number, targetLine: number, mode: DropMode): void {
+  private onNodeDrop(srcLines: number[], targetLine: number, mode: DropMode): void {
     const file = this.targetFile;
     const snap = this.editSnapshot();
     if (!file || !snap) return;
 
     // Bug 2 修复：多行合并节点暂不支持拖动（续行写回会错位），请在笔记里调整层级。
-    const dragSrc = this.editSnapshot() ? this.nodeAt(srcLine) : null;
-    if (dragSrc && dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
-      new Notice("obmind：多行节点暂不支持拖动，请在笔记中调整层级");
-      return;
+    for (const srcLine of srcLines) {
+      const dragSrc = this.nodeAt(srcLine);
+      if (dragSrc && dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
+        new Notice("obmind：多行节点暂不支持拖动，请在笔记里调整层级");
+        return;
+      }
     }
 
-    const out = this.editSvc.move({ snap, srcLine, targetLine, mode });
+    const out =
+      srcLines.length === 1
+        ? this.editSvc.move({ snap, srcLine: srcLines[0], targetLine, mode })
+        : this.editSvc.moveGroup({ snap, srcLines, targetLine, mode });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
       return;
@@ -2026,6 +2998,27 @@ export class MindmapView extends ItemView {
     if (out.kind === "none") return;
 
     void this.applyPlan(file, out.op);
+  }
+
+  /**
+   * 给定节点行号，返回拖动时应一起移动的行号集合：
+   * 若该节点属于 size>1 的选中集，取选中集里所有「不被其它选中节点子树覆盖」的顶层成员；
+   * 否则只返回它自己。
+   */
+  private groupOf(line: number): number[] {
+    const snap = this.editSnapshot();
+    if (!snap || this.selectedLines.size <= 1 || !this.selectedLines.has(line)) return [line];
+    const nodes = snap.nodes as SrcRef[];
+    const selected = [...this.selectedLines];
+    const keep: number[] = [];
+    for (const s of selected) {
+      const si = nodes.findIndex((n) => n.line === s);
+      if (si < 0) continue;
+      const end: number = blockRange(nodes, si).end;
+      const covered: boolean = selected.some((o) => o !== s && o > s && o <= end);
+      if (!covered) keep.push(s);
+    }
+    return keep.length ? keep : [line];
   }
 
   /** 执行写入计划并刷新（拖动、新建节点这类不属于编辑框的操作走这里） */
@@ -2123,6 +3116,8 @@ export class MindmapView extends ItemView {
     src: SrcRef,
   ): Promise<void> {
     let next: string | undefined;
+    /** 「提交即预览」的撤销句柄：写失败/计划作废时把 DOM 还原成旧内容 */
+    let revertPreview: (() => void) | null = null;
     try {
       if (action === "cancel") return;
 
@@ -2130,18 +3125,38 @@ export class MindmapView extends ItemView {
       const snap = this.editSnapshot();
       if (!file || !snap) return;
 
+      // 先把结果画上去，再去写文件。
+      //
+      // 编辑框一关，节点文字会退回**旧内容**等写入完成（一次 vault 事务通常十几毫秒，
+      // 赶上编辑器里还有未落盘的改动会更久），然后才跳到新内容 —— 眼睛看到的就是
+      // 「按完回车，字闪一下」。XMind 这类编辑器是当场改的，写盘在背后跑；
+      // 这里同样：先用同一个 inline 渲染器把新文字铺上去，写完的真实投影到达时
+      // 内容已经一致（applyPatch 会跳过重复赋值），视觉上零切换。
+      revertPreview = this.previewText(src, value);
+
       const out = this.editSvc.commit({ snap, src, action, value });
       if (out.kind === "error") {
+        revertPreview?.();
+        revertPreview = null;
         this.pendingEditLine = -1;
         new Notice(`obmind：${out.reason}`);
         return;
       }
-      if (out.kind === "none") return;
+      if (out.kind === "none") {
+        // 计划说「不用写」：预览得撤回去，否则会和真实内容对不上
+        revertPreview?.();
+        revertPreview = null;
+        return;
+      }
 
       if (out.focusLine !== undefined) this.pendingEditLine = out.focusLine;
       const res = await this.runWrite(file, out.op);
       next = res.next;
+      if (!res.ok) revertPreview?.();
+      revertPreview = null;
     } catch (err) {
+      revertPreview?.();
+      revertPreview = null;
       this.pendingEditLine = -1;
       console.error("[obmind] 写回笔记失败", err);
       new Notice("写回笔记失败，详见控制台。");
@@ -2175,6 +3190,62 @@ export class MindmapView extends ItemView {
    */
   private editorValueOf(src: SrcRef): string {
     return src.checked === null ? src.text : `${src.checked ? "☑" : "☐"} ${src.text}`;
+  }
+
+  /**
+   * 提交即预览：把编辑框里的新文字直接铺到卡片上，不等文件写完。
+   *
+   * 用**同一个** renderInline 渲染，所以后面真实投影到达时 innerHTML 逐字节相同，
+   * applyPatch 会跳过赋值 —— 屏幕上文字一次都不跳。
+   *
+   * 不预览的两种情况：
+   * - 文本被清空（提交时会放弃这次修改，节点保持原样，没有新内容可预览）；
+   * - 内容没变（白白重排一次）。
+   *
+   * @returns 还原函数；写失败时调用，把卡片退回旧内容
+   */
+  private previewText(src: SrcRef, raw: string): (() => void) | null {
+    const parsed = parseEditorValue(src, raw);
+    if (parsed.text === "") return null;
+    if (parsed.text === src.text && parsed.checked === src.checked) return null;
+
+    const g = this.findNodeByLine(src.line);
+    if (!g) return null;
+    const fo = g.querySelector<SVGForeignObjectElement>(":scope > foreignObject");
+    const box = fo?.firstElementChild?.firstElementChild as HTMLElement | null;
+    if (!fo || !box) return null;
+
+    const shown: string =
+      parsed.checked === null
+        ? parsed.text
+        : `${parsed.checked ? "☑" : "☐"} ${parsed.text}`;
+    const html: string = renderInline(shown);
+
+    const prevHtml: string = box.innerHTML;
+    const prevW: string = fo.getAttribute("width") ?? "";
+    const prevH: string = fo.getAttribute("height") ?? "";
+
+    if (prevHtml !== html) box.innerHTML = html;
+
+    // 卡片尺寸要同步长出来：只换文字不改 foreignObject 宽高的话，会先出现一帧
+    // 「新文字溢出旧卡片」，等 markmap 自己重排（100ms 防抖）才回正。
+    const w: number = box.scrollWidth;
+    const h: number = box.scrollHeight;
+    if (w > 0 && h > 0) {
+      fo.setAttribute("width", String(w));
+      fo.setAttribute("height", String(h));
+    }
+    // 尺寸变了就得重排：卡片变宽后邻居那一列还没让开，光重画卡片只会压住别人。
+    // 这里不先 paintNow —— 重排完成后 reflowNow 会画一次，省掉一帧错位。
+    this.reflowSoon();
+
+    return (): void => {
+      if (!fo.isConnected || !box.isConnected) return;
+      box.innerHTML = prevHtml;
+      if (prevW) fo.setAttribute("width", prevW);
+      if (prevH) fo.setAttribute("height", prevH);
+      this.reflowSoon();
+    };
   }
 
   /**
@@ -2263,6 +3334,8 @@ export class MindmapView extends ItemView {
     this.blockCache.clear();
     this.drag?.destroy();
     this.drag = null;
+    this.boxSelect?.destroy();
+    this.boxSelect = null;
     this.snapshot = null;
     this.navStack = [];
     // 只丢映射，不 detach：插件卸载 / 视图关闭不该替用户关掉笔记标签

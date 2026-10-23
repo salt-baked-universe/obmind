@@ -34,6 +34,14 @@ export interface InlineEditorHandle {
 }
 
 /**
+ * 编辑框的最小宽度（按汉字格数算）。
+ *
+ * 7 格是实测出来的：短到「新节点」这种占位文案时，编辑框仍然能横着放下
+ * 「新建一个子节点」这样的半句话，不会刚敲四个字就折行、把卡片顶高。
+ */
+const MIN_EDIT_COLS = 7;
+
+/**
  * 卡片在文字盒四周的内边距（节点局部单位）。
  * 卡片以文字盒为中心对称外扩，所以直接用宽高差的一半，不必去读 x/y 属性。
  * 属性缺失（例如卡片还没画出来）时退回 0，编辑框就只盖文字，行为与旧版一致。
@@ -93,14 +101,33 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
   const svg: SVGSVGElement | null = container.querySelector("svg");
 
   let done = false;
-  const prevOpacity: string = fo.style.opacity;
+  // 原文用 visibility 藏，**不能**用 opacity。
+  //
+  // 曾经写的是 `fo.style.opacity = "0"`，症状是「一进编辑态，这个节点的卡片和连线
+  // 整块消失，屏幕上只剩一个孤零零的输入框」：painter 把 foreignObject 的 opacity
+  // 当作「markmap 正在淡入淡出」的信号（render/painter.ts 的 syncFadeFor），
+  // 一看到 < 1 就同步给自绘的阴影/卡片/连线/收放点。编辑框的隐藏被它当成淡出，
+  // 整块装饰跟着透明 —— 而那正是我们想让人看见的东西（线是结构的一部分）。
+  // visibility 不走那条通道：它表达的是「暂时看不见」，不是「正在消失」。
+  const prevVisibility: string = fo.style.visibility;
+  /** 上一次落位的输入签名：位置与文本都没变就不写样式（见 place） */
+  let lastKey = "";
 
-  const place = (): void => {
+  const place = (): boolean => {
     const rect: DOMRect = fo.getBoundingClientRect();
     const base: DOMRect = container.getBoundingClientRect();
     const rawW: number = Number.parseFloat(fo.getAttribute("width") ?? "") || rect.width;
     const rawH: number = Number.parseFloat(fo.getAttribute("height") ?? "") || rect.height;
     const scale: number = rawW > 0 ? rect.width / rawW : 1;
+
+    // 位置、缩放、文本都没变就别再写一遍。
+    // 打开后的 420ms 里这里每帧都会跑（见 followLoop），每帧写 width/height 再读
+    // scrollHeight 是一次强制同步布局 —— 用户往往这时候已经开始打字了，
+    // 每帧重排 + 每帧写样式叠在一起就是「输入时画面发虚/闪」。
+    // 文本进签名（不是长度）：等长替换时字宽可能不同、折行会变，高度得跟着重算。
+    const key: string = `${rect.left},${rect.top},${rawW},${rawH},${scale}|${ta.value}`;
+    if (key === lastKey) return false;
+    lastKey = key;
 
     // 编辑框要盖住**整张卡片**，而不只是文字盒——卡片左右各有十几像素内边距，
     // 只盖文字的话，一进编辑态卡片左右两侧会露出原色，像「框套框」。
@@ -112,7 +139,11 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     // +2 的容差：markmap 的节点宽是 scrollWidth 取整后的值，
     // 真实文字宽度可能多零点几像素。宽度卡得太死，textarea 会多折一行，
     // 编辑框就比卡片高一截。（加在内边距之外，不影响换行位置）
-    ta.style.width = `${rawW + pad.x * 2 + 2}px`;
+    // 至少 7 个汉字宽：新节点的占位文案是「新节点」（3 个字），卡片也就 3 格宽，
+    // 编辑框要是死跟着卡片宽度走，打到第 4 个字就开始折行 —— 视觉上像「一打字就换行」。
+    // 中文一格 ≈ 1em，所以直接按字号算；编辑框比卡片宽没关系，它只是个临时浮层。
+    const minWidth: number = (Number.parseFloat(cs.fontSize) || 16) * MIN_EDIT_COLS;
+    ta.style.width = `${Math.max(rawW + pad.x * 2 + 2, minWidth)}px`;
     ta.style.padding = `${pad.y}px ${pad.x}px`;
     ta.style.transform = `scale(${scale})`;
 
@@ -120,6 +151,7 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     ta.style.height = "1px";
     const needed: number = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
+    return true;
   };
 
   let frame = 0;
@@ -138,15 +170,23 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
    * 看起来就是「输入框飘在半空闪一下」。超过窗口期就停，不做常驻监听。
    */
   let follow = 0;
+  let lastMoveAt: number = performance.now();
   const followUntil: number = performance.now() + 420;
   const followLoop = (): void => {
     if (done) {
       follow = 0;
       return;
     }
-    place();
-    follow =
-      performance.now() < followUntil ? window.requestAnimationFrame(followLoop) : 0;
+    // 位置稳定下来就提前收工（阈值 240ms > markmap 那个 100ms 防抖重排）：
+    // 窗口期是给「刚重建完、节点晚一步挪到位」留的余量，节点已经不动了
+    // 就没必要继续每帧量一遍。
+    if (place()) lastMoveAt = performance.now();
+    const now: number = performance.now();
+    if (now - lastMoveAt > 240 || now >= followUntil) {
+      follow = 0;
+      return;
+    }
+    follow = window.requestAnimationFrame(followLoop);
   };
   follow = window.requestAnimationFrame(followLoop);
 
@@ -166,7 +206,7 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     ta.removeEventListener("wheel", stop);
     svg?.removeEventListener("wheel", reposition, true);
     window.removeEventListener("resize", reposition);
-    fo.style.opacity = prevOpacity;
+    fo.style.visibility = prevVisibility;
     ta.remove();
   };
 
@@ -208,14 +248,27 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
       return;
     }
     if (e.key === "Tab") {
+      // Tab 和 Enter 一样只做一件事：**提交并退出编辑**。
+      //
+      // 曾经 Tab 在这里是「提交 + 建子级」（按 XMind 手感「顺手往下一层写」），
+      // 但实际用起来是反的：改完一个字按 Tab，屏幕上会立刻多出一个空节点、
+      // 焦点也跑到它身上，用户以为自己在「结束输入」，结果是「又开了一个」。
+      // 现在统一成两步：先结束输入，再在画布上按 Tab 建子级 —— 和「先 Enter
+      // 结束、再 Enter 建同级」完全对称，两种键的手感一致。
+      //
+      // 带修饰键的仍然直接做结构操作（Shift+Tab 提升一级），因为它不是
+      // 「结束输入」的手势，而是明确要求改结构。
       e.preventDefault();
-      finish(e.shiftKey ? "outdent" : "indent");
+      e.stopPropagation();
+      finish(e.shiftKey ? "outdent" : "commit");
       return;
     }
-    if (e.key === "Backspace" && ta.value.trim() === "") {
-      e.preventDefault();
-      finish("delete");
-    }
+    // 退格 / 删除键在这里**只删文字**。
+    //
+    // 曾经做成「清空后再按一次 = 删掉整个节点」，理由是 XMind 的手感。但那是
+    // 结构操作混进了文字编辑：用户想删一行字、或者全选清空重打，节点会连同
+    // 整棵子树一起消失，而且没有确认。删除只属于「没在编辑、画布上选中」这个
+    // 状态（Delete / Backspace），编辑框里永远不产出结构变化。
   }
 
   ta.addEventListener("keydown", onKeyDown);
@@ -227,7 +280,7 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
   svg?.addEventListener("wheel", reposition, true);
   window.addEventListener("resize", reposition);
 
-  fo.style.opacity = "0";
+  fo.style.visibility = "hidden";
   place();
   ta.focus();
   if (options.selectAll) ta.select();

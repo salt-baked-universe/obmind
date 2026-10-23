@@ -26,6 +26,8 @@ export interface FrameSource {
 
 export class FrameScheduler {
   private frame = 0;
+  /** 全量绘制发现「还有节点没长全」时的重试计数，避免无限排帧 */
+  private retries = 0;
 
   constructor(
     private readonly painter: NodePainter,
@@ -53,7 +55,20 @@ export class FrameScheduler {
     const svg = this.source.svg();
     const spec = this.source.spec();
     if (!svg || !spec) return;
-    this.painter.paintAll(svg, spec);
+    const pending: number = this.painter.paintAll(svg, spec);
+
+    // 还有节点读不到几何（内容还没量出来、transform 还没写）：隔一帧再全量画一次。
+    // 不补这一遍，这些节点就永远没有卡片 —— 用户看到的就是「只渲染了半张图」。
+    // 最多补 3 次（一帧一次），之后放手：那些节点可能真的是空内容。
+    if (pending > 0 && this.retries < 3 && !this.source.blocked()) {
+      this.retries++;
+      this.frame = window.requestAnimationFrame(() => {
+        this.frame = 0;
+        this.paintNow();
+      });
+      return;
+    }
+    this.retries = 0;
   }
 
   /**
@@ -76,9 +91,21 @@ export class FrameScheduler {
     }
   }
 
+  /**
+   * 同步透明度。
+   *
+   * 刻意**不看 blocked()**：这一步只把 foreignObject 的 opacity 抄到卡片/连线/收放点上，
+   * 不读任何布局，重建期间照抄也是对的；反过来放行让它被跳过，就会留下
+   * 「卡片停在 opacity: 0」的死局（见 NodePainter.syncFadeFor 的注释）。
+   */
+  syncFade(els: Iterable<SVGGElement>): void {
+    this.painter.syncFadeFor(els);
+  }
+
   /** 缓存全清（重建后元素引用全部作废） */
   reset(): void {
     this.cancel();
+    this.retries = 0;
     this.painter.reset();
   }
 }

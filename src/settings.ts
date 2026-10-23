@@ -12,12 +12,20 @@ export interface ObmindSettings {
   filterFrontmatter: boolean;
   /** 面包屑跳转时，笔记窗口是否跟随、怎么跟随 */
   navSync: NavSyncMode;
+  /**
+   * 新建笔记时套用的模板笔记路径（空串 = 不套用，建空白笔记）。
+   *
+   * 存路径而不是内容：模板是用户笔记库里的一等公民，改模板就是改笔记，
+   * 复制一份内容进插件设置之后必然会和原文件分叉。
+   */
+  noteTemplate: string;
 }
 
 export const DEFAULT_SETTINGS: ObmindSettings = {
   theme: "follow",
   filterFrontmatter: true,
   navSync: DEFAULT_NAV_SYNC,
+  noteTemplate: "",
 };
 
 export class ObmindSettingTab extends PluginSettingTab {
@@ -68,6 +76,28 @@ export class ObmindSettingTab extends PluginSettingTab {
           paintHint(mode);
           await this.plugin.saveSettings();
         });
+      });
+
+    // 新建笔记的模板：只存「哪篇笔记当模板」，内容每次现读。
+    // 变量名沿用核心 Templates 插件那一套，从那边迁过来不用重学。
+    new Setting(containerEl)
+      .setName("新建笔记模板")
+      .setDesc(
+        "从节点新建笔记（Ctrl+N）时套用这篇模板的内容；留空则新建一篇空白笔记。" +
+          "可用变量：{{title}} 笔记名、{{date}} 今天、{{time}} 现在、" +
+          "{{from}} 来源笔记的双链。日期时间可带格式，如 {{date:YYYY年MM月DD日}}。" +
+          "新建笔记放在哪里，跟随 Obsidian 设置里的「新建笔记的存放位置」。",
+      )
+      .addText((text) => {
+        text.inputEl.addClass("obmind-setting-input");
+        text
+          .setPlaceholder("模板/笔记模板.md（留空 = 空白笔记）")
+          .setValue(this.plugin.settings.noteTemplate)
+          .onChange(async (value: string) => {
+            // 只改设置，不刷新导图：模板不参与当前的渲染
+            this.plugin.settings.noteTemplate = value.trim();
+            await this.plugin.saveSettings();
+          });
       });
   }
 }

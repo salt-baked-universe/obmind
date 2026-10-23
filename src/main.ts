@@ -81,6 +81,14 @@ export default class MindmapPlugin extends Plugin {
         name: "重新读取笔记并重绘导图",
         callback: () => this.withMindmap((view) => void view.refresh()),
       });
+
+      // 导图内的 Ctrl+N 已经被视图自己接住（见 MindmapView.onViewKeyDown），
+      // 这里再注册一条命令：快捷键被别的插件抢走时，用户还能在设置里重新绑。
+      this.addCommand({
+        id: "mindmap-create-note",
+        name: "为选中节点新建笔记并双链",
+        callback: () => this.withMindmap((view) => void view.createNoteForSelected()),
+      });
     });
 
     this.safely("添加设置页", () => {

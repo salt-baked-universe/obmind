@@ -62,6 +62,41 @@
   overflow: hidden;
 }
 
+/* 行首品牌位（logo 占位）：现在是「低山」两个字，将来换成真图标只要换文案。
+   字距拉开、用 faint 色，只做视觉锚点 —— 不抢图标按钮的注意力，
+   又能把「这一行是插件的操作区」和右边的按钮群分开。 */
+.obmind-toolbar .obmind-brand {
+  flex: 0 0 auto;
+  padding: 0 5px 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.14em;
+  color: var(--text-faint);
+  user-select: none;
+  white-space: nowrap;
+}
+
+/* 行尾规模统计：「128 节点 · 深 6」。
+   tabular-nums 是必须的：数字等宽，加一个节点时这串字的宽度才不会变，
+   否则每次编辑都会让右边那排按钮左右抖一下。 */
+.obmind-toolbar .obmind-stats {
+  flex: 0 0 auto;
+  margin-left: 4px;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* 没有导图（空态）时不占位 */
+.obmind-toolbar .obmind-stats.is-empty {
+  display: none;
+}
+
 /* 图标按钮：28px 见方 + 7px 圆角，hover 底色由 Obsidian 的 .clickable-icon
    提供（跟随主题的 --background-modifier-hover）。
    原来 26px + padding 4 在 300px 侧栏里挤成一排小方块；
@@ -105,6 +140,20 @@
   color: var(--text-faint);
 }
 
+/* 开关型按钮的开启态（钉住）：底色用强调色兑一档淡的，图标保持强调色。
+   只换图标不够 —— 16px 的图钉在灰底上一眼分不出开没开；
+   只换颜色也不够 —— 用户不知道点一下是「开」还是「关」，tooltip 里说清楚。
+   必须排在 :hover 之后：两者特异度相同（3 个类），靠书写顺序决出胜负。 */
+.obmind-toolbar .clickable-icon.is-active {
+  color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 16%, transparent);
+}
+
+.obmind-toolbar .clickable-icon.is-active:hover {
+  color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 26%, transparent);
+}
+
 /* 图标缺失时的文字兜底按钮 */
 .obmind-toolbar .clickable-icon.obmind-icon-fallback,
 .obmind-nodebar .clickable-icon.obmind-icon-fallback {
@@ -113,6 +162,13 @@
   padding: 0 7px;
   font-size: var(--font-ui-smaller, 12px);
   line-height: 1;
+}
+
+/* 条件性按钮的「不适用」态：节点已经有双链时，「新建笔记」不该占着一个位置。
+   这是唯一用 display:none 的地方 —— 它不是「暂时点不了」，而是此刻没有意义，
+   置灰的话用户会一直点它试为什么点不动。 */
+.obmind-nodebar .clickable-icon.is-gone {
+  display: none;
 }
 
 /* 分组竖线：用 currentColor + 低透明度，比 --background-modifier-border 更软，
@@ -131,20 +187,24 @@
   min-width: 4px;
 }
 
-/* 节点操作条：选中节点时浮在卡片正下方，操作跟着上下文走。
+/* 节点操作条：选中单个节点时贴在画布**右侧**、垂直居中，竖排一列。
    位置由 JS 用 transform 写（ui/nodeBar.ts），这里只管长相。
 
+   为什么竖排而不是横条：横条贴右边会横着压住一整行卡片，竖排只占一条
+   3xpx 宽的窄缝，正好落在最深一级节点的右边留白里。
+
    隐藏用 opacity + pointer-events 而不是 display:none —— 隐藏态也要参与布局，
-   否则刚创建时读不到 offsetWidth，第一次弹出会先落在左上角再跳过来。 */
+   否则刚创建时读不到 offsetHeight，第一次弹出会先落在左上角再跳过来。 */
 .obmind-nodebar {
   position: absolute;
   top: 0;
   left: 0;
   z-index: 30;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 1px;
-  padding: 3px 4px;
+  padding: 4px 3px;
   border-radius: 10px;
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
@@ -152,8 +212,11 @@
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.12s ease;
-  /* 浮层每帧都在跟着卡片挪，提前合成一层，避免跟节点动画抢主线程 */
-  will-change: transform;
+  /* 位置是固定的（只在画布尺寸变化时重算），所以不再需要 will-change 常驻合成层。
+     画布比 5 个按钮还矮时按上限截住，宁可滚动也不能溢出到看不见的地方 */
+  max-height: calc(100% - 16px);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .obmind-nodebar.is-in {
@@ -181,9 +244,11 @@
   height: 15px;
 }
 
+/* 竖排之后分组线要转 90°：横线 + 上下间距，宽度撑满内容宽度 */
 .obmind-nodebar .obmind-toolbar-sep {
-  height: 13px;
-  margin: 0 3px;
+  width: 14px;
+  height: 1px;
+  margin: 3px 0;
 }
 
 /* 快捷键面板：点「?」浮出。
@@ -240,14 +305,20 @@
   font-weight: var(--font-semibold, 600);
 }
 
-/* 下面两条容器查询必须放在基础规则**之后**：
+/* 下面几条容器查询必须放在基础规则**之后**：
    @container 不提升优先级，同优先级下靠书写顺序取胜，
-   放在前面会被后面的 .obmind-toolbar 规则原样覆盖回去。 */
-/* 窄侧栏（Obsidian 允许拖到 260px 上下）：
-   图标 28 → 24、分隔线留白减半，实测 240px 仍能一行放下 8 个按钮。 */
-@container (max-width: 310px) {
-  /* 图标缩到 24 之后把上下内边距补回来，行高仍是 37px ——
-     拖动侧栏跨过断点时工具条不会突然变矮，画布也不会跟着跳。 */
+   放在前面会被后面的 .obmind-toolbar 规则原样覆盖回去。
+
+   三档宽度是按「实测的自然宽度」倒推的（10 个按钮 + 主题键）：
+     28px 图标 + 分隔线 → 350px
+     24px 图标 + 分隔线 → 304px
+     24px 图标 + 无分隔线 → 264px
+     20px 图标 + 无分隔线 → 223px
+   每档阈值压在上一档自然宽度之上，跨档时才不会出现「差 12px 把尾部按钮裁掉」。 */
+
+/* 28px 一档撑不住 356px 以下的容器 → 收成 24px。
+   上边距补回来，行高仍是 37px：拖侧栏跨断点时工具条不会变矮、画布不会跳。 */
+@container (max-width: 355px) {
   .obmind-toolbar {
     padding-top: 7px;
     padding-bottom: 6px;
@@ -270,7 +341,7 @@
 
 /* 极窄（用户把侧栏拖到底）：分组竖线先让位 —— 它们的间隙就是最后这十几个像素。
    按钮靠颜色与间距已经能看出成组，竖线只是锦上添花。 */
-@container (max-width: 280px) {
+@container (max-width: 310px) {
   .obmind-toolbar {
     gap: 1px;
     padding-left: 4px;
@@ -279,6 +350,26 @@
 
   .obmind-toolbar-sep {
     display: none;
+  }
+}
+
+/* 再窄就只剩图标能收了：10 个按钮 + 主题键在 24px 一档要 264px，
+   240px 的侧栏必须收成 20px —— 那正是 Obsidian 自带侧栏图标的量级，
+   这个宽度下并不难按。行高仍靠上下内边距补回 37px。 */
+@container (max-width: 272px) {
+  .obmind-toolbar {
+    padding-top: 9px;
+    padding-bottom: 8px;
+  }
+
+  .obmind-toolbar .clickable-icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  .obmind-toolbar .clickable-icon svg {
+    width: 14px;
+    height: 14px;
   }
 }
 
@@ -554,6 +645,13 @@
   caret-color: var(--interactive-accent, #4a7dff);
 }
 
+/* 文本被清空后的提示：再按一次退格 / Delete 就删节点。
+   灰一点、轻一点，不要抢过用户刚删空的那张卡片。 */
+.obmind-inline-editor::placeholder {
+  color: var(--text-faint, #9aa0aa);
+  opacity: 1;
+}
+
 /* 拖动改变父子关系的视觉反馈。
    拖拽中的源节点淡出，跟随鼠标显示「落点」：
    落在卡片中部 = 变成子节点（描边框），落在上下沿 = 排到前后（横线）。 */
@@ -584,8 +682,51 @@
   background: var(--interactive-accent, #4a7dff);
 }
 
+/* 框选橡皮筋：左键在空白区拖出的选择矩形。半透明填充 + 描边，
+   视觉上和拖动提示（obmind-drop-box）同源但更轻，区分"选中"与"放置"。 */
+.obmind-select-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 16;
+}
+
+.obmind-select-box {
+  position: absolute;
+  display: none;
+  box-sizing: border-box;
+  border: 1.5px dashed var(--interactive-accent, #4a7dff);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--interactive-accent, #4a7dff) 14%, transparent);
+}
+
 /* 设置页：联动模式的说明文字，紧贴在下拉框下面 */
 .obmind-nav-hint {
   margin: -10px 0 18px;
   line-height: 1.5;
+}
+
+/* 模板路径要整条看得见：Obsidian 默认的 200px 输入框连「模板/读书笔记模板.md」
+   都显示不全，用户根本没法核对路径写对没有。 */
+.obmind-setting-input {
+  width: min(420px, 46vw);
+}
+
+/* 字标与统计都是「锦上添花」：宽度不够时按顺序让位，按钮永远优先。
+   实测（28px 图标、10 个按钮 + 主题键）：纯按钮 ≈ 350px，加字标 ≈ 408px，
+   再加统计 ≈ 471px；≤310px 图标缩到 24 后纯按钮 ≈ 264px。
+   阈值就卡在这三档上留点余量，免得换个字体差几像素就把统计挤成半截。
+
+   为什么宁可整个隐藏也不让它换行/截断：工具条一换行，画布高度就会变，
+   每次缩放/编辑都上下跳；截断又会出现「128 节…」这种读不出数的残句。 */
+@container (max-width: 480px) {
+  .obmind-toolbar .obmind-stats {
+    display: none;
+  }
+}
+
+@container (max-width: 412px) {
+  .obmind-toolbar .obmind-brand {
+    display: none;
+  }
 }

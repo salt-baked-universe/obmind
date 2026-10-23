@@ -21,7 +21,7 @@
 import type { DropMode, EditorAction, SrcRef, Span, WriteOp } from "../types";
 import { planCreate, subtreeEndOf, type CreateMode } from "../edit/create";
 import { indentBy, parseEditorValue, rewriteNode } from "../edit/text";
-import { moveNode } from "../edit/move";
+import { moveNode, moveNodes, blockRange } from "../edit/move";
 
 /** 一次操作的输入快照：只读，由读路径产出 */
 export interface EditSnapshot {
@@ -89,10 +89,18 @@ export interface MoveInput {
   mode: DropMode;
 }
 
-export interface RemoveInput {
+export interface MoveGroupInput {
   snap: EditSnapshot;
-  /** 要删的节点所在行 */
-  line: number;
+  /** 要整体移动的源节点行号（多个） */
+  srcLines: number[];
+  targetLine: number;
+  mode: DropMode;
+}
+
+export interface RemoveGroupInput {
+  snap: EditSnapshot;
+  /** 要删除的节点行号（多个，可含嵌套）；重叠范围会自动合并 */
+  lines: number[];
 }
 
 export class EditService {
@@ -102,9 +110,9 @@ export class EditService {
   }
 
   /**
-   * 编辑框结束：改字 / 缩进 / 新建同级 / 删除。
+   * 编辑框结束：改字 / 缩进 / 新建同级 / 新建子级 / 删除。
    *
-   * 其中「新建同级」是最容易写错的一条：新行不能插在下一行，而要插在
+   * 其中「新建同级 / 子级」最容易写错的一条：新行不能插在下一行，而要插在
    * **整棵子树之后**。父节点有孩子时，下一行是它的第一个孩子 ——
    * 插在那里会被缩进规则判成孩子，越加越深。
    */
@@ -113,26 +121,28 @@ export class EditService {
     if (action === "cancel") return none("已取消");
 
     const parsed = parseEditorValue(src, value);
-    // 只有「退格清空」才删行；否则空文本一律视为放弃修改。
-    // 笔记里一行就是一条内容，误删比改不动代价大得多。
-    if (parsed.text === "" && action !== "delete") return none("空文本不写入");
 
-    if (action === "delete") {
-      // 编辑框被清空后按退格 = 删掉这个节点。
-      // 有子节点时一并删掉整棵子树：孩子失去父节点后层级会塌，留着只会变成
-      // 一堆挂到上一层的孤儿，用户还得手工收拾。
-      return { kind: "write", op: this.removeOp(snap, src) };
-    }
+    // 文本被清空 = 放弃这次修改，节点原样留着。
+    //
+    // 这里踩过两次坑，结论是**编辑框永远不产出结构变化**：
+    // 先是「空文本一律放弃」被当成 bug（字删完了节点还在）；改成「清空即删节点」，
+    // 又把「改字」和「删结构」混在了一起 —— 全选想重打一行，回车的那一刻节点
+    // 连整棵子树一起没了。删除只属于「没在编辑、画布上选中」的状态
+    // （画布 Delete / Backspace → removeGroup），编辑框里退格就只是退格。
+    if (parsed.text === "") return none("文本为空，保持原样");
 
-    if (action === "sibling") {
+    if (action === "sibling" || action === "child") {
       // 注意不要用 parsed.text 当新节点的文本：编辑框里敲的是**当前节点**的新名字，
       // 新节点是另一条内容，用占位文本，写完立刻进编辑框让用户输入。
+      //
+      // 同级与子级走同一条拼装路径，只有「新行插在哪、缩进几层」不同（planCreate 决定）：
+      // 两者都是「改当前行 + 在某个位置插一行」，区别只是插入点。
       const plan = planCreate({
         src,
         nodes: snap.nodes,
         step: snap.step,
         unit: snap.unit,
-        mode: "sibling",
+        mode: action,
       });
       if (!plan.ok) return error(plan.reason);
 
@@ -247,16 +257,99 @@ export class EditService {
   }
 
   /**
+   * 整体移动一组节点（框选后整体拖动）。
+   *
+   * 与单节点 move 一样整篇重写：一次移动多块，中间任何瞬间都不该出现「半截笔记」。
+   */
+  moveGroup(input: MoveGroupInput): EditOutcome {
+    const res = moveNodes({
+      lines: input.snap.content.split("\n"),
+      nodes: [...input.snap.nodes],
+      step: input.snap.step,
+      unit: input.snap.unit,
+      srcLines: input.srcLines,
+      targetLine: input.targetLine,
+      mode: input.mode,
+    });
+    if (!res.ok) return error(res.reason);
+
+    return {
+      kind: "write",
+      op: {
+        kind: "whole",
+        content: res.lines.join("\n"),
+        expect: input.snap.content,
+      },
+    };
+  }
+
+  /**
    * 删除节点（画布上按 Delete/Backspace）。
    *
    * 删的是**整棵子树**：一行 + 它下面所有更深缩进的行。只删一行的话，
    * 子节点会失去父节点、被缩进规则挂到更上层，导图结构在用户眼里就乱了。
+   *
+   * 这是**唯一的删除入口**：编辑框不产出删除（见 commit 里的说明）。
+   *
+   * @returns focusLine 删完之后该选中的行 —— 父节点。父节点在删除区间之前，
+   *          行号不受这次写入影响，可以原样用来恢复选中框。
    */
-  remove(input: RemoveInput): EditOutcome {
-    const src = this.nodeAt(input.snap, input.line);
-    if (!src) return error("找不到要删除的节点");
-    if (src.depth === 0) return error("根节点是笔记本身，删不了");
-    return { kind: "write", op: this.removeOp(input.snap, src) };
+  removeGroup(input: RemoveGroupInput): EditOutcome {
+    const nodes = [...input.snap.nodes];
+    const lines: string[] = input.snap.content.split("\n");
+
+    // 收集每棵子树的范围（含自身到末代）
+    const ranges: Array<[number, number]> = [];
+    for (const ln of input.lines) {
+      const idx = nodes.findIndex((n) => n.line === ln);
+      if (idx < 0) continue;
+      const src = nodes[idx];
+      if (src.depth === 0) continue; // 根节点不可删
+      const r = blockRange(nodes, idx);
+      ranges.push([r.start, r.end]);
+    }
+    if (ranges.length === 0) return error("没有可删除的节点");
+
+    // 按起点升序合并重叠/相邻区间
+    ranges.sort((a, b) => a[0] - b[0]);
+    const merged: Array<[number, number]> = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1] + 1) {
+        last[1] = Math.max(last[1], r[1]);
+      } else {
+        merged.push([r[0], r[1]]);
+      }
+    }
+
+    const removeSet = new Set<number>();
+    for (const [s, e] of merged) {
+      for (let i = s; i <= e; i++) removeSet.add(i);
+    }
+    const newLines: string[] = lines.filter((_, i) => !removeSet.has(i));
+    if (newLines.join("\n") === lines.join("\n")) return none("内容没有变化");
+
+    // 删完把选中交给父节点：最早的被删节点往上找一层。它一定在删除区间之前
+    // （若它也被选中，区间会从它开始，它就不会是「最早的那个」），
+    // 所以行号不受影响，删完直接用它恢复选中框，用户能接着按 Delete 连删。
+    //
+    // 顶层节点没有可选中的父节点（根是文件名，不能选也不能删），退一步选
+    // 「落在删除位置上」的那个节点 —— 效果是选中下一个兄弟。不这么做的话，
+    // 删掉顶层节点后选中框会直接消失，用户以为是「删完就断了」。
+    const firstRemoved: number = merged[0][0];
+    const parentLine: number = this.parentLineOf(input.snap, firstRemoved);
+    const nextLine: number = newLines.length > firstRemoved ? firstRemoved : -1;
+    const focusLine: number = parentLine >= 0 ? parentLine : nextLine;
+
+    return {
+      kind: "write",
+      op: {
+        kind: "whole",
+        content: newLines.join("\n"),
+        expect: input.snap.content,
+      },
+      focusLine: focusLine >= 0 ? focusLine : undefined,
+    };
   }
 
   /** 某个节点在树里的父节点行号；根节点返回 -1（删完用它把选中挪过去） */
@@ -277,26 +370,5 @@ export class EditService {
     const src = this.nodeAt(snap, line);
     if (!src) return 0;
     return subtreeEndOf(src, snap.nodes) - src.line + 1;
-  }
-
-  /**
-   * 删除用的行区间：从该行到子树最后一行。
-   *
-   * 首尾都要锚定：跨越多行时，中间任何一行被外部改过，写入都必须放弃，
-   * 否则会拿旧内容覆盖用户刚敲的字。
-   */
-  private removeOp(snap: EditSnapshot, src: SrcRef): WriteOp {
-    const end: number = subtreeEndOf(src, snap.nodes);
-    const lines: string[] = snap.content.split("\n");
-    const span: Span = {
-      start: src.line,
-      end: end + 1,
-      lines: [],
-      checkLine: src.line,
-      checkText: src.full,
-      checkEnd:
-        end > src.line ? { line: end, text: lines[end] ?? "" } : undefined,
-    };
-    return { kind: "span", span };
   }
 }

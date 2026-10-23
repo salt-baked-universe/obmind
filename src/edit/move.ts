@@ -237,3 +237,127 @@ export function moveNode(input: MoveInput): MoveResult {
   }
   return { ok: true, lines: rest };
 }
+
+export interface MoveGroupInput {
+  /** 整篇正文按 \n 切分的行数组 */
+  lines: string[];
+  /** 解析时的节点坐标，必须按 line 升序 */
+  nodes: SrcRef[];
+  /** 缩进步长（列数） */
+  step: number;
+  /** 缩进单位原文（可能是制表符）；空串表示用 step 个空格 */
+  unit?: string;
+  /** 要整体移动的源节点行号（多个）；互相嵌套的情况由 groupOf 在视图层已经剥离 */
+  srcLines: number[];
+  targetLine: number;
+  mode: DropMode;
+}
+
+/**
+ * 整体移动一组节点（框选后整体拖动）。
+ *
+ * 思路与 moveNode 一致，但一次搬多块：
+ * 1. 每块按 blockRange 取出，按源行升序排好（保证彼此不嵌套，由视图层 groupOf 保证）；
+ * 2. 每块各自按目标重写层级（标题改 # 数、正文改缩进），逻辑逐块复用 moveNode；
+ * 3. 从后往前整块删掉，再按「目标插入点之前被删了多少行」修正插入下标，把重写后的块
+ *    按原相对顺序整段插回去。
+ *
+ * 整篇重写（whole）和单节点移动同等级别的安全：写回时校验整篇原文未变（expect）。
+ */
+export function moveNodes(input: MoveGroupInput): MoveResult {
+  const { lines, nodes, step, targetLine, mode, srcLines } = input;
+  const unit: string = input.unit ?? "";
+
+  const tgtIdx: number = nodes.findIndex((n) => n.line === targetLine);
+  if (tgtIdx < 0) return { ok: false, reason: "找不到目标节点" };
+  const tgt: SrcRef = nodes[tgtIdx];
+  const tgtBlock = blockRange(nodes, tgtIdx);
+
+  // 收集每个源块的区间；去重 + 按源行升序
+  const blocks: Array<{ start: number; end: number; idx: number }> = [];
+  for (const ln of srcLines) {
+    const i: number = nodes.findIndex((n) => n.line === ln);
+    if (i < 0) continue;
+    const src: SrcRef = nodes[i];
+    // 根节点（笔记本身）不能移动
+    if (src.depth === 0) return { ok: false, reason: "根节点不能移动" };
+    const sb = blockRange(nodes, i);
+    // 不能把任何选中块拖进它自己的子树
+    if (targetLine >= sb.start && targetLine <= sb.end) {
+      return { ok: false, reason: "不能移到自己的子节点下面" };
+    }
+    // 和单节点一致的层级体系约束
+    if (src.heading && !tgt.heading) {
+      return { ok: false, reason: "标题不能拖到正文节点上" };
+    }
+    if (!src.heading && tgt.heading && mode !== "child") {
+      return { ok: false, reason: "正文不能和标题平级，只能拖到标题上当子节点" };
+    }
+    blocks.push({ start: sb.start, end: sb.end, idx: i });
+  }
+  if (blocks.length === 0) return { ok: false, reason: "找不到源节点" };
+  blocks.sort((a, b) => a.start - b.start);
+  // 防御：选中集里若仍有互相嵌套的块（例如用户没走 groupOf 直接调用），直接拒绝
+  for (let i = 1; i < blocks.length; i++) {
+    if (blocks[i].start <= blocks[i - 1].end) {
+      return { ok: false, reason: "选中的节点存在嵌套，无法整体移动" };
+    }
+  }
+
+  // 插入点：和 moveNode 同一套算法
+  const insertAfterHeading: boolean = mode === "child" && tgt.heading;
+  const rawInsertAt: number = insertAfterHeading
+    ? tgt.line + 1
+    : mode === "before"
+      ? tgt.line
+      : Math.min(tgtBlock.end + 1, lines.length);
+
+  // 逐块重写层级
+  const extracted: Array<{ block: string[]; bad?: string }> = blocks.map((b) => {
+    const src: SrcRef = nodes[b.idx];
+    const block: string[] = lines.slice(b.start, b.end + 1);
+    if (src.heading) {
+      const srcLevel: number = src.level ?? 1;
+      const tgtLevel: number = tgt.level ?? 1;
+      const newLevel: number = mode === "child" ? tgtLevel + 1 : tgtLevel;
+      if (newLevel > 6) return { block, bad: "标题层级超过 6 级了" };
+      return { block: rewriteHeadingBlock(block, srcLevel, newLevel) };
+    }
+    const srcCols: number = colsOf(src.full);
+    const tgtCols: number = colsOf(tgt.full);
+    let newCols: number;
+    if (mode === "child") {
+      const childCols: number | null = childIndentCols(nodes, tgtIdx);
+      if (childCols !== null) newCols = childCols;
+      else if (tgt.heading) newCols = 0; // 标题不吃缩进，直接子节点缩进为 0
+      else newCols = tgtCols + step;
+    } else {
+      newCols = tgtCols; // 变成目标的兄弟：缩进与目标一致
+    }
+    return { block: shiftBlock(block, newCols - srcCols, unit, step) };
+  });
+  for (const e of extracted) {
+    if (e.bad) return { ok: false, reason: e.bad };
+  }
+
+  // 从后往前整块删除（保持下标有效）
+  let rest: string[] = lines.slice();
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    rest.splice(blocks[i].start, blocks[i].end - blocks[i].start + 1);
+  }
+  // 修正插入下标：源块里落在 rawInsertAt 之前的行都被删掉了，下标要前移相应数量
+  let before = 0;
+  for (const b of blocks) {
+    for (let l = b.start; l <= b.end; l++) if (l < rawInsertAt) before++;
+  }
+  let insertAt: number = rawInsertAt - before;
+  if (insertAt < 0) insertAt = 0;
+
+  const rewritten: string[] = extracted.map((e) => e.block).flat();
+  rest.splice(insertAt, 0, ...rewritten);
+
+  if (rest.join("\n") === lines.join("\n")) {
+    return { ok: false, reason: "位置没有变化" };
+  }
+  return { ok: true, lines: rest };
+}

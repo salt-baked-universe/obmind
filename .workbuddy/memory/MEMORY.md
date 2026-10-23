@@ -135,3 +135,218 @@
   `msedge --headless=new --virtual-time-budget` 下 **rAF 不推进**，测不到 markmap 重排，别用它验证布局。
 - 插件加载链路用 mock obsidian + `require("main.js")` 验证，含幂等注册路径。
 - 部署目标：`D:/BJRepository/2. 知识星球/.obsidian/plugins/obmind`（copy 后比对 sha1）。
+
+## 交互模型（1.13.0 起：框选/多选/整体拖动）
+- **选中态是集合**：`selectedLines: Set<number>` + `primaryLine`；`get/set selectedLine`
+  代理兜旧调用点（读=primary、写=单元素集）。多选操作都走集合，别退回单值。
+- **左键**：按节点=拖动（DragController）、空白区拖=框选（`edit/boxSelect.ts`，ctrl/shift 加选）、
+  单击节点=选中、**Ctrl/⌘+单击=加选/减选**、**Shift+单击=同级区间**（`anchorLine` 定锚点，
+  `siblingLines` 按 depth 扫同层兄弟）、**Alt+单击=按节点文字开同名笔记**、单击空白=清空。
+  判序必须**先 Shift 后 Ctrl**（Ctrl+Shift 是并入区间，反过来会被 Ctrl 吃掉）。
+  **右键**=平移画布（`mm.zoom.filter` 仅 button===2 触发；create/setOptions 后要重设）。
+  右键拖动过 >4px 才压 contextmenu。
+- **整体拖动/批量删除只作用于「顶层成员」**：`groupOf(line)` 取选中集里不被其它选中节点
+  子树覆盖的行；批量删除 `removeGroup` 把各子树范围求并集后一次性 whole 重写。
+- **纯函数**：`moveNodes`（批量移动，edit/move.ts）、`EditService.moveGroup/removeGroup`。
+  回归测试 `npm test`（scripts/testBatch.ts，esbuild+Node）。
+- **坑**：解析器 `collectSrc` **不含 depth=0 的节点**（文件根 depth=1）→ 任何
+  `depth===0` 的「根保护」判断都是死代码；删顶层节点会连带整篇，别指望它兜底。
+
+## 编辑框手势（1.13.1）
+- **编辑框里只改字，不改结构**：Tab = 提交 + 建子级（`EditorAction "child"`，
+  `EditService.commit` 里与 `sibling` 合流，只有 `planCreate` 的 mode 不同），
+  Shift+Tab = 提交 + 提升一级。曾经 Tab 绑 `indent`，用户按 XMind 习惯拿 Tab 收尾，
+  结果节点被挪进上一个兄弟的子树 —— 这类「结束输入」的手势绝不能再动层级。
+  换行/建同级仍是 Enter / Ctrl+Enter。
+- 区间选择的锚点**要在算完区间后恢复**：`applySelection` 会把 `anchorLine` 重设为
+  primary（框选那条路需要），`selectSiblingRange` 必须存一下再放回去，否则
+  每按一次 Shift 都从新锚点重算，选不到「首→尾」。
+
+## 导出与浮条（1.13.1）
+31. **导出必须清掉「只被我们 CSS 隐藏」的元素**。`styles.css` 里 `path.markmap-link`
+    和 `g.markmap-node > line` 都是 `display: none`，但 CSS 不跟文件走 —— 导出后
+    markmap 自带的连线（双线，细的那条错开）和卡片内部的下划线（看着像「卡片中间
+    横着一条线」）全回来了。`export/svg.ts` 的 `stripHidden` 用**活树计算样式**
+    （`display === "none"` 就 remove），不写死类名；必须在 `inlineForeignStyles`
+    **之后**跑，那一步靠 src/clone 下标对齐，先删就错位。收放点 `<circle>` 单独删：
+    静态图里点不动。
+32. **浮动条固定在画布右侧、垂直居中、竖排**（`ui/nodeBarPosition.ts` 纯函数，
+    T12 覆盖；`nodeBar.ts` 只 re-export，这样纯函数能进 Node 单测）。跟着卡片
+    跑试过「卡片下方」「卡片上方」，两个位置都在跟内容抢地方（下方压子树、上方压
+    父级和刚点过的兄弟），而且每帧都要读 `getBoundingClientRect` 追折叠动画。
+    固定后只在**画布尺寸变化**时重算（`ResizeObserver`），没有任何跟随开销。
+    兜底：条子比画布还高 → 贴顶；画布比条子还窄 → 贴左。竖排后分组线要转 90°。
+33. **只有单选才显示浮动条**（`paintSelection` 里 `selectedLines.size === 1`）。
+    那五个动作语义都是「对这一个节点」，多选时改文字没意义、删除是灾难；
+    钉在其中一张卡片上会让人误以为作用于全部。
+
+## 交互与观感（1.14.0）
+34. **编辑框：不带修饰键的键只结束输入**。Enter / Tab 都是「提交并退出」，
+    结构操作只走修饰键（Ctrl+↵ 建同级、⇧+Tab 提升一级）或退出后在画布上按。
+    上一版把 Tab 绑成「提交 + 建子级」，用户的实际感受是「改完按 Tab 又多出一个节点」。
+    退出后焦点回画布（`pendingEditLine < 0`）才接得上画布上的 Tab；改字走 `patch`
+    分支、快照同步更新，所以「提交后立刻按 Tab」不会有旧快照的竞态。
+35. **节点阴影保持原样：和卡片同尺寸的 rect 下移 2px + 10% 纯色**。
+    **别再动它了。** 试过两版都被否：8px 竖向渐变带被说「越改越大」；4px 径向
+    渐隐（可见 3px、峰值 20%，已经把底边完全化开）也被说「还不如不改」。
+    用户要的只是「底边那条线柔一点」，而这个形状（圆角 14 的胶囊卡片 + 2px 薄影）
+    在零滤镜下没有更好的解 —— `filter: drop-shadow` 每个节点一张离屏图，
+    折叠动画必掉帧，不能碰。要再提这件事，先拿到用户明确要求。
+36. **操作栏两端**：`brand`（字标「低山」，logo 占位）+ `trailing`（`N 节点 · 深 M`）。
+    统计用 `domain/stats.ts` 的 `treeStats`（显式栈，不是递归），文案没变不写 DOM。
+    窄侧栏靠容器查询让步，**阈值按实测自然宽度倒推**（10 按钮 + 主题键）：
+    28px 图标+分隔线 350、24px+分隔线 304、24px 无分隔线 264、20px 无分隔线 223。
+    所以 ≤480 收统计、≤412 收字标、≤355 图标 24、≤310 收分隔线、≤272 图标 20。
+    228px 以上零溢出、行高恒 37。
+37. **编辑框最小宽度 7 格**（`MIN_EDIT_COLS × fontSize`），否则新节点「新节点」
+    三格宽的卡片会让输入到第 4 个字就折行。
+
+## 钉住（1.14.1）
+38. **钉住只是「不跟随外部切换」，不是「锁死」。** `pinned` 是个布尔，不存路径：
+    `resolveTargetFile` 里一旦钉住就返回 `targetFile` 自己，不再问 `getActiveFile`。
+    点图里的双链照样能往下潜（那是用户在图上的明确动作），`file-open` 直接 early
+    return —— **绝不能走 resetNav**，否则「去别的笔记翻一下回来面包屑就没了」，
+    等于把钉住做成一钉就被重置。
+39. **`setPinned` 自己不调 refresh**：解除钉住发生在 `refresh → resolveTargetFile →
+    pinnedTarget`（目标文件被删那一路）内部，在那里再 refresh 会原地递归。
+    要立刻重画的调用方（工具栏点击）自己 refresh。toolbar 的 `setActive` 与
+    `setEnabled` 是两件事：前者是「开关开着」，还要顺手换 tooltip。
+
+## 编辑体验（1.15.0）
+40. **观察器必须听 `class`**：markmap 的 `renderData` 里有一句 `w.attr("class", …)`，
+    把每个节点的 class 整个重写 —— `obmind-selected` 会被原地抹掉，而
+    `selectedLines` 还在内存里。它自己的 ResizeObserver（100ms 防抖）在**每次内容
+    尺寸变化**后都会重排一次，所以表现是「编辑完就丢选中框，按 Tab 却多出一个子级」。
+    修法：`attributeFilter: ["transform", "class", "style"]`，class 记录交给
+    `paintSelectionOn(els)` 只补「本该选中但没有」的节点（写同值不产生新记录，无死循环）。
+41. **观察器必须听 `style`（仅 foreignObject 的 opacity）**：markmap 折叠/展开每帧写一次。
+    以前只在全量/增量绘制里**读一次** opacity 抄给卡片 —— enter 节点那一瞬是 0，
+    抄下去就是透明卡片。能恢复全靠「后面还有 transform 写入再画一次」；一旦那次绘制
+    被 `blocked()`（快速连按 Enter / 第二轮重建）挡掉，卡片就**永久**停在 opacity 0，
+    屏幕上少一整块 —— 这就是「只渲染一半图」。`NodePainter.syncFadeFor` 必须做成
+    事件驱动，且**不过 blocked 闸门**（只抄样式、不读布局）。实测 42 节点里 29 个卡死。
+42. **`paintAll` 要返回「没画成的节点数」**（读不到 fo 宽高 / transform 的），
+    `FrameScheduler.paintNow` 隔帧重试 ≤3 次；`paintMoved` 首次见到的节点要补齐
+    样式/尺寸/收放点（只 `ensureLayers` 会得到一堆宽高未设置的 rect = 卡片消失）。
+43. **提交即预览**：编辑框关闭后先别等写盘。用**同一个 `renderInline`** 把新文字铺到
+    卡片上（连 fo 宽高一起改，再 `frames.paintNow()`），写盘在后面跑；真实投影到达时
+    内容逐字节相同，`applyPatch` 里「innerHTML 相同就不赋值」。写失败/计划作废要用
+    `previewText` 返回的 revert 句柄把 DOM 退回旧内容 —— 否则界面会停在没写进去的内容上。
+44. **空文本 = 删节点**（`EditService.commit`）。以前「空文本一律放弃修改」，用户把字
+    删完按回车，节点还在、旧文字回来。现在清空即删（整棵子树，撤销可回），
+    `sibling`/`child` 也归到这里。编辑框里 `Delete` 与 `Backspace` **都要**认空文本删除
+    （只认 Backspace 时，Ctrl+A 之后习惯用 Delete 的人会一直按、节点一直不删）；
+    清空后给 placeholder 提示下一步。
+45. **编辑框不能每帧落位**：`place()` 要带输入签名（位置 + fo 宽高 + 文本），
+    follow 循环 240ms 没变化就收尾。每帧写 width/height 再读 scrollHeight 等于每帧
+    强制同步布局，用户这时往往已经开始打字 —— 就是「输入时发虚」。
+46. **键盘拦截挂在视图根节点上，判据抽成 `ui/keyGuard.ts`**：画布 keydown 要求
+    `target === canvas`，焦点被工具栏/重建拿走后就永远收不到 —— 表现是「按了没反应」。
+    空格 = 编辑选中节点（XMind 手感），但是 `button` / `[role=button]` 上的空格是
+    「按下这个按钮」的无障碍语义，**必须让路**，否则「焦点在删除按钮上按空格」会开始编辑。
+    `isTypingTarget` 用作单元判据（`isContentEditable` + closest 输入控件），
+    真实 DOM 用例在 `tmp/keyGuardTest.py`（Node 侧没有 DOM，不进 testBatch）。
+47. **编辑框永远不产出结构变化**（1.16.0 定论，之前两版都错）：空文本 = 放弃修改，
+    节点原样留着；`EditorAction` 里没有 "delete"。删除只有一个入口 —— 画布选中态的
+    Delete/Backspace → `EditService.removeGroup`。理由：全选想重打一行时，回车把整棵
+    子树删掉是不可接受的意外。不要再往编辑框里加「清空即删」。
+48. **删除后 `focusLine` 由 service 给，不要在 View 里算**：父节点在删除区间之前，
+    行号不受影响；顶层节点的父是文件名（不可选），退一步给「落在删除位置上的节点」。
+    View 侧必须 `applySelection([focus], focus, false)` —— 只写 `primaryLine` 不写
+    `selectedLines` 等于「不画选中框」，这就是「删完框消失」的老 bug。
+49. **折叠的子树没有 DOM，不是隐藏**（实测）：markmap 折叠后把子节点的 `<g>` 直接删掉，
+    所以 `findNodeByLine` 返回 null 就代表「被折叠」，可以据此决定要不要 `toggleNode`。
+    但**可见序列必须从 `mm.state.data` 读 fold**：解析出来的那棵树是旧的，
+    用户点圆点折叠只改 markmap 手里那份（`setData` 时 children 被浅拷贝过）。
+50. **方向键两条轴分工（1.16.1 用户定）**：↑↓ 只走**末端节点**（无孩子，或 fold>0 ——
+    折叠的在屏幕上就是末梢，它自己也进序列），层级只由左右负责；← = 父，→ = 长子
+    （折叠着先展开）。上下用 `visibleLeafRefs`，**不能**用 `visibleRefs`：后者含分支，
+    按 ↓ 会落到「看起来是一行、其实是整个分支」的节点上（B 有孩子也照样停下），
+    用户的原话就是「上下是叶子节点，左右是父子节点」。
+    起点不在末端序列里（点中分支标题 / ← 从子级退回）时按**行号**找它之后/之前的
+    第一个末端，别按 index 找（index=-1 会被当成「没选中」而跳到序列首尾）。
+    选中后要 `mm.ensureVisible(data, {pad:32})`：只平移不改缩放，连按十几下也不会跑出画布。
+51. **改一个字会「闪」的真正机制（1.16.2 实测）**：markmap 对每个节点的内容 div
+    挂了 `ResizeObserver(debounce(..., 100))`，**100ms 后**才 `renderData`；
+    renderData 里的位置变化又走 `options.duration`（180ms）的 transition。
+    所以「卡片已经变宽、孩子列还停在旧位置」的错位要持续约 233ms。
+    修法：尺寸变了立刻 `reflowSoon()` —— 下一帧 duration 置 0 主动
+    `mm.renderData()`（`renderData` 是 public），再 `paintNow()` + `paintSelection()`。
+    两个坑：① renderData 里 `attr("class", …)` 会整段重写，选中标记必须补回；
+    ② 它还会 `transition(K).style("opacity", 1)`，折叠淡出正演到一半时别调。
+    另：`applyPatch` 要判 `changed`，previewText 铺过的内容不要重复重排。
+    **修正（1.16.3）**：setData 干净只是假象 —— 见下条。用逐帧采样才会看到
+    「36/43 个卡片同时透明」，肉眼全量审计根本抓不到。
+52. **新建节点必闪的真正机制（1.16.3 实测，43 节点树）**：markmap 的节点 key 里带
+    **孩子序号**，插入/删除一行会让**它后面所有兄弟**的 key 改变 → d3 把它们当新节点
+    重新 enter → 先写 `opacity: 0`，再起过渡。**`duration: 0` 的过渡也是异步到下一帧的**，
+    而 `setData` 内部本来就 await 让出主线程，浏览器就在这一帧绘制了「一排卡片有底色、
+    没有文字」。更糟的是我们的全量绘制紧随其后，把这个 `opacity: 0` **抄给了卡片**：
+    实测 36/43 个卡片一帧全消失（`?noguard` 对照实验）。
+    修法三层：
+    ① `inFadeGuard()` —— `rebuilding` 期 + 结束后 50ms 内，凡是 foreignObject 上
+       < 1 的 opacity **当场抹成 `""`**（MutationObserver 回调在微任务里，赶在绘制之前）；
+       **`phase === "editing"` 必须豁免**，那里 opacity 0 是我们自己设的（防重影）。
+    ② `clearFade()` —— setData 返回后把所有残余 opacity 清掉（`removeProperty`，
+       不写 "1"，否则会卡住 markmap 后续过渡的插值）。
+    ③ `measureMissing()` —— 刚 enter 的节点还没有 width/height 属性，全量绘制读不到
+       几何 → 新节点第一帧没有卡片。只对缺失的节点读一次 `scrollWidth`（强制布局，
+       不能对所有节点做）。
+    窗口别开太长（50ms 够）：这期间用户若点收放点折叠，淡出会被一起抹掉。
+53. **`reflowNow` 必须让路给重建**：`previewText` 排的 rAF 可能正好撞进
+    `applyTree` 的 rebuilding 期，那时 `renderData` 会把半成品 DOM 重排一遍（还会
+    重写 opacity/class）。开头与 await 之后都要查 `phase !== "idle"` 直接返回，
+    重建结束的 `paintNow` 会做同一件事。
+54. **「节点 → 新笔记」（1.17.0）的定论**：
+    决策全在 `app/notePlan.ts` 的纯函数里（`noteTitleOf` / `resolveNoteFolder` /
+    `applyTemplate` / `linkLiteral`），View 只做 IO 编排，所以命名规则能跑用例（T17）。
+    ① **名字必须清 `# ^ [ ]`**：它们不是文件系统限制，是**双链语法**限制 ——
+       `[[Q3 复盘 #会议]]` 指向的是「Q3 复盘」这篇的「会议」小节。斜杠/冒号等
+       才是 Windows 限制（`\ / : * ? " < > |`），一并换成空格。
+    ② 文件夹**复用 Obsidian 自己的设置**（`vault.getConfig("newFileLocation")` /
+       `"newFileFolderPath"`），不另立一项。`Vault.getConfig` 运行时一直在但**没写进
+       d.ts** → 按可选能力探测，拿不到当「库根」，降级不抛错。
+    ③ 同名笔记已存在就**复用它**，不新建：双链按名字解析，库里多一篇同名的
+       会让 `[[标题]]` 指向不确定的那一篇。
+    ④ **先建文件、后改节点**。反过来一旦建文件失败，节点上就留一条红链。
+    ⑤ 原文带行内样式时用别名 `[[重点|**重点**]]`：名字干净，卡片上的字不变 ——
+       用户改的是「它有没有链接」，不是「它的字」。
+    ⑥ 跳转必须走 `openDoc`（面包屑 / 跳回自动就有），不要自己 `targetFile = x`。
+       跳之前 `applySelection([], -1, false)`：选中集存的是**上一篇的行号**，
+       换文件后会指着新图里无关的节点。
+    ⑦ **Ctrl+N 要挂 document 的捕获阶段**。Obsidian 的全局热键在 document 冒泡处理，
+       排在它后面就等于「一篇空笔记已经开出去了才轮到你」。捕获里先
+       `preventDefault + stopPropagation`，元素级的同名分支自然被 defaultPrevented 挡住。
+       只在 `containerEl.contains(target)` 时接管，别处的 Ctrl+N 仍归 Obsidian。
+    ⑧ 「新建笔记」按钮在节点已有双链时**隐藏**（`.is-gone` → display:none），
+       不是置灰：置灰会让人反复点它试为什么点不动。NodeBar.setHidden 里
+       **必须重 measure + place** —— 条子右对齐，少一个按钮整条位置就偏一格。
+55. **钉住 = 锁「这张图」，不是锁「导航」（1.17.2 定为终版）**：
+    语义（用户原话）：「文件切换，导图不切换」。所以钉住期间点卡片双链，
+    **笔记照常打开**，只有导图原地不动。1.17.1 曾做成「拦住跳转」，
+    等于把双链在钉住期间变成死链 —— 方向错了，已推翻。
+    分叉点只有一个：`navigate(file)` —— 没钉住 → `openDoc`（换图 + 按 navSync 联动）；
+    钉住 → `openFileOnly`（只动 leaf，**绝不碰** targetFile / navStack / leafId 记账）。
+    四个入口全走 `navigate`：点双链、Alt+单击、面包屑（钉住时直取 `getAbstractFileByPath`
+    后调 `openFileOnly`，非钉住仍走 `goBackTo` 裁剪栈）、新建笔记。
+    `openDoc` 保持纯执行不判 pinned，这样程序性跳转也有通道。
+    两个必须记住的点：
+    ① **为什么动了 targetFile 就是换图**：`resolveTargetFile()` 里 `pinnedFile()`（栈顶）
+       优先于 pinned 分支，栈非空时导图跟着栈顶走 —— 所以「在 openDoc 里判 pinned」是假拦截，
+       真正的锁是「根本不进 openDoc」。
+    ② **`openFileOnly` 不要 revealLeaf**：openDoc 里 reveal 是为了「新标签抢走焦点后
+       面包屑还能点」，钉住时面包屑不需要点，reveal 只会把刚打开的笔记又塞回标签栏。
+    map-only 模式下 `forwardTarget === "none"`：钉住 + 点链接 = 什么都不发生，必须给一句提示。
+    外链 `https?` / `mailto` 一律不进 navigate：那是浏览器的事，本来就动不了导图。
+56. **编辑框藏原文只能用 `visibility`，绝对不能用 `opacity`（1.17.3 修）**：
+    症状：双击/空格进入编辑，那个节点的**卡片和连线整块消失**，屏幕上只剩一个
+    孤零零的输入框（用户：「编辑时没有线？」）。看起来像「连线没画」，其实是画了又被透明掉。
+    因果链：`inlineText` 里 `fo.style.opacity = "0"` → MutationObserver 的 style 分支
+    把它当成「markmap 正在淡入淡出」→ `faded` → `painter.syncFadeFor` →
+    `writeFade` 把同一个值抄给阴影/卡片/**连线**/收放点。编辑框的隐藏被误解成淡出。
+    **这是「借用别处语义」的经典代价**：opacity 在本项目里已经被征用为
+    「消失进度」的信号（折叠/enter 过渡），任何「我想暂时看不见」都不该走这条通道。
+    `visibility: hidden` 保留布局盒（`getBoundingClientRect` 照常返回真实尺寸，
+    编辑框定位不受影响）、不参与 opacity 通道。
+    另外：`export/svg.ts` 里清 opacity 的地方要**一起清 visibility**，
+    否则编辑中导出的 SVG 会缺那个节点的文字。

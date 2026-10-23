@@ -198,6 +198,31 @@ function inlineForeignStyles(source: SVGSVGElement, clone: SVGSVGElement): void 
   }
 }
 
+/**
+ * 删掉「在 Obsidian 里本来就被 CSS 隐藏」的元素。
+ *
+ * 这是导出最容易翻车的地方，两个最刺眼的 bug 都出自这里：
+ *
+ * - markmap 自带的 `.markmap-link`（它的连线接在节点底边，和我们的卡片对不上，
+ *   所以 `styles.css` 里整条 `display: none`）。CSS 不跟文件走 → 导出后每条
+ *   连线都变成**双线**：一条细的（markmap）、一条粗的（我们自绘），还互相错开。
+ * - markmap 给每个节点画的 `<line>`（最早「线托着文字」的那条下划线）也被我们
+ *   隐藏了，导出后它横在卡片内部 —— 看着就是「卡片中间有一条线」。
+ *
+ * 判据用**活树的计算样式**而不是写死类名：用户自己的 CSS 片段、主题若改动了
+ * 显隐，导出结果自动跟着变，不用改插件。
+ *
+ * 下标对齐的前提是此时结构还没被改过（`inlineForeignStyles` 之后、删圆点之前）。
+ */
+function stripHidden(source: SVGSVGElement, clone: SVGSVGElement): void {
+  const srcEls: Element[] = Array.from(source.querySelectorAll("*"));
+  const dstEls: Element[] = Array.from(clone.querySelectorAll("*"));
+  const n: number = Math.min(srcEls.length, dstEls.length);
+  for (let i = 0; i < n; i++) {
+    if (getComputedStyle(srcEls[i]).display === "none") dstEls[i].remove();
+  }
+}
+
 export interface SvgExportOptions {
   /** 背景色；不透明才会铺一层 rect */
   background?: string;
@@ -220,15 +245,28 @@ export function buildSvgText(
   // 顺序很重要：先按原树/克隆体的下标对齐内联样式，之后才能随便改克隆体结构
   inlineForeignStyles(svg, clone);
 
+  // 只有「屏幕上没显示」的东西才需要在这里消失，顺序同样不能提前
+  stripHidden(svg, clone);
+
+  // 收放点是运行时的开关：静态图里点不动，摆在那儿只会让人以为「这里能折叠」。
+  // 而且它会偏 —— painter 把 `transform-box: fill-box` 写在**内联样式**里没问题，
+  // 但 transform 一旦离开 transform-origin 的加持，圆心就落进卡片内部（实测压字）。
+  for (const dot of Array.from(clone.querySelectorAll('g[class~="markmap-node"] > circle'))) {
+    dot.remove();
+  }
+
   // 选中描边、悬停态不该出现在导出的图里（这些 class 的样式也不在文件里，
   // 留着只是给阅读器的 CSS 留个口子）
   for (const el of Array.from(clone.querySelectorAll(".obmind-selected"))) {
     el.classList.remove("obmind-selected");
   }
 
-  // 淡入淡出残留：折叠动画正跑到一半时导出，会有一半节点是 opacity 0
+  // 淡入淡出残留：折叠动画正跑到一半时导出，会有一半节点是 opacity 0。
+  // visibility 是编辑框留下的（它把原文藏起来，好让输入框盖在上面）——
+  // 导出的是「这张图」，不是「这一刻的屏幕」，原文得还回来。
   for (const fo of Array.from(clone.querySelectorAll<SVGForeignObjectElement>("foreignObject"))) {
     fo.style.opacity = "";
+    fo.style.visibility = "";
     if (fo.getAttribute("style") === "") fo.removeAttribute("style");
   }
   for (const deco of Array.from(clone.querySelectorAll<SVGElement>('[class^="obmind-node"]'))) {
