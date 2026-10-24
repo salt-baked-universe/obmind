@@ -42,11 +42,11 @@ export class FrameScheduler {
     if (this.source.blocked()) {
       // 重建期间被挡掉是正常的（DOM 是半成品），重建结束的 paintNow 会补上。
       // 但若重建已经结束还一直出现这一句，说明 phase 卡在 rebuilding —— 图就不会再更新。
-      traceLog("paint.request.blocked");
+      // traceLog("paint.request.blocked");
       return;
     }
     if (this.frame !== 0) {
-      traceLog("paint.request.merged");
+      // traceLog("paint.request.merged");
       return;
     }
     this.frame = window.requestAnimationFrame(() => {
@@ -75,7 +75,7 @@ export class FrameScheduler {
       this.retries++;
       // 加上这一遍，屏幕上会连着两三帧「卡片还没包上」—— 若日志里 pending 一直不降，
       // 说明有节点永远量不出几何（空内容 / 尺寸为 0），那才是空白卡片的真凶
-      traceLog("paint.retry", { pending, retries: this.retries });
+      // traceLog("paint.retry", { pending, retries: this.retries });
       this.frame = window.requestAnimationFrame(() => {
         this.frame = 0;
         this.paintNow();
@@ -111,28 +111,31 @@ export class FrameScheduler {
    * 只在开日志时排：一次自检要对全部节点读属性，热路径上不能常开。
    */
   private scheduleDrift(): void {
+    // 埋点已停用：这段自检（漂线 / 摘掉没还的线）只在排查时用，
+    // 它要对全部节点读属性重算每条 d，热路径上不能常开。
+    // 要恢复诊断就解开下面的注释。
     if (!isTracing()) return;
-    if (this.driftFrame !== 0) return;
-    this.driftFrame = window.requestAnimationFrame(() => {
-      this.driftFrame = 0;
-      const svg = this.source.svg();
-      if (!svg || this.source.blocked()) return;
-      const rep = this.painter.measureDrift(svg);
-      // max>1 才出声：亚像素的舍入差是 round2 带来的，不算飘。
-      // 200ms 限流：折叠动画里每帧都会有一条，全记会把有用的事件冲掉。
-      // hidden>0 单独报：那是「线被摘掉没还回去」，偏差计算看不出来（d 可能还是对的）。
-      if (rep.max > 1 || rep.hidden > 0) {
-        traceLogEvery("drift", 200, "link.drift", {
-          n: rep.checked,
-          max: Math.round(rep.max),
-          hidden: rep.hidden,
-          shifted: rep.shifted,
-          skip: rep.skipped,
-          frozen: rep.frozen,
-          worst: rep.worst.slice(0, 2).join("|"),
-        });
-      }
-    });
+    // if (this.driftFrame !== 0) return;
+    // this.driftFrame = window.requestAnimationFrame(() => {
+    //   this.driftFrame = 0;
+    //   const svg = this.source.svg();
+    //   if (!svg || this.source.blocked()) return;
+    //   const rep = this.painter.measureDrift(svg);
+    //   // max>1 才出声：亚像素的舍入差是 round2 带来的，不算飘。
+    //   // 200ms 限流：折叠动画里每帧都会有一条，全记会把有用的事件冲掉。
+    //   // hidden>0 单独报：那是「线被摘掉没还回去」，偏差计算看不出来（d 可能还是对的）。
+    //   if (rep.max > 1 || rep.hidden > 0) {
+    //     traceLogEvery("drift", 200, "link.drift", {
+    //       n: rep.checked,
+    //       max: Math.round(rep.max),
+    //       hidden: rep.hidden,
+    //       shifted: rep.shifted,
+    //       skip: rep.skipped,
+    //       frozen: rep.frozen,
+    //       worst: rep.worst.slice(0, 2).join("|"),
+    //     });
+    //   }
+    // });
   }
 
   cancel(): void {

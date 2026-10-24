@@ -31,7 +31,24 @@ export type Projection =
    * 而编辑框的初始内容、右键菜单、拖动落点用的都是它。不写回去，症状就是
    * 「节点上明明是刚输入的内容，点开编辑却显示上一次的旧文本」。
    */
-  | { kind: "patch"; line: number; content: string; src: SrcRef }
+  | {
+      kind: "patch";
+      line: number;
+      content: string;
+      src: SrcRef;
+      /**
+       * 其它节点的行号漂了（不是结构变化）。
+       *
+       * 典型场景：把某一行文字改成两行、或在上面插一段块 —— 被改的那个节点
+       * content 变了，而它后面所有节点的行号都 +1。以前这会被判成 `why=line`
+       * 全量重建；其实树的形状一点没变，只是「每个节点现在在第几行」变了。
+       *
+       * 但行号是**所有定位操作的坐标系**（编辑框初始文本、拖动落点、写盘锚点、
+       * 选中集），所以这个标记不是「可以忽略」，而是「调用方必须先把新 src
+       * 写回 DOM 再做别的」—— 见 MindmapView.applyRelabel。
+       */
+      relabel: boolean;
+    }
   /** 必须 setData 重建整棵树 */
   | { kind: "structure"; reason: StructureReason; at?: number };
 
@@ -52,7 +69,12 @@ export type StructureReason =
   | "multi"
   /** 孩子数量变了 */
   | "children"
-  /** 行号位移（中间插删过行） */
+  /**
+   * 行号位移（中间插删过行）。
+   *
+   * **1.18.12 起不再产生**：行号只是「这个节点现在在第几行」，树形没变就不该
+   * 重建，改走 `patch` + `relabel`。留着这个值是为了读懂旧日志里的 `why=line`。
+   */
   | "line"
   /** 深度变了（缩进 / 标题级别动过） */
   | "depth"
@@ -103,6 +125,8 @@ export function planProjection(input: PlanInput): Projection {
   let patchSrc: SrcRef | null = null;
   let why: StructureReason | null = null;
   let at: number | undefined;
+  /** 有节点的行号漂了（不是结构变化，但必须把新行号写回 DOM） */
+  let lineDrift = false;
 
   const walk = (a: IPureNode, b: IPureNode): void => {
     if (why !== null) return;
@@ -137,18 +161,18 @@ export function planProjection(input: PlanInput): Projection {
     for (let i = 0; i < ac.length; i++) {
       const sa = srcOf(ac[i]);
       const sb = srcOf(bc[i]);
-      // 同一位置上必须还是同一行、同一层级。行号变了说明中间插删过行，
-      // 深度变了说明缩进/标题级别动过——两者都是结构变化。
-      if ((sa?.line ?? -1) !== (sb?.line ?? -1)) {
-        why = "line";
-        at = sb?.line ?? sa?.line;
-        return;
-      }
+      // 同一位置上必须还是同一层级。深度变了说明缩进 / 标题级别动过 ——
+      // 这才是真的结构变化，先判它。
+      // （判定顺序有讲究：以前先看行号，于是「插入一个子级」被报成 why=line，
+      //  日志里看不出真正的原因，白排查一轮。）
       if ((sa?.depth ?? -1) !== (sb?.depth ?? -1)) {
         why = "depth";
         at = sb?.line ?? sa?.line;
         return;
       }
+      // 行号漂移**不是**结构变化：孩子数量与层级都对得上，就还是同一棵树，
+      // 只是「每个节点现在在第几行」变了。记一笔交给调用方把新行号写回 DOM。
+      if ((sa?.line ?? -1) !== (sb?.line ?? -1)) lineDrift = true;
       walk(ac[i], bc[i]);
     }
   };
@@ -157,14 +181,60 @@ export function planProjection(input: PlanInput): Projection {
 
   if (why !== null) return { kind: "structure", reason: why, at };
   if (changed === 0) {
-    // 树一样但原文不一样：块内容/空行变了，树上看不出来，只能重建
+    // 树一样但原文不一样：块内容/空行变了，树上看不出来，只能重建。
+    // （`lineDrift` 在这里救不了场：插入空行和「代码块里改了几行」在树上长得
+    //  一模一样 —— 都是「内容不变、行号漂移」，区分不了就不冒险。）
     return input.sourceSame
       ? { kind: "none" }
       : { kind: "structure", reason: "blockOnly" };
   }
   return patchSrc
-    ? { kind: "patch", line, content, src: patchSrc }
+    ? { kind: "patch", line, content, src: patchSrc, relabel: lineDrift }
     : { kind: "structure", reason: "noSrc", at: line };
+}
+
+/**
+ * 把 `src` 树里每个节点的源坐标**就地**写到 `dst` 树上，返回「旧行号 → 新行号」。
+ *
+ * 用途：一次编辑只改了一个节点的文字，却让后面所有节点的行号整体漂了
+ * （把一行改成两行、在它上面插了一段…）。树的形状没变，所以不重建 DOM；
+ * 但 DOM 里每个 g 的 `payload.src` 还指着旧行号，而编辑框初始文本、拖动落点、
+ * 写盘锚点、选中集**全都按行号定位** —— 不写回去，点开编辑就会读到隔壁行的字。
+ *
+ * 两棵树结构必须完全一致（`planProjection` 返回 `relabel: true` 就保证了这一点）。
+ * 中途发现孩子数量对不上立即返回 `null`，调用方必须退回重建：宁可慢 400ms，
+ * 也不能把行号写错 —— 写错的后果是内容被写到别的节点上。
+ *
+ * 刻意**换引用**而不是逐字段覆盖：新行可能少了 `endLine` / `blockStart`，
+ * 逐字段写会把「上一次才有」的值留下来，`startEdit` 就会把单行误判成多行。
+ *
+ * @param dst 被修改的树（通常是 markmap 手里的 `state.data`）
+ * @param src 新解析出来的树（只读）
+ * @returns 旧行号 → 新行号（只含真漂了的）；结构对不上返回 null
+ */
+export function relabelTree(dst: IPureNode, src: IPureNode): Map<number, number> | null {
+  const moved = new Map<number, number>();
+  let ok = true;
+
+  const walk = (a: IPureNode, b: IPureNode): void => {
+    if (!ok) return;
+    const ac = a.children ?? [];
+    const bc = b.children ?? [];
+    if (ac.length !== bc.length) {
+      ok = false;
+      return;
+    }
+    const ap = a.payload as { src?: SrcRef } | undefined;
+    const bp = b.payload as { src?: SrcRef } | undefined;
+    if (ap && bp?.src) {
+      if (ap.src && ap.src.line !== bp.src.line) moved.set(ap.src.line, bp.src.line);
+      ap.src = bp.src;
+    }
+    for (let i = 0; i < ac.length && ok; i++) walk(ac[i], bc[i]);
+  };
+
+  walk(dst, src);
+  return ok ? moved : null;
 }
 
 /**

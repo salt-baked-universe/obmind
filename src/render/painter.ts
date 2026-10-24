@@ -248,13 +248,13 @@ export class NodePainter {
     this.prune(boxes);
     // total 要多扫一遍 DOM，只在记日志时算 —— 这段是折叠动画的每帧路径。
     // writes 是这套渲染唯一的成本指标：它直接等于「这一帧把多少节点的排版作废了」。
-    traceLog("paint.all", {
-      boxes: boxes.length,
-      skipped,
-      fresh,
-      writes: this.writes,
-      total: isTracing() ? svg.querySelectorAll("g.markmap-node").length : undefined,
-    });
+    // traceLog("paint.all", {
+    //   boxes: boxes.length,
+    //   skipped,
+    //   fresh,
+    //   writes: this.writes,
+    //   total: isTracing() ? svg.querySelectorAll("g.markmap-node").length : undefined,
+    // });
     return skipped;
   }
 
@@ -379,12 +379,12 @@ export class NodePainter {
     // 折叠动画里每帧都会走到这里，限流记「这一批动了几个节点」。
     // 数值持续接近节点总数就说明「只动了一两个节点」被放大成了全量重画。
     if (isTracing()) {
-      traceLogEvery("moved", 500, "paint.moved", {
-        n: movedCount,
-        links: relinked,
-        miss: kidsMissed,
-        nogeo,
-      });
+      // traceLogEvery("moved", 500, "paint.moved", {
+      //   n: movedCount,
+      //   links: relinked,
+      //   miss: kidsMissed,
+      //   nogeo,
+      // });
     }
   }
 
@@ -606,7 +606,7 @@ export class NodePainter {
     // v<1 意味着我们把「卡片/线」也写成半透明了 —— 屏幕上就是那一块变淡。
     // 折叠动画里这每帧都会发生几百次，所以限流：只留「最近 200ms 里发生过几次」。
     // 关着日志时 isTracing() 先短路，不进 traceLogEvery 的 Map 查找。
-    if (v < 1 && isTracing()) traceLogEvery("fade", 200, "fade.write", { v });
+    // if (v < 1 && isTracing()) traceLogEvery("fade", 200, "fade.write", { v });
     return v;
   }
 

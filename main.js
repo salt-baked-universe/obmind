@@ -5829,28 +5829,8 @@ function push(line) {
     dropped++;
   }
 }
-var everyAt = /* @__PURE__ */ new Map();
-var everySkipped = /* @__PURE__ */ new Map();
-function traceLogEvery(key, ms, tag, data) {
-  var _a, _b, _c;
-  if (level === "off")
-    return;
-  const now2 = performance.now();
-  const prev = (_a = everyAt.get(key)) != null ? _a : Number.NEGATIVE_INFINITY;
-  if (now2 - prev < ms) {
-    everySkipped.set(key, ((_b = everySkipped.get(key)) != null ? _b : 0) + 1);
-    return;
-  }
-  everyAt.set(key, now2);
-  const skipped = (_c = everySkipped.get(key)) != null ? _c : 0;
-  everySkipped.set(key, 0);
-  traceLog(tag, skipped > 0 && data ? { ...data, skipped } : skipped > 0 ? { skipped } : data);
-}
 function traceSince() {
   return performance.now();
-}
-function traceElapsed(since) {
-  return (performance.now() - since).toFixed(1);
 }
 function traceClear() {
   lines = [];
@@ -6121,13 +6101,6 @@ var NodePainter = class {
         this.applyLink(box, parent, entry, spec);
     }
     this.prune(boxes);
-    traceLog("paint.all", {
-      boxes: boxes.length,
-      skipped,
-      fresh,
-      writes: this.writes,
-      total: isTracing() ? svg.querySelectorAll("g.markmap-node").length : void 0
-    });
     return skipped;
   }
   /**
@@ -6220,12 +6193,6 @@ var NodePainter = class {
         relinked++;
     }
     if (isTracing()) {
-      traceLogEvery("moved", 500, "paint.moved", {
-        n: movedCount,
-        links: relinked,
-        miss: kidsMissed,
-        nogeo
-      });
     }
   }
   /**
@@ -6412,8 +6379,6 @@ var NodePainter = class {
       n++;
     }
     this.writes += n;
-    if (v2 < 1 && isTracing())
-      traceLogEvery("fade", 200, "fade.write", { v: v2 });
     return v2;
   }
   /** 卡片尺寸：只依赖内容宽高，与节点位移无关，所以动画期间零写入 */
@@ -6635,11 +6600,9 @@ var FrameScheduler = class {
   /** 请求一次全量绘制（本帧内多次请求合并成一次） */
   requestAll() {
     if (this.source.blocked()) {
-      traceLog("paint.request.blocked");
       return;
     }
     if (this.frame !== 0) {
-      traceLog("paint.request.merged");
       return;
     }
     this.frame = window.requestAnimationFrame(() => {
@@ -6662,7 +6625,6 @@ var FrameScheduler = class {
     const pending = this.painter.paintAll(svg, spec);
     if (pending > 0 && this.retries < 3 && !this.source.blocked()) {
       this.retries++;
-      traceLog("paint.retry", { pending, retries: this.retries });
       this.frame = window.requestAnimationFrame(() => {
         this.frame = 0;
         this.paintNow();
@@ -6700,26 +6662,6 @@ var FrameScheduler = class {
   scheduleDrift() {
     if (!isTracing())
       return;
-    if (this.driftFrame !== 0)
-      return;
-    this.driftFrame = window.requestAnimationFrame(() => {
-      this.driftFrame = 0;
-      const svg = this.source.svg();
-      if (!svg || this.source.blocked())
-        return;
-      const rep = this.painter.measureDrift(svg);
-      if (rep.max > 1 || rep.hidden > 0) {
-        traceLogEvery("drift", 200, "link.drift", {
-          n: rep.checked,
-          max: Math.round(rep.max),
-          hidden: rep.hidden,
-          shifted: rep.shifted,
-          skip: rep.skipped,
-          frozen: rep.frozen,
-          worst: rep.worst.slice(0, 2).join("|")
-        });
-      }
-    });
   }
   cancel() {
     if (this.frame !== 0) {
@@ -6986,11 +6928,6 @@ function openInlineEditor(options) {
     const needed = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
     if (isTracing()) {
-      traceLogEvery("edit.place", 100, "edit.place", {
-        x: Math.round(rect.left - base.left),
-        y: Math.round(rect.top - base.top),
-        w: Math.round(rawW)
-      });
     }
     return true;
   };
@@ -7316,12 +7253,6 @@ var DragController = class {
       this.members = Array.from(members);
       this.rootEls = memberRoots;
       this.candidates = all.filter((n) => !members.has(n));
-      traceLog("drag.pick", {
-        path: rootPath,
-        members: this.members.length,
-        roots: memberRoots.length,
-        total: all.length
-      });
     };
     this.onPointerMove = (e) => {
       if (!this.origin)
@@ -7357,13 +7288,6 @@ var DragController = class {
       swallowNextClick();
       const tgtSrc = this.cb.srcOf(target.g);
       const willRebuild = tgtSrc ? this.cb.onDrop(originSrc.line, tgtSrc.line, target.mode) : false;
-      traceLog("drag.drop", {
-        line: originSrc.line,
-        to: tgtSrc == null ? void 0 : tgtSrc.line,
-        mode: target.mode,
-        rebuild: willRebuild,
-        members: members.length
-      });
       this.clearShift(members, roots, willRebuild, outerLinks);
     };
     this.onKeyDown = (e) => {
@@ -7416,7 +7340,6 @@ var DragController = class {
     }
     this.outerLinks = links;
     this.cb.onShift(this.rootEls, true);
-    traceLog("drag.links", { n: links.length, roots: this.rootEls.length });
   }
   /**
    * 整块平移。
@@ -7459,11 +7382,9 @@ var DragController = class {
       if (token !== this.shiftToken)
         return;
       if (members.every((g) => !g.isConnected)) {
-        traceLog("drag.shift.gone", { ms: Math.round(performance.now() - t0), n: members.length });
         return;
       }
       if (performance.now() - t0 > 900) {
-        traceLog("drag.shift.timeout", { n: members.length });
         wipe();
         this.restoreOuterLinks(links);
         return;
@@ -9136,8 +9057,9 @@ function planProjection(input) {
   let patchSrc = null;
   let why = null;
   let at;
+  let lineDrift = false;
   const walk = (a, b) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
     if (why !== null)
       return;
     if (a.content !== b.content) {
@@ -9167,16 +9089,13 @@ function planProjection(input) {
     for (let i = 0; i < ac.length; i++) {
       const sa = srcOf(ac[i]);
       const sb = srcOf(bc[i]);
-      if (((_f = sa == null ? void 0 : sa.line) != null ? _f : -1) !== ((_g = sb == null ? void 0 : sb.line) != null ? _g : -1)) {
-        why = "line";
+      if (((_f = sa == null ? void 0 : sa.depth) != null ? _f : -1) !== ((_g = sb == null ? void 0 : sb.depth) != null ? _g : -1)) {
+        why = "depth";
         at = (_h = sb == null ? void 0 : sb.line) != null ? _h : sa == null ? void 0 : sa.line;
         return;
       }
-      if (((_i = sa == null ? void 0 : sa.depth) != null ? _i : -1) !== ((_j = sb == null ? void 0 : sb.depth) != null ? _j : -1)) {
-        why = "depth";
-        at = (_k = sb == null ? void 0 : sb.line) != null ? _k : sa == null ? void 0 : sa.line;
-        return;
-      }
+      if (((_i = sa == null ? void 0 : sa.line) != null ? _i : -1) !== ((_j = sb == null ? void 0 : sb.line) != null ? _j : -1))
+        lineDrift = true;
       walk(ac[i], bc[i]);
     }
   };
@@ -9186,42 +9105,33 @@ function planProjection(input) {
   if (changed === 0) {
     return input.sourceSame ? { kind: "none" } : { kind: "structure", reason: "blockOnly" };
   }
-  return patchSrc ? { kind: "patch", line, content, src: patchSrc } : { kind: "structure", reason: "noSrc", at: line };
+  return patchSrc ? { kind: "patch", line, content, src: patchSrc, relabel: lineDrift } : { kind: "structure", reason: "noSrc", at: line };
 }
-function explainDiff(prev, next, limit = 6) {
-  const out = [];
-  const text = (n) => {
-    var _a;
-    const raw = String((_a = n.content) != null ? _a : "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
-    return raw.slice(0, 8) || "?";
-  };
-  const walk = (a, b, path2) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
-    if (out.length >= limit)
+function relabelTree(dst, src) {
+  const moved = /* @__PURE__ */ new Map();
+  let ok = true;
+  const walk = (a, b) => {
+    var _a, _b;
+    if (!ok)
       return;
-    const sa = srcOf(a);
-    const sb = srcOf(b);
-    if (a.content !== b.content) {
-      out.push(`${path2 || "root"} content "${text(a)}"->"${text(b)}"`);
-    }
-    if (((_a = sa == null ? void 0 : sa.line) != null ? _a : -1) !== ((_b = sb == null ? void 0 : sb.line) != null ? _b : -1)) {
-      out.push(`${path2 || "root"} line ${(_c = sa == null ? void 0 : sa.line) != null ? _c : -1}->${(_d = sb == null ? void 0 : sb.line) != null ? _d : -1} "${text(b)}"`);
-    }
-    if (((_e = sa == null ? void 0 : sa.depth) != null ? _e : -1) !== ((_f = sb == null ? void 0 : sb.depth) != null ? _f : -1)) {
-      out.push(`${path2 || "root"} depth ${(_g = sa == null ? void 0 : sa.depth) != null ? _g : -1}->${(_h = sb == null ? void 0 : sb.depth) != null ? _h : -1} "${text(b)}"`);
-    }
-    const ac = (_i = a.children) != null ? _i : [];
-    const bc = (_j = b.children) != null ? _j : [];
+    const ac = (_a = a.children) != null ? _a : [];
+    const bc = (_b = b.children) != null ? _b : [];
     if (ac.length !== bc.length) {
-      out.push(`${path2 || "root"} children ${ac.length}->${bc.length} "${text(b)}"`);
+      ok = false;
       return;
     }
-    for (let i = 0; i < ac.length && out.length < limit; i++) {
-      walk(ac[i], bc[i], `${path2}.${i}`);
+    const ap = a.payload;
+    const bp = b.payload;
+    if (ap && (bp == null ? void 0 : bp.src)) {
+      if (ap.src && ap.src.line !== bp.src.line)
+        moved.set(ap.src.line, bp.src.line);
+      ap.src = bp.src;
     }
+    for (let i = 0; i < ac.length && ok; i++)
+      walk(ac[i], bc[i]);
   };
-  walk(prev, next, "");
-  return out;
+  walk(dst, src);
+  return ok ? moved : null;
 }
 
 // src/export/svg.ts
@@ -9448,39 +9358,8 @@ function errText(err) {
     return err.message;
   return String(err);
 }
-function countNodes(root2) {
-  var _a;
-  let n = 1;
-  for (const child of (_a = root2.children) != null ? _a : [])
-    n += countNodes(child);
-  return n;
-}
-function countLines(text) {
-  if (!text)
-    return 0;
-  let n = 1;
-  for (let i = 0; i < text.length; i++)
-    if (text.charCodeAt(i) === 10)
-      n++;
-  return n;
-}
 function normalizeLabel(s) {
   return s.replace(/[\s\u00a0]+/g, "").replace(/[*_`~]/g, "").replace(/[☑☐]/g, "").replace(/\[[ xX]\]/g, "");
-}
-function callerOf() {
-  const stack = new Error().stack;
-  if (!stack)
-    return "?";
-  const names = [];
-  for (const raw of stack.split("\n").slice(1)) {
-    if (raw.includes("callerOf") || raw.includes("patchedRender") || raw.includes("tracedTransition"))
-      continue;
-    const m = /at\s+([^\s(]+)/.exec(raw);
-    names.push(m ? m[1].replace(/\s+/g, "_") : "?");
-    if (names.length >= 3)
-      break;
-  }
-  return names.join("<");
 }
 function nodeLabel(g) {
   var _a;
@@ -9949,31 +9828,15 @@ var MindmapView = class extends import_obsidian3.ItemView {
     mm.toggleNode = patchedToggle;
     const origRender = mm.renderData.bind(mm);
     const patchedRender = async (target) => {
-      var _a2, _b;
       if (isTracing()) {
         const t = target;
-        traceLog("render.enter", {
-          dur: mm.options.duration,
-          phase: this.rt.phase,
-          left: Math.round(this.settleUntil - performance.now()),
-          arg: (_b = (_a2 = t == null ? void 0 : t.state) == null ? void 0 : _a2.path) != null ? _b : "-",
-          from: callerOf()
-        });
       }
       const inWindow = this.rt.phase !== "rebuilding" && this.toggleIntent === false && mm.options.duration !== 0 && performance.now() < this.settleUntil;
       if (!inWindow) {
-        traceLog("settle.pass", {
-          dur: mm.options.duration,
-          phase: this.rt.phase,
-          left: Math.round(this.settleUntil - performance.now()),
-          // 取栈很贵，只有真在记录时才做
-          from: isTracing() ? callerOf() : void 0
-        });
         return origRender();
       }
       this.settleUntil = 0;
       const prev = mm.options.duration;
-      traceLog("settle.catch", { duration: prev });
       mm.setOptions({ duration: 0 });
       try {
         await origRender();
@@ -9991,11 +9854,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       withTransition.transition = function tracedTransition(sel) {
         if (isTracing()) {
           const sized = sel;
-          traceLog("tr.create", {
-            dur: mm.options.duration,
-            n: typeof sized.size === "function" ? sized.size() : -1,
-            from: callerOf()
-          });
         }
         return origTransition(sel);
       };
@@ -10105,37 +9963,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (moved.size > 0)
         this.frames.paintMoved(moved);
       this.frames.requestAll();
-      traceLog("obs.structural", {
-        recs: records.length,
-        child: childRecords,
-        moved: moved.size,
-        jump: Math.round(jumpPx),
-        dt: Math.round(performance.now() - this.rebuildEndAt)
-      });
     } else if (moved.size > 0) {
       this.frames.paintMoved(moved);
-      traceLogEvery("transform", 100, "obs.transform", {
-        n: moved.size,
-        jump: Math.round(jumpPx)
-      });
     }
     if (resized.size > 0 && !structural) {
       this.frames.paintMoved(resized);
-      traceLog("obs.resize", { n: resized.size });
     }
     if (recls.size > 0) {
       this.paintSelectionOn(recls);
-      traceLog("obs.class", { n: recls.size });
-    }
-    if (guardStrips > 0)
-      traceLog("guard.strip", { n: guardStrips });
-    if (faded.size > 0) {
-      if (faded.size <= 3) {
-        for (const f of fades)
-          traceLog("obs.fade", { node: f });
-      } else {
-        traceLog("obs.fadeBatch", { n: faded.size, guard: this.inFadeGuard() });
-      }
     }
   }
   /**
@@ -10173,7 +10008,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (ob && svg)
         ob.observe(svg, OBSERVE_OPTIONS);
     }
-    traceLog("drag.raise", { n: els.length });
   }
   /**
    * 监听画布尺寸。
@@ -10980,7 +10814,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (this.mm !== mm || this.svgEl !== el)
       return;
     if (!this.fitHealthy()) {
-      traceLog("fit.unhealthy", { tries, k: this.zoomScale().toFixed(3) });
       if (tries < 4) {
         this.pendingFit = true;
         this.scheduleFitRetry(tries);
@@ -10988,7 +10821,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     }
     this.fittedSize = size;
-    traceLog("fit.done", { w: size.w, h: size.h, k: this.zoomScale().toFixed(3), tries });
   }
   /** fit 之后的自检：包围盒非空、缩放比例是有效正数 */
   fitHealthy() {
@@ -11073,7 +10905,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.rt.request((rev) => this.project(rev, knownContent));
   }
   async project(rev, knownContent) {
-    var _a, _b, _c;
+    var _a, _b;
     const t0 = traceSince();
     this.syncThemeButton();
     if (!this.svgEl)
@@ -11113,20 +10945,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       forceStructure: !sameFile || !sameTheme || !sameFilter,
       sourceSame: prev !== null && prev.content === content
     });
-    traceLog("refresh.plan", {
-      kind: plan.kind,
-      why: plan.kind === "structure" ? plan.reason : void 0,
-      at: plan.kind === "structure" ? plan.at : plan.kind === "patch" ? plan.line : void 0,
-      lines: isTracing() ? `${countLines(prev == null ? void 0 : prev.content)}->${countLines(content)}` : void 0,
-      nodes: isTracing() ? `${countNodes((_b = prev == null ? void 0 : prev.tree) != null ? _b : tree)}->${countNodes(tree)}` : void 0,
-      file: file.basename,
-      load: traceElapsed(t0)
-    });
-    if (isTracing() && plan.kind === "structure" && prev) {
-      for (const detail of explainDiff(prev.tree, tree, 4)) {
-        traceLog("refresh.diff", { detail });
-      }
-    }
     if (plan.kind === "none") {
       this.snapshot = {
         content,
@@ -11139,19 +10957,22 @@ var MindmapView = class extends import_obsidian3.ItemView {
       this.flushPendingEdit();
       return;
     }
-    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content, plan.src)) {
-      this.snapshot = {
-        content,
-        tree,
-        nodes: doc.nodes,
-        path: file.path,
-        themeKey,
-        filterFrontmatter: filter2
-      };
-      this.flushPendingEdit();
-      return;
+    if (plan.kind === "patch") {
+      const relabeled = plan.relabel ? this.applyRelabel(tree) : true;
+      if (relabeled && this.applyPatch(plan.line, plan.content, plan.src)) {
+        this.snapshot = {
+          content,
+          tree,
+          nodes: doc.nodes,
+          path: file.path,
+          themeKey,
+          filterFrontmatter: filter2
+        };
+        this.flushPendingEdit();
+        return;
+      }
     }
-    applyFolds(tree, collectFolds((_c = this.mm) == null ? void 0 : _c.state.data));
+    applyFolds(tree, collectFolds((_b = this.mm) == null ? void 0 : _b.state.data));
     if (this.rt.stale(rev))
       return;
     const restructure = () => this.applyTree(tree);
@@ -11191,6 +11012,40 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.flushPendingEdit();
   }
   /**
+   * 把新树的源坐标写回 DOM 树（`mm.state.data`）——只改行号坐标系，不碰 DOM 结构。
+   *
+   * 什么时候需要：一次编辑只改了**一个**节点的文字，但让后面所有节点的行号
+   * 整体漂了（把一行改成两行、在它上面插了一段…）。树的形状没变，所以不该重建；
+   * 可 DOM 里每个 g 的 `payload.src` 还指着旧行号，而编辑框初始文本、拖动落点、
+   * 写盘锚点、选中集**全都按行号定位** —— 不写回去，点开编辑就会读到隔壁行的字。
+   *
+   * 真正的写回逻辑在 `relabelTree`（纯函数，有单测）；这里只处理视图侧的两件事：
+   * 选中集要跟着挪、DOM 上那份高亮要重挂。
+   */
+  applyRelabel(next) {
+    var _a, _b, _c, _d;
+    const root2 = (_b = (_a = this.mm) == null ? void 0 : _a.state.data) != null ? _b : null;
+    if (!root2)
+      return false;
+    const moved = relabelTree(root2, next);
+    if (!moved)
+      return false;
+    if (moved.size === 0)
+      return true;
+    if (this.selectedLines.size > 0) {
+      const sel = /* @__PURE__ */ new Set();
+      for (const ln of this.selectedLines)
+        sel.add((_c = moved.get(ln)) != null ? _c : ln);
+      this.selectedLines = sel;
+    }
+    if (this.primaryLine >= 0) {
+      this.primaryLine = (_d = moved.get(this.primaryLine)) != null ? _d : this.primaryLine;
+    }
+    this.structureGen++;
+    this.paintSelection();
+    return true;
+  }
+  /**
    * 原地改字：只替换该节点的内容 DOM，不 setData。
    *
    * 为什么能这么做：markmap 的节点 key 是 `父id.子id + hash(content)`，
@@ -11205,7 +11060,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
     var _a, _b;
     const g = this.findNodeByLine(line);
     if (!g) {
-      traceLog("patch.miss", { line });
       return false;
     }
     const fo = g.querySelector(":scope > foreignObject");
@@ -11215,7 +11069,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const changed = box.innerHTML !== content;
     if (changed)
       box.innerHTML = content;
-    traceLog("patch.apply", { line, changed });
     const data = g.__data__;
     if (data) {
       data.content = content;
@@ -11223,9 +11076,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (payload && payload.src) {
         const before = payload.src.text;
         payload.src = src;
-        traceLog("patch.src", { line, from: before.slice(0, 12), to: src.text.slice(0, 12) });
       } else {
-        traceLog("patch.src.miss", { line });
       }
     }
     const w = box.scrollWidth;
@@ -11267,10 +11118,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
   }
   reflowSoon() {
     if (this.reflowFrame !== 0) {
-      traceLog("reflow.coalesce");
       return;
     }
-    traceLog("reflow.soon");
     this.reflowFrame = window.requestAnimationFrame(() => {
       this.reflowFrame = 0;
       void this.reflowNow();
@@ -11282,11 +11131,9 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (!mm || !svg)
       return;
     if (this.rebuilding()) {
-      traceLog("reflow.skip", { phase: this.rt.phase });
       return;
     }
     const t0 = traceSince();
-    traceLog("reflow.start", { duration: mm.options.duration });
     const prev = mm.options.duration;
     this.settleUntil = performance.now() + 1200;
     mm.setOptions({ duration: 0 });
@@ -11295,10 +11142,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     } catch (e) {
     } finally {
       mm.setOptions({ duration: prev > 0 ? prev : 180 });
-      traceLog("reflow.rendered", { dt: traceElapsed(t0), prev });
     }
     if (this.rebuilding()) {
-      traceLog("reflow.abort", { phase: this.rt.phase });
       return;
     }
     this.structureGen++;
@@ -11329,30 +11174,18 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.rt.setPhase("rebuilding");
     this.fadeGuardUntil = performance.now() + 50;
     const t0 = traceSince();
-    traceLog("rebuild.start", {
-      duration: mm.options.duration,
-      nodes: isTracing() ? countNodes(tree) : void 0
-    });
     const prev = mm.options.duration;
     mm.setOptions({ duration: 0 });
     try {
       await mm.setData(tree);
       this.fadeGuardUntil = performance.now() + 120;
       this.settleUntil = performance.now() + 1200;
-      traceLog("rebuild.setData", { dt: traceElapsed(t0) });
       let step = traceSince();
       const ghosts = this.dropDetached();
-      traceLog("rebuild.ghost", {
-        n: ghosts,
-        dt: traceElapsed(step),
-        guardLeft: Math.round(this.fadeGuardUntil - performance.now())
-      });
       step = traceSince();
       const faded = this.clearFade();
-      traceLog("rebuild.clearFade", { n: faded, dt: traceElapsed(step) });
       step = traceSince();
       const measured = this.measureMissing();
-      traceLog("rebuild.measure", { n: measured, dt: traceElapsed(step) });
       this.frames.reset();
       const liveMembers = new Set((_d = (_c = this.drag) == null ? void 0 : _c.liveMembers()) != null ? _d : []);
       const liveRoots = (_f = (_e = this.drag) == null ? void 0 : _e.liveRoots()) != null ? _f : [];
@@ -11361,30 +11194,16 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (liveRoots.length > 0)
         this.painter.markShifted(liveRoots, true);
       const synced = this.syncStalePositions();
-      if (synced.n > 0)
-        traceLog("rebuild.syncPos", { n: synced.n, max: Math.round(synced.max) });
       step = traceSince();
       this.frames.paintNow();
-      if (isTracing()) {
-        const lag = measureLayoutLag(svg);
-        traceLog("paint.lag", {
-          lag: lag.n,
-          max: Math.round(lag.max),
-          fresh: lag.fresh,
-          worst: lag.worst
-        });
-      }
-      traceLog("rebuild.paint", { dt: traceElapsed(step), total: traceElapsed(t0) });
     } finally {
       mm.setOptions({ duration: prev });
       this.rt.setPhase("idle");
       this.rebuildEndAt = performance.now();
-      traceLog("rebuild.end", { total: traceElapsed(t0) });
     }
     this.structureGen++;
     this.paintSelection();
     this.syncToolbar();
-    this.startTrajTrace();
   }
   /**
    * 把 DOM 里落后的 `transform` 直接写成布局真值 `state.rect`。
@@ -11460,21 +11279,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
       if (rep.n > 0) {
         sawLag = true;
         quiet = 0;
-        traceLog("f.traj", {
-          t,
-          lag: rep.n,
-          max: Math.round(rep.max),
-          fresh: rep.fresh,
-          worst: rep.worst
-        });
       } else if (sawLag) {
         quiet++;
-        traceLog("f.traj", { t, lag: 0, fresh: rep.fresh, note: "settled" });
         if (quiet >= 2)
           return;
       }
       if (performance.now() > deadline) {
-        traceLog("f.traj.end", { t, sawLag });
         return;
       }
       this.trajRaf = window.requestAnimationFrame(tick);
@@ -11511,8 +11321,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       g.style.removeProperty("translate");
       n++;
     }
-    if (n > 0)
-      traceLog("drag.shift.sweep", { n });
     for (const g of Array.from(svg.querySelectorAll("g.markmap-node.obmind-dragging"))) {
       if (skip.has(g))
         continue;
@@ -11613,8 +11421,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
     for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
       const data = g.__data__;
       if (!data || !alive.has(data)) {
-        if (isTracing() && n < 3)
-          traceLog("rebuild.ghostItem", { node: nodeLabel(g) });
         g.remove();
         n++;
       }
@@ -12608,12 +12414,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
     }
     const editor = normalizeLabel(value);
     const stale = card !== "" && editor !== "" && card !== editor;
-    traceLog("edit.value", {
-      line: src.line,
-      val: editor.slice(0, 12),
-      stale,
-      card: stale ? card.slice(0, 12) : void 0
-    });
   }
   /**
    * 编辑结束后：交给 EditService 算出写入计划 → 写文件 → 重建导图。
@@ -12626,18 +12426,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     let next;
     let revertPreview = null;
     try {
-      traceLog("edit.commit", {
-        act: action,
-        line: src.line,
-        val: value.slice(0, 12),
-        same: value === this.editorValueOf(src)
-      });
       if (action === "cancel")
         return;
       const file = this.targetFile;
       const snap = this.editSnapshot();
       if (!file || !snap) {
-        traceLog("edit.commit.nosnap", { file: Boolean(file), snap: Boolean(snap) });
         return;
       }
       revertPreview = this.previewText(src, value);
@@ -12646,21 +12439,18 @@ var MindmapView = class extends import_obsidian3.ItemView {
         revertPreview == null ? void 0 : revertPreview();
         revertPreview = null;
         this.pendingEditLine = -1;
-        traceLog("edit.commit.error", { reason: out.reason });
         new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
         return;
       }
       if (out.kind === "none") {
         revertPreview == null ? void 0 : revertPreview();
         revertPreview = null;
-        traceLog("edit.commit.none", { line: src.line, val: value.slice(0, 12) });
         return;
       }
       if (out.focusLine !== void 0)
         this.pendingEditLine = out.focusLine;
       const res = await this.runWrite(file, out.op);
       next = res.next;
-      traceLog("edit.commit.ok", { line: src.line, ok: res.ok });
       if (!res.ok)
         revertPreview == null ? void 0 : revertPreview();
       revertPreview = null;
@@ -12668,7 +12458,6 @@ var MindmapView = class extends import_obsidian3.ItemView {
       revertPreview == null ? void 0 : revertPreview();
       revertPreview = null;
       this.pendingEditLine = -1;
-      traceLog("edit.commit.throw", { msg: errText(err).slice(0, 40) });
       console.error("[obmind] \u5199\u56DE\u7B14\u8BB0\u5931\u8D25", err);
       new import_obsidian3.Notice("\u5199\u56DE\u7B14\u8BB0\u5931\u8D25\uFF0C\u8BE6\u89C1\u63A7\u5236\u53F0\u3002");
     } finally {

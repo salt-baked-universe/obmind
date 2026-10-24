@@ -68,7 +68,7 @@ import { NodeBar } from "./ui/nodeBar";
 import { isTypingTarget } from "./ui/keyGuard";
 import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
-import { explainDiff, planProjection } from "./app/plan";
+import { explainDiff, planProjection, relabelTree } from "./app/plan";
 import {
   buildSvgText,
   exportFileName,
@@ -827,13 +827,13 @@ export class MindmapView extends ItemView {
       // 来自**更早创建的那条过渡**（去 `tr.create` 里按 dur 与 n 对号）。
       if (isTracing()) {
         const t = target as (INode & { state?: { path?: string } }) | undefined;
-        traceLog("render.enter", {
-          dur: mm.options.duration,
-          phase: this.rt.phase,
-          left: Math.round(this.settleUntil - performance.now()),
-          arg: t?.state?.path ?? "-",
-          from: callerOf(),
-        });
+        // traceLog("render.enter", {
+        //   dur: mm.options.duration,
+        //   phase: this.rt.phase,
+        //   left: Math.round(this.settleUntil - performance.now()),
+        //   arg: t?.state?.path ?? "-",
+        //   from: callerOf(),
+        // });
       }
       // 重建期间照原样跑（applyTree 已经把 duration 置 0，这里再包一层会打架）；
       // duration 已经是 0 说明调用方自己就是按「瞬间到位」来的（reflowNow），
@@ -856,19 +856,19 @@ export class MindmapView extends ItemView {
         // dur=0 说明别的路径已经把它压成瞬间了；dur=180 才是真正漏掉的动画。
         // 现场日志里重建后 230–425ms 必有一次「252 个节点全动」，
         // 而它前后都没有 settle.catch，就是在这里留痕的。
-        traceLog("settle.pass", {
-          dur: mm.options.duration,
-          phase: this.rt.phase,
-          left: Math.round(this.settleUntil - performance.now()),
-          // 取栈很贵，只有真在记录时才做
-          from: isTracing() ? callerOf() : undefined,
-        });
+        // traceLog("settle.pass", {
+        //   dur: mm.options.duration,
+        //   phase: this.rt.phase,
+        //   left: Math.round(this.settleUntil - performance.now()),
+        //   // 取栈很贵，只有真在记录时才做
+        //   from: isTracing() ? callerOf() : undefined,
+        // });
         return origRender();
       }
 
       this.settleUntil = 0;
       const prev: number = mm.options.duration;
-      traceLog("settle.catch", { duration: prev });
+      // traceLog("settle.catch", { duration: prev });
       mm.setOptions({ duration: 0 });
       try {
         await origRender();
@@ -896,11 +896,11 @@ export class MindmapView extends ItemView {
       withTransition.transition = function tracedTransition(sel: unknown): unknown {
         if (isTracing()) {
           const sized = sel as { size?: () => number };
-          traceLog("tr.create", {
-            dur: mm.options.duration,
-            n: typeof sized.size === "function" ? sized.size() : -1,
-            from: callerOf(),
-          });
+          // traceLog("tr.create", {
+          //   dur: mm.options.duration,
+          //   n: typeof sized.size === "function" ? sized.size() : -1,
+          //   from: callerOf(),
+          // });
         }
         return origTransition(sel);
       };
@@ -1081,13 +1081,13 @@ export class MindmapView extends ItemView {
       // - jump：本批单点最大位移（px）。重建之后 300ms 又冒出 jump=100 就是「图又跳了一下」；
       // - dt：距上次重建结束多少毫秒。同一个 jump 在重建当帧出现是正常的落位，
       //   在 +400ms 出现才是有人又重排了一遍。
-      traceLog("obs.structural", {
-        recs: records.length,
-        child: childRecords,
-        moved: moved.size,
-        jump: Math.round(jumpPx),
-        dt: Math.round(performance.now() - this.rebuildEndAt),
-      });
+      // traceLog("obs.structural", {
+      //   recs: records.length,
+      //   child: childRecords,
+      //   moved: moved.size,
+      //   jump: Math.round(jumpPx),
+      //   dt: Math.round(performance.now() - this.rebuildEndAt),
+      // });
     } else if (moved.size > 0) {
       // 同步重绘，不走 rAF：d3 刚在这一帧的 rAF 回调里写完 transform，
       // MutationObserver 回调紧跟着在微任务里跑 —— 此刻重画连线仍是同一帧，
@@ -1096,32 +1096,29 @@ export class MindmapView extends ItemView {
       // 折叠动画里每帧一批；限流到 100ms 一条，用来回答「什么时候又有一大批节点在动」
       // ——改字重排完之后若还冒出一批，就是 markmap 自己那个 100ms 防抖重排又跑了一遍。
       // jump = 这一批里单个节点最大位移（px）：>50 且出现在 rebuild 之后 = 画面又整体跳了一下。
-      traceLogEvery("transform", 100, "obs.transform", {
-        n: moved.size,
-        jump: Math.round(jumpPx),
-      });
+      // traceLogEvery("transform", 100, "obs.transform", {
+      //   n: moved.size,
+      //   jump: Math.round(jumpPx),
+      // });
     }
     // 只变宽变高、位置没动的那批：单独补一次增量绘制（每节点只有 8 个属性写）。
     // 不做这一步的后果就是用户截图那张：新文字比旧卡片宽，直接顶出边框，
     // 而且要等到下一次**别的原因**触发全量绘制才会回正。
     if (resized.size > 0 && !structural) {
       this.frames.paintMoved(resized);
-      traceLog("obs.resize", { n: resized.size });
+      // traceLog("obs.resize", { n: resized.size });
     }
     if (recls.size > 0) {
       this.paintSelectionOn(recls);
-      traceLog("obs.class", { n: recls.size });
+      // traceLog("obs.class", { n: recls.size });
     }
-    if (guardStrips > 0) traceLog("guard.strip", { n: guardStrips });
-    if (faded.size > 0) {
-      // 少量节点的透明变化逐条记（「某几个卡片莫名变透明」的可疑现场就是它），
-      // 成批淡出（折叠动画）只记数量，否则一秒几百行把有用信息冲掉
-      if (faded.size <= 3) {
-        for (const f of fades) traceLog("obs.fade", { node: f });
-      } else {
-        traceLog("obs.fadeBatch", { n: faded.size, guard: this.inFadeGuard() });
-      }
-    }
+    // if (guardStrips > 0) traceLog("guard.strip", { n: guardStrips });
+    // 埋点已停用：原来按批量大小分别写 obs.fade / obs.fadeBatch ——
+    // 少量时逐条记（「某几个卡片莫名变透明」的可疑现场就是它），成批淡出只记数量。
+    // if (faded.size > 0) {
+    //   if (faded.size <= 3) { for (const f of fades) traceLog("obs.fade", { node: f }); }
+    //   else { traceLog("obs.fadeBatch", { n: faded.size, guard: this.inFadeGuard() }); }
+    // }
   }
 
   /**
@@ -1154,7 +1151,7 @@ export class MindmapView extends ItemView {
     } finally {
       if (ob && svg) ob.observe(svg, OBSERVE_OPTIONS);
     }
-    traceLog("drag.raise", { n: els.length });
+    // traceLog("drag.raise", { n: els.length });
   }
 
   /**
@@ -2030,7 +2027,7 @@ export class MindmapView extends ItemView {
     //   · 视口尺寸为 0 时 fit 出来的 scale = 0：整张图缩成一个点。
     if (!this.fitHealthy()) {
       // 包围盒空 / scale 为 0：这一次适配等于把图留在模糊状态，紧接着会重试
-      traceLog("fit.unhealthy", { tries, k: this.zoomScale().toFixed(3) });
+      // traceLog("fit.unhealthy", { tries, k: this.zoomScale().toFixed(3) });
       if (tries < 4) {
         this.pendingFit = true;
         this.scheduleFitRetry(tries);
@@ -2039,7 +2036,7 @@ export class MindmapView extends ItemView {
     }
     this.fittedSize = size;
     // 每次 fit 都会动整张图的缩放：短时间内连续出现多条 = 画面在整体抖
-    traceLog("fit.done", { w: size.w, h: size.h, k: this.zoomScale().toFixed(3), tries });
+    // traceLog("fit.done", { w: size.w, h: size.h, k: this.zoomScale().toFixed(3), tries });
   }
 
   /** fit 之后的自检：包围盒非空、缩放比例是有效正数 */
@@ -2197,23 +2194,21 @@ export class MindmapView extends ItemView {
     // 只有结构通道要 setData 换掉整批 g —— 日志里看到 rebuild 就该往重建链路想。
     // why 是「为什么必须重建」（见 app/plan.ts 的 StructureReason）：
     // 改一个字却出现 why=line/depth，说明是行号位移或缩进变了，不是文字变了。
-    traceLog("refresh.plan", {
-      kind: plan.kind,
-      why: plan.kind === "structure" ? plan.reason : undefined,
-      at: plan.kind === "structure" ? plan.at : plan.kind === "patch" ? plan.line : undefined,
-      lines: isTracing() ? `${countLines(prev?.content)}->${countLines(content)}` : undefined,
-      nodes: isTracing() ? `${countNodes(prev?.tree ?? tree)}->${countNodes(tree)}` : undefined,
-      file: file.basename,
-      load: traceElapsed(t0),
-    });
+    // traceLog("refresh.plan", {
+    //   kind: plan.kind,
+    //   why: plan.kind === "structure" ? plan.reason : undefined,
+    //   at: plan.kind === "structure" ? plan.at : plan.kind === "patch" ? plan.line : undefined,
+    //   lines: isTracing() ? `${countLines(prev?.content)}->${countLines(content)}` : undefined,
+    //   nodes: isTracing() ? `${countNodes(prev?.tree ?? tree)}->${countNodes(tree)}` : undefined,
+    //   file: file.basename,
+    //   load: traceElapsed(t0),
+    // });
 
-    // why 只说「哪一类原因」，这里把「具体哪几个节点、行号/文字怎么变的」也写下来。
-    // 一次复现就能定位，不必再来一轮。
-    if (isTracing() && plan.kind === "structure" && prev) {
-      for (const detail of explainDiff(prev.tree, tree, 4)) {
-        traceLog("refresh.diff", { detail });
-      }
-    }
+    // 埋点已停用：why 只说「哪一类原因」，原来这里把「具体哪几个节点、行号/文字
+    // 怎么变的」也写进 refresh.diff。要恢复诊断把下面三行解开即可。
+    // if (isTracing() && plan.kind === "structure" && prev) {
+    //   for (const detail of explainDiff(prev.tree, tree, 4)) traceLog("refresh.diff", { detail });
+    // }
 
     if (plan.kind === "none") {
       this.snapshot = {
@@ -2231,17 +2226,23 @@ export class MindmapView extends ItemView {
     // 只改了一处文字：直接换那个节点的 DOM，不 setData。
     // markmap 的 key 里带内容哈希，setData 会让整棵树重新 enter（DOM 全量重建）；
     // 而它自己对节点内容挂了 ResizeObserver，尺寸一变会重排，这就是官方支持的增量路径。
-    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content, plan.src)) {
-      this.snapshot = {
-        content,
-        tree,
-        nodes: doc.nodes,
-        path: file.path,
-        themeKey,
-        filterFrontmatter: filter,
-      };
-      this.flushPendingEdit();
-      return;
+    if (plan.kind === "patch") {
+      // 这一改可能让后面的行号整体漂了（文字从一行变两行、或上面多了一段）。
+      // 行号是所有定位操作的坐标系，必须先写回 DOM —— 否则下面的
+      // findNodeByLine 找的还是旧行号，patch 必然落空、又退回重建。
+      const relabeled: boolean = plan.relabel ? this.applyRelabel(tree) : true;
+      if (relabeled && this.applyPatch(plan.line, plan.content, plan.src)) {
+        this.snapshot = {
+          content,
+          tree,
+          nodes: doc.nodes,
+          path: file.path,
+          themeKey,
+          filterFrontmatter: filter,
+        };
+        this.flushPendingEdit();
+        return;
+      }
     }
 
     // 结构变化：setData 全量重建
@@ -2300,6 +2301,39 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 把新树的源坐标写回 DOM 树（`mm.state.data`）——只改行号坐标系，不碰 DOM 结构。
+   *
+   * 什么时候需要：一次编辑只改了**一个**节点的文字，但让后面所有节点的行号
+   * 整体漂了（把一行改成两行、在它上面插了一段…）。树的形状没变，所以不该重建；
+   * 可 DOM 里每个 g 的 `payload.src` 还指着旧行号，而编辑框初始文本、拖动落点、
+   * 写盘锚点、选中集**全都按行号定位** —— 不写回去，点开编辑就会读到隔壁行的字。
+   *
+   * 真正的写回逻辑在 `relabelTree`（纯函数，有单测）；这里只处理视图侧的两件事：
+   * 选中集要跟着挪、DOM 上那份高亮要重挂。
+   */
+  private applyRelabel(next: IPureNode): boolean {
+    const root = (this.mm?.state.data ?? null) as IPureNode | null;
+    if (!root) return false;
+    const moved = relabelTree(root, next);
+    if (!moved) return false;
+    if (moved.size === 0) return true;
+
+    // 选中集也是行号：不跟着挪，刷新之后高亮会挂到别人的卡片上
+    if (this.selectedLines.size > 0) {
+      const sel = new Set<number>();
+      for (const ln of this.selectedLines) sel.add(moved.get(ln) ?? ln);
+      this.selectedLines = sel;
+    }
+    if (this.primaryLine >= 0) {
+      this.primaryLine = moved.get(this.primaryLine) ?? this.primaryLine;
+    }
+    // DOM 上那份 obmind-selected 是按旧行号挂的，代数 +1 让 paintSelection 重挂
+    this.structureGen++;
+    this.paintSelection();
+    return true;
+  }
+
+  /**
    * 原地改字：只替换该节点的内容 DOM，不 setData。
    *
    * 为什么能这么做：markmap 的节点 key 是 `父id.子id + hash(content)`，
@@ -2314,7 +2348,7 @@ export class MindmapView extends ItemView {
     const g = this.findNodeByLine(line);
     if (!g) {
       // 节点不在 DOM 里（折叠 / 刚被换掉）→ 这次会退回结构重建，下次就看到 rebuild 了
-      traceLog("patch.miss", { line });
+      // traceLog("patch.miss", { line });
       return false;
     }
 
@@ -2328,7 +2362,7 @@ export class MindmapView extends ItemView {
     const changed: boolean = box.innerHTML !== content;
     if (changed) box.innerHTML = content;
     // changed=false 是正常路径（预览已经铺过），日志里出现大量 true 说明预览没接上
-    traceLog("patch.apply", { line, changed });
+    // traceLog("patch.apply", { line, changed });
 
     // 同步写回 markmap 手里的节点数据：后续拖动等逻辑读的是 DOM，
     // 但下次结构重建前若有其它代码看 state.data，内容不能是旧的。
@@ -2346,10 +2380,10 @@ export class MindmapView extends ItemView {
         // 换引用而不是 Object.assign：新行可能少了 endLine / blockStart 之类的字段，
         // 逐字段覆盖会把这些「上一次才有」的值留下来，于是 startEdit 会误判成多行节点。
         payload.src = src;
-        traceLog("patch.src", { line, from: before.slice(0, 12), to: src.text.slice(0, 12) });
+        // traceLog("patch.src", { line, from: before.slice(0, 12), to: src.text.slice(0, 12) });
       } else {
         // 拿不到 payload 就没法回写 —— 下一步必然又是「显示新字、编辑旧字」
-        traceLog("patch.src.miss", { line });
+        // traceLog("patch.src.miss", { line });
       }
     }
 
@@ -2405,10 +2439,10 @@ export class MindmapView extends ItemView {
     if (this.reflowFrame !== 0) {
       // 合并掉一次：previewText 和随后的 applyPatch 会在同一轮里各改一次，
       // 正常现象。若这里频繁出现而 reflow.start 不多，说明重排被合并得过头。
-      traceLog("reflow.coalesce");
+      // traceLog("reflow.coalesce");
       return;
     }
-    traceLog("reflow.soon");
+    // traceLog("reflow.soon");
     this.reflowFrame = window.requestAnimationFrame(() => {
       this.reflowFrame = 0;
       void this.reflowNow();
@@ -2431,14 +2465,14 @@ export class MindmapView extends ItemView {
     // 屏幕上就是「文字溢出卡片边框」，且永远不会自己恢复。
     // 编辑态下 DOM 是完整的（编辑框是浮层，原文只是 visibility: hidden），安全。
     if (this.rebuilding()) {
-      traceLog("reflow.skip", { phase: this.rt.phase });
+      // traceLog("reflow.skip", { phase: this.rt.phase });
       return;
     }
 
     const t0 = traceSince();
     // duration 进日志：这条路径临时把它改成 0，恢复时若 prev 已经是 0 会退回 180。
     // 若日志里反复出现「duration=180 而本来应该是别的值」，动画速度就被改过了。
-    traceLog("reflow.start", { duration: mm.options.duration });
+    // traceLog("reflow.start", { duration: mm.options.duration });
     const prev: number = mm.options.duration;
     // 这一遍 renderData 会让内容 div 再一次「变尺寸」，markmap 自己的防抖回调
     // 100ms 后还会再排一次（现场日志：reflow.rendered 之后 200ms 又冒一个
@@ -2452,12 +2486,12 @@ export class MindmapView extends ItemView {
     } finally {
       // prev 可能已经是 0（上一次重排还没收尾）：退回默认值，别把动画永久关掉
       mm.setOptions({ duration: prev > 0 ? prev : 180 });
-      traceLog("reflow.rendered", { dt: traceElapsed(t0), prev });
+      // traceLog("reflow.rendered", { dt: traceElapsed(t0), prev });
     }
 
     // 等 renderData 的这几帧里可能又开始了一轮重建：别用刚被换掉的 DOM 去画
     if (this.rebuilding()) {
-      traceLog("reflow.abort", { phase: this.rt.phase });
+      // traceLog("reflow.abort", { phase: this.rt.phase });
       return;
     }
     // 节点位置变了，卡片/连线要按新几何重新摆；renderData 同时会把每个节点的
@@ -2508,10 +2542,10 @@ export class MindmapView extends ItemView {
     // 注意 guard 窗口是从**现在**算的 50ms —— 若 setData 本身跑了 200ms，
     // 收尾阶段其实已经没有保护了（日志里 guardLeft 为负就是这个意思）。
     const t0 = traceSince();
-    traceLog("rebuild.start", {
-      duration: mm.options.duration,
-      nodes: isTracing() ? countNodes(tree) : undefined,
-    });
+    // traceLog("rebuild.start", {
+    //   duration: mm.options.duration,
+    //   nodes: isTracing() ? countNodes(tree) : undefined,
+    // });
 
     const prev: number = mm.options.duration;
     mm.setOptions({ duration: 0 });
@@ -2525,31 +2559,31 @@ export class MindmapView extends ItemView {
       // 再跑一遍整树重排，那时 duration 已恢复成 180 → 整张图重播一遍动画。
       // 给它一个 1.2s 的窗口，落进来就按 duration 0 跑（见 attachSettleHook）。
       this.settleUntil = performance.now() + 1200;
-      traceLog("rebuild.setData", { dt: traceElapsed(t0) });
+      // traceLog("rebuild.setData", { dt: traceElapsed(t0) });
 
       // 旧节点是走 transition 移除的，即使 duration=0 也要等一个 tick。
       // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
       // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
       let step = traceSince();
       const ghosts: number = this.dropDetached();
-      traceLog("rebuild.ghost", {
-        n: ghosts,
-        dt: traceElapsed(step),
-        guardLeft: Math.round(this.fadeGuardUntil - performance.now()),
-      });
+      // traceLog("rebuild.ghost", {
+      //   n: ghosts,
+      //   dt: traceElapsed(step),
+      //   guardLeft: Math.round(this.fadeGuardUntil - performance.now()),
+      // });
 
       // 重建期间没挡住的残余（比如 observer 还没跑到的那几条记录）在这里清掉：
       // 位置已经是瞬间到位的，任何 < 1 的透明度都不该留下来。
       step = traceSince();
       const faded: number = this.clearFade();
-      traceLog("rebuild.clearFade", { n: faded, dt: traceElapsed(step) });
+      // traceLog("rebuild.clearFade", { n: faded, dt: traceElapsed(step) });
 
       // 刚 enter 的节点 markmap 还没来得及写 width/height（它下一次 renderData 才量），
       // 此刻全量绘制会读不到几何 → 新节点第一帧**没有卡片**，只有裸文字。
       // 缺尺寸的才去量（scrollWidth 会强制同步布局，不能对所有节点做）。
       step = traceSince();
       const measured: number = this.measureMissing();
-      traceLog("rebuild.measure", { n: measured, dt: traceElapsed(step) });
+      // traceLog("rebuild.measure", { n: measured, dt: traceElapsed(step) });
 
       // 丢掉「按位置索引」的缓存（path → g）与「整块平移中」的登记。
       // **绘制缓存不丢**：d3 按 key join，没变的节点复用同一个 `<g>`，
@@ -2583,7 +2617,7 @@ export class MindmapView extends ItemView {
       // 这里既然已经把 duration 置 0 了（语义就是「瞬间到位」），就把终点直接写进去，
       // 让 d3 第一帧无事可做。实测追平后再看 40 帧：一次都没被改回去。
       const synced = this.syncStalePositions();
-      if (synced.n > 0) traceLog("rebuild.syncPos", { n: synced.n, max: Math.round(synced.max) });
+      // if (synced.n > 0) traceLog("rebuild.syncPos", { n: synced.n, max: Math.round(synced.max) });
       step = traceSince();
       this.frames.paintNow();
       // 这一遍画下去之后，卡片位置与「布局真值」(`state.rect`) 差多少？
@@ -2593,21 +2627,17 @@ export class MindmapView extends ItemView {
       // 那句同步 `$.attr("transform", …)` 写的起点（= 根节点的右下角）。
       // 所以这里 lag>0 就说明「这一帧画下去的卡片是错的」，max 就是它偏了多少像素；
       // 紧接着的 `f.traj` 会逐帧给出「它什么时候才回来」。
-      if (isTracing()) {
-        const lag = measureLayoutLag(svg);
-        traceLog("paint.lag", {
-          lag: lag.n,
-          max: Math.round(lag.max),
-          fresh: lag.fresh,
-          worst: lag.worst,
-        });
-      }
-      traceLog("rebuild.paint", { dt: traceElapsed(step), total: traceElapsed(t0) });
+      // 埋点已停用（paint.lag / f.traj）：这一段原本是「画完立刻核对位置」的自检。
+      // if (isTracing()) {
+      //   const lag = measureLayoutLag(svg);
+      //   traceLog("paint.lag", { lag: lag.n, max: Math.round(lag.max), fresh: lag.fresh, worst: lag.worst });
+      // }
+      // traceLog("rebuild.paint", { dt: traceElapsed(step), total: traceElapsed(t0) });
     } finally {
       mm.setOptions({ duration: prev });
       this.rt.setPhase("idle");
       this.rebuildEndAt = performance.now();
-      traceLog("rebuild.end", { total: traceElapsed(t0) });
+      // traceLog("rebuild.end", { total: traceElapsed(t0) });
     }
 
     // 重建换掉了整批 g：选中高亮和节点浮动条都要按行号重新挂回去。
@@ -2617,7 +2647,8 @@ export class MindmapView extends ItemView {
     this.structureGen++;
     this.paintSelection();
     this.syncToolbar();
-    this.startTrajTrace();
+    // 逐帧采样已停用（f.traj）：它每帧都要遍历全部节点比对位置，只在排查时开。
+    // this.startTrajTrace();
   }
 
   /**
@@ -2693,21 +2724,21 @@ export class MindmapView extends ItemView {
       if (rep.n > 0) {
         sawLag = true;
         quiet = 0;
-        traceLog("f.traj", {
-          t,
-          lag: rep.n,
-          max: Math.round(rep.max),
-          fresh: rep.fresh,
-          worst: rep.worst,
-        });
+        // traceLog("f.traj", {
+        //   t,
+        //   lag: rep.n,
+        //   max: Math.round(rep.max),
+        //   fresh: rep.fresh,
+        //   worst: rep.worst,
+        // });
       } else if (sawLag) {
         // 落定那一帧也记一条（用户真正看到的「回到正确位置」就是这个时刻）
         quiet++;
-        traceLog("f.traj", { t, lag: 0, fresh: rep.fresh, note: "settled" });
+        // traceLog("f.traj", { t, lag: 0, fresh: rep.fresh, note: "settled" });
         if (quiet >= 2) return;
       }
       if (performance.now() > deadline) {
-        traceLog("f.traj.end", { t, sawLag });
+        // traceLog("f.traj.end", { t, sawLag });
         return;
       }
       this.trajRaf = window.requestAnimationFrame(tick);
@@ -2743,7 +2774,7 @@ export class MindmapView extends ItemView {
       g.style.removeProperty("translate");
       n++;
     }
-    if (n > 0) traceLog("drag.shift.sweep", { n });
+    // if (n > 0) traceLog("drag.shift.sweep", { n });
     // class 也可能被复用的元素带过来：留着就是那个节点永远半透明
     for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node.obmind-dragging"))) {
       if (skip.has(g)) continue;
@@ -2842,7 +2873,7 @@ export class MindmapView extends ItemView {
       if (!data || !alive.has(data)) {
         // 记前几个的名字：`rebuild.ghost n=10` 只说数量，说不出「被换掉的是哪几个」，
         // 而那正是判断「为什么这次要重建」的关键（比如每次都是同一个父节点）
-        if (isTracing() && n < 3) traceLog("rebuild.ghostItem", { node: nodeLabel(g) });
+        // if (isTracing() && n < 3) traceLog("rebuild.ghostItem", { node: nodeLabel(g) });
         g.remove();
         n++;
       }
@@ -3951,12 +3982,12 @@ export class MindmapView extends ItemView {
     }
     const editor = normalizeLabel(value);
     const stale: boolean = card !== "" && editor !== "" && card !== editor;
-    traceLog("edit.value", {
-      line: src.line,
-      val: editor.slice(0, 12),
-      stale,
-      card: stale ? card.slice(0, 12) : undefined,
-    });
+    // traceLog("edit.value", {
+    //   line: src.line,
+    //   val: editor.slice(0, 12),
+    //   stale,
+    //   card: stale ? card.slice(0, 12) : undefined,
+    // });
   }
 
   /**
@@ -3976,18 +4007,18 @@ export class MindmapView extends ItemView {
     try {
       // 提交链路的每一步都留痕：现场「输入完按回车却什么都没写」最难查 ——
       // 屏幕上没变化时，用户说不清是没提交、被判成「没变」、还是写失败。
-      traceLog("edit.commit", {
-        act: action,
-        line: src.line,
-        val: value.slice(0, 12),
-        same: value === this.editorValueOf(src),
-      });
+      // traceLog("edit.commit", {
+      //   act: action,
+      //   line: src.line,
+      //   val: value.slice(0, 12),
+      //   same: value === this.editorValueOf(src),
+      // });
       if (action === "cancel") return;
 
       const file = this.targetFile;
       const snap = this.editSnapshot();
       if (!file || !snap) {
-        traceLog("edit.commit.nosnap", { file: Boolean(file), snap: Boolean(snap) });
+        // traceLog("edit.commit.nosnap", { file: Boolean(file), snap: Boolean(snap) });
         return;
       }
 
@@ -4005,7 +4036,7 @@ export class MindmapView extends ItemView {
         revertPreview?.();
         revertPreview = null;
         this.pendingEditLine = -1;
-        traceLog("edit.commit.error", { reason: out.reason });
+        // traceLog("edit.commit.error", { reason: out.reason });
         new Notice(`obmind：${out.reason}`);
         return;
       }
@@ -4015,21 +4046,21 @@ export class MindmapView extends ItemView {
         // 对照 `edit.value`（编辑框打开时的初始值）就知道是不是值本身没变。
         revertPreview?.();
         revertPreview = null;
-        traceLog("edit.commit.none", { line: src.line, val: value.slice(0, 12) });
+        // traceLog("edit.commit.none", { line: src.line, val: value.slice(0, 12) });
         return;
       }
 
       if (out.focusLine !== undefined) this.pendingEditLine = out.focusLine;
       const res = await this.runWrite(file, out.op);
       next = res.next;
-      traceLog("edit.commit.ok", { line: src.line, ok: res.ok });
+      // traceLog("edit.commit.ok", { line: src.line, ok: res.ok });
       if (!res.ok) revertPreview?.();
       revertPreview = null;
     } catch (err) {
       revertPreview?.();
       revertPreview = null;
       this.pendingEditLine = -1;
-      traceLog("edit.commit.throw", { msg: errText(err).slice(0, 40) });
+      // traceLog("edit.commit.throw", { msg: errText(err).slice(0, 40) });
       console.error("[obmind] 写回笔记失败", err);
       new Notice("写回笔记失败，详见控制台。");
     } finally {

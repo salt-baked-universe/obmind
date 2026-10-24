@@ -9,7 +9,7 @@ import { blockRange } from "../src/edit/move";
 import { subtreeEndOf } from "../src/edit/create";
 import { insertBlockPlan } from "../src/edit/block";
 import { EditService } from "../src/app/EditService";
-import { planProjection } from "../src/app/plan";
+import { planProjection, relabelTree } from "../src/app/plan";
 import { nodeBarPosition } from "../src/ui/nodeBarPosition";
 import { formatStats, treeStats } from "../src/domain/stats";
 import {
@@ -857,6 +857,51 @@ console.log("\n=== T24: 原地改字（patch）必须带出新的源坐标 ===")
     sourceSame: true,
   });
   assert(same.kind === "none", "原文一样 → none");
+}
+
+console.log("\n=== T25: 行号漂移不算结构变化（patch + relabel） ===");
+{
+  const opts = { render: (s: string) => s };
+  // 在 b 上面插一个空行：树形一模一样，只有行号 +1。
+  // 以前这条被判成 why=line → 全量 setData（250 节点 400~550ms + 整图重排）。
+  const prevTree = buildTree("a\n- b", "t.md", opts);
+  const nextTree = buildTree("a\n\n- b 改", "t.md", opts);
+  const plan = planProjection({
+    prev: prevTree,
+    next: nextTree,
+    forceStructure: false,
+    sourceSame: false,
+  });
+  assert(plan.kind === "patch", "行号漂移 + 改一个字仍然是 patch");
+  if (plan.kind === "patch") {
+    assert(plan.relabel, "带出 relabel 标记（调用方必须把新行号写回 DOM）");
+    assert(plan.line === 2, "patch 用的是**新**行号（上面多了一行空行）");
+    assert(plan.src.line === 2, "带出的 src 也是新行号");
+  }
+
+  // 行号要真正写回旧树：编辑框初始文本、拖动落点、写盘锚点全按它定位
+  const moved = relabelTree(prevTree, nextTree);
+  assert(moved !== null, "结构一致 → 写回成功");
+  if (moved) {
+    assert(moved.get(1) === 2, "旧行 1 → 新行 2");
+    // 树是 root → [a(行0), b(行1)]，b 是第二个孩子
+    const b = prevTree.children?.[1];
+    assert(b?.payload?.src?.line === 2, "旧树上的 src 已经是新行号");
+    assert(b?.payload?.src?.text === "b 改", "连文字一起换成了新的");
+  }
+
+  // 结构对不上必须拒绝：行号写错 = 内容被写到别的节点上（比慢 400ms 严重得多）
+  const broken = buildTree("a\n- b\n- c", "t.md", opts);
+  assert(relabelTree(prevTree, broken) === null, "孩子数量不一致 → null，让调用方退回重建");
+
+  // 行号没漂时不该白写一遍（relabel=false 让调用方跳过这一步）
+  const plain = planProjection({
+    prev: buildTree("a\n- b", "t.md", opts),
+    next: buildTree("a\n- b 改", "t.md", opts),
+    forceStructure: false,
+    sourceSame: false,
+  });
+  assert(plain.kind === "patch" && plain.relabel === false, "行号没动 → relabel=false");
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

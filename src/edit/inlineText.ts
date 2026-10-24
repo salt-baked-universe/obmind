@@ -161,11 +161,11 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     // 落位真的变了才记：短时间内多条说明编辑框在跳（背后节点还在被 markmap 挪），
     // 那在屏幕上就是「输入框飘在半空闪一下」
     if (isTracing()) {
-      traceLogEvery("edit.place", 100, "edit.place", {
-        x: Math.round(rect.left - base.left),
-        y: Math.round(rect.top - base.top),
-        w: Math.round(rawW),
-      });
+      // traceLogEvery("edit.place", 100, "edit.place", {
+      //   x: Math.round(rect.left - base.left),
+      //   y: Math.round(rect.top - base.top),
+      //   w: Math.round(rawW),
+      // });
     }
     return true;
   };

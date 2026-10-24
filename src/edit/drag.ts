@@ -238,12 +238,12 @@ export class DragController {
     this.candidates = all.filter((n) => !members.has(n));
     // 「拖动时飘线」的诊断入口：members 应该正好是「根 + 全部后代」。
     // 少了成员 = 块内有卡片没跟着走，屏幕上就是线被拉长；多了成员 = 误吞了别人的节点。
-    traceLog("drag.pick", {
-      path: rootPath,
-      members: this.members.length,
-      roots: memberRoots.length,
-      total: all.length,
-    });
+    // traceLog("drag.pick", {
+    //   path: rootPath,
+    //   members: this.members.length,
+    //   roots: memberRoots.length,
+    //   total: all.length,
+    // });
   };
 
   private onPointerMove = (e: PointerEvent): void => {
@@ -295,13 +295,13 @@ export class DragController {
     // 会重建：块先留在鼠标处，等 setData 把这批 g 换掉（新 g 上没有任何位移）。
     // 不重建：当场弹回原位，否则卡片会停在鼠标底下不走了。
     // rebuild=false 但块确实换了位置 → 卡片会弹回旧位置，看起来就是「拖了没反应 + 线乱跳」。
-    traceLog("drag.drop", {
-      line: originSrc.line,
-      to: tgtSrc?.line,
-      mode: target.mode,
-      rebuild: willRebuild,
-      members: members.length,
-    });
+    // traceLog("drag.drop", {
+    //   line: originSrc.line,
+    //   to: tgtSrc?.line,
+    //   mode: target.mode,
+    //   rebuild: willRebuild,
+    //   members: members.length,
+    // });
     this.clearShift(members, roots, willRebuild, outerLinks);
   };
 
@@ -339,7 +339,7 @@ export class DragController {
     }
     this.outerLinks = links;
     this.cb.onShift(this.rootEls, true);
-    traceLog("drag.links", { n: links.length, roots: this.rootEls.length });
+    // traceLog("drag.links", { n: links.length, roots: this.rootEls.length });
   }
 
   /**
@@ -389,13 +389,13 @@ export class DragController {
       if (token !== this.shiftToken) return;
       // 全部脱离文档 = 已经被 setData 换掉，什么都没必要做了
       if (members.every((g) => !g.isConnected)) {
-        traceLog("drag.shift.gone", { ms: Math.round(performance.now() - t0), n: members.length });
+        // traceLog("drag.shift.gone", { ms: Math.round(performance.now() - t0), n: members.length });
         return;
       }
       if (performance.now() - t0 > 900) {
         // 兜底清掉了：说明「说要重建」但重建没来（写盘失败 / 被判成 none）。
         // 这一刻卡片会从鼠标处弹回旧位置 —— 看着像「拖了没反应」。
-        traceLog("drag.shift.timeout", { n: members.length });
+        // traceLog("drag.shift.timeout", { n: members.length });
         wipe();
         this.restoreOuterLinks(links);
         return;
