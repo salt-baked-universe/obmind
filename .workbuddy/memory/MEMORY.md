@@ -29,6 +29,7 @@ Obsidian 插件：笔记 → XMind 风格思维导图。当前 1.18.11（`manife
 15. 「提交即预览」**不能把重画托付给别人**：它发生在 `editing` 相位，`reflowNow` 曾早退，随后 `applyPatch` 因 innerHTML 已铺成一样 → `changed=false` → 一次绘制都没发生。凡写了 `fo.width/height` 就当场 `frames.paintMoved([g])`。
 16. **`await setData()` 返回时 DOM 的 transform 还是 enter 起点**（终点要等 d3 那条 duration=0 过渡的第一帧）。我们的卡片按 transform 画 → 这一刻画就是「新建节点+其后所有节点飘到根节点角落」。实测（`tmp/lagProbe.ts`，77 节点插 1 个）：+1ms 时 **75 个节点**错位、最大 **1260px**，一帧后归零，每节点只有 2 个 transform 值（**瞬移不是动画**）。修法 `applyTree` 在 `paintNow()` 前 `syncStalePositions()`（只在 `duration===0` 时、跳过 rect 宽高为 0 的），追平后 40 帧没被 d3 改回去（过渡第一帧拿当前值当起点）。
 17. 闪烁**不是**透明度问题时：日志无 `fade.write` + `obs.fadeBatch guard=true` → 查位置（`obs.structural jump`、`f.traj lag`）。
+17a. **行号漂移不是结构变化**（1.18.12）：`planProjection` 只在 children / depth / content 上判结构，`line` 差异降级成 `lineDrift` → 返回 `patch` + `relabel:true`。但行号是**所有定位操作的坐标系**（编辑框初始文本、拖动落点、写盘锚点、选中集），所以必须先把新树的 `payload.src` 换引用写回 `mm.state.data`（`relabelTree` 纯函数；结构对不上返回 `null` → 调用方退回重建，宁可慢也不能写错行）。DOM 的 `__data__` 就是 `state.data` 的同一批对象（探针 4/4），改它不动 `state.key`（key 含 content hash、不含行号）→ 不会触发重建。判定顺序也要注意：**depth 先于 line**，否则「插入一个子级」会被报成 `why=line`。
 
 ## 解析（domain/syntax）
 
@@ -82,6 +83,7 @@ Obsidian 插件：笔记 → XMind 风格思维导图。当前 1.18.11（`manife
 
 - `npx tsc -noEmit -skipLibCheck` → `npm test`（esbuild + Node，`scripts/testBatch.ts`，T1–T24）→ `node esbuild.config.mjs production`（Windows 沙箱可能 EBUSY）→ `node tmp/smoke.cjs` → 部署到 `D:/BJRepository/2. 知识星球/.obsidian/plugins/obmind` 比 sha1。
 - 埋点规矩：**每个可能出问题的分支都要有数字**。`obs.structural` 带 `jump`(px)/`dt`(距 rebuild.end)；`render.enter` 记每一次重排（有 transform 写入却没有对应 `render.enter` → 来自更早创建的过渡，查 `tr.create`）；`paint.lag` + `f.traj` 逐帧量化「DOM 落后布局」；`obs.fade` 只报 opacity 真变了的。假证据比没证据更浪费时间。
+- **埋点 1.18.12 起全部停用**：业务侧 60 处 `traceLog`/`traceLogEvery` 与 `startTrajTrace`/`scheduleDrift` 的采样体都注释掉了（`src/render/trace.ts` 与命令面板开关保留）。要重新排查就在原处解开注释 —— 别另起一套。
 - 浏览器行为用 **Python Playwright + `channel="msedge"`**（`D:/Program Files/Python314/python.exe`）；`--virtual-time-budget` 下 rAF 不推进。探针在 `tmp/*.ts|py`：`lagProbe`（落位滞后）、`paintProbe`（writes 成本）、`dragProbe`（真鼠标拖动）、`widenProbe`（改字变宽）、`createProbe3`（duration 量化）。
 - 现场探针 `src/render/trace.ts`：三档 off/events/frames，开关存 localStorage `obmind:trace`；`window.obmindTrace` + 两条诊断命令。行格式 `+123.4 f0123 tag k=v`。热路径先 `isTracing()`；`installTraceConsole` **不能幂等**。
 

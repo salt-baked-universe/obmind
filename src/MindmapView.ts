@@ -68,7 +68,7 @@ import { NodeBar } from "./ui/nodeBar";
 import { isTypingTarget } from "./ui/keyGuard";
 import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
-import { explainDiff, planProjection, relabelTree } from "./app/plan";
+import { planProjection, relabelTree } from "./app/plan";
 import {
   buildSvgText,
   exportFileName,
@@ -2205,7 +2205,8 @@ export class MindmapView extends ItemView {
     // });
 
     // 埋点已停用：why 只说「哪一类原因」，原来这里把「具体哪几个节点、行号/文字
-    // 怎么变的」也写进 refresh.diff。要恢复诊断把下面三行解开即可。
+    // 怎么变的」也写进 refresh.diff。要恢复诊断：解开下面三行，并把 explainDiff
+    // 加回文件头的 import。
     // if (isTracing() && plan.kind === "structure" && prev) {
     //   for (const detail of explainDiff(prev.tree, tree, 4)) traceLog("refresh.diff", { detail });
     // }
