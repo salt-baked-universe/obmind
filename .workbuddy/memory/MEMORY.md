@@ -36,7 +36,7 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 21. **callout 是容器**：`> [!note] 标题` 自成节点，正文剥一层 `>` 当虚拟行继续分层；无标题用正文首行顶上（`promoted` 层级上移一层）。`v.orig/v.off` 换回原文坐标。
 22. 回写先校验锚点行原文，宁可失败不能错位；跨多行加 `Span.checkEnd`。`applyOp` 顺带返回新全文，别再读文件。
 23. 回写/移动保留引用前缀（`quoteOf`/`markOf`/`splitLine`）；进出 callout 用 `rebaseQuote` 换整块前缀。callout 标题的「同级」在引用外、`mark` 不沿用 `[!note] `；其子级不能再缩进。
-24. 插入块插在**宿主行之后**：代理行缩一层（`src.indent + step`）+ 围栏**顶格**，callout 内每行带 `>`。新建节点插在子树末尾（`subtreeEndOf`，块的子树＝自身到 `blockEnd`）。`insertBlock` 自带代理行；拖裸块由 `moveNode` 自动补代理行升级 free（`frozenIn` 只冻块体）。
+24. 插入块插在**宿主行之后**。**围栏类块（代码/公式）一律顶格**，代理行单独缩进一层 —— 早先让围栏对齐「列表内容列」，浅层没事，深列表（11 层 tab）算出 42 列而内容列在 46，既不在列表项里又超过 3 格 → Obsidian 当缩进代码块，` ```python ` 原样露出来（1.18.14 修）。引用 / 表格不是围栏，仍对齐列表内容列，留在列表项里更整齐。callout 内每行带 `>`。新建节点插在子树末尾（`subtreeEndOf`，块的子树＝自身到 `blockEnd`）。`insertBlock` 自带代理行与语言（`sanitizeLang` 只留 `[A-Za-z0-9#+._-]`，记住上次语言存 localStorage `obmind:code-lang`，选择器是 `ui/codeLang.ts` 的 `FuzzySuggestModal`，清单外可自敲）；拖裸块由 `moveNode` 自动补代理行升级 free（`frozenIn` 只冻块体）。
 25. GFM 表格要「头行含 `|` + 分隔行 + 分隔行自身含 `|`」；列表下缩进表格先 dedent。
 
 ## 交互

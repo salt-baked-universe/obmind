@@ -786,6 +786,41 @@ console.log("\n=== T20: 操作栏插入块（自动带代理行 / 列表项 / ca
   assert(round.depth === 3, "层级正确：块的父节点就是「子」（子节点再深一层）");
 }
 
+console.log("\n=== T20b: 深列表里的代码块必须顶格（围栏不能跟列表内容列走） ===");
+{
+  // 实测坏过的形状：笔记里 11 层 tab 的提纲，围栏若对齐列表内容列会到 46 列，
+  // 而 blockIndent 算出来只有 42 列 —— 既不在列表项里、又超过 3 格，
+  // Obsidian 当成缩进代码块，用户看到的就是 ```python 原样露出来。
+  const deep = ["\t\t- 父", "\t\t\t- 子"].join("\n");
+  const d = parse(deep);
+  const di = d.nodes.find((n) => n.text === "子")!;
+  const dp = insertBlockPlan({ src: di, step: 4, unit: "\t", lang: "python" }, "code");
+  assert(dp.lines[1] === "```python", "深列表里围栏照样顶格（42 列就会变字面量）");
+  assert(dp.lines[1].startsWith("```"), "围栏前面一个空白都没有");
+  assert(dp.lines[0].trim() === "<!-- obmind:block -->", "层级由代理行承担");
+  assert(dp.lines[0].startsWith("\t\t\t"), "代理行比宿主还深一层");
+  assert(dp.lines[3] === "```", "收尾围栏同样顶格");
+
+  // 语言标识：合法字符原样写进 info string，非法字符丢掉
+  const py = insertBlockPlan({ src: zi2(), step: 2, lang: "python" }, "code");
+  assert(py.lines[1] === "```python", "选了语言就直接写进围栏");
+  const bad = insertBlockPlan({ src: zi2(), step: 2, lang: "py thon`" }, "code");
+  assert(bad.lines[1] === "```python", "语言里的空白与反引号被清掉");
+  const empty = insertBlockPlan({ src: zi2(), step: 2, lang: "" }, "code");
+  assert(empty.lines[1] === "```", "不选语言就是裸围栏");
+
+  // 引用 / 表格不是围栏，留在列表项里更整齐（不受第 4 格限制）
+  const lq = insertBlockPlan({ src: li2(), step: 2 }, "quote");
+  assert(lq.lines[1] === "    > ", "引用仍对齐列表内容列");
+
+  function zi2() {
+    return parse(["父", "  子"].join("\n")).nodes.find((n) => n.text === "子")!;
+  }
+  function li2() {
+    return parse(["- 父", "  - 子"].join("\n")).nodes.find((n) => n.text === "子")!;
+  }
+}
+
 // ---------------------------------------------------------------------------
 console.log("\n=== T21: callout 是容器（标题成节点，正文按内部缩进变成子节点） ===");
 {

@@ -36,6 +36,7 @@ import { firstChildRef, stepVisible, visibleLeafRefs } from "./domain/nav";
 import type { NavNode } from "./domain/nav";
 import { parseEditorValue } from "./edit/text";
 import type { BlockKind } from "./edit/block";
+import { CodeLangModal, lastCodeLang, rememberCodeLang } from "./ui/codeLang";
 import { openInlineEditor } from "./edit/inlineText";
 import type { EditorAction, InlineEditorHandle } from "./edit/inlineText";
 import { applyOp, findEditor } from "./edit/writer";
@@ -95,6 +96,7 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["Tab / Enter", "新建子级 / 新建同级"],
   ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
   ["插入块", "在选中节点下面加代码块 / 引用 / 表格，按 Obsidian 原生方式渲染，成为独立节点"],
+  ["插入代码块", "菜单里直接给「代码块 · 上次用的语言」，换语言走「代码块（换语言）…」（可自己敲）"],
   ["块的位置", "块是一张独立卡片（只读）：双击不进编辑，选中后可以删除、可以拖到别处"],
   ["让块能拖", "在块上面加一行 <!-- obmind:block -->（插件插入的块会自动带）"],
   ["Callout", "`> [!note] 标题` 当容器：标题成节点，正文按 `>` 后的缩进挂在它下面"],
@@ -3889,28 +3891,54 @@ export class MindmapView extends ItemView {
     if (!rect || rect.width < 1) return;
 
     const menu = new Menu();
-    const add = (title: string, icon: string, kind: BlockKind): void => {
+    const add = (title: string, icon: string, kind: BlockKind, lang?: string): void => {
       menu.addItem((item) =>
         item
           .setTitle(title)
           .setIcon(icon)
-          .onClick(() => this.insertBlock(kind)),
+          .onClick(() => this.insertBlock(kind, lang)),
       );
     };
-    add("代码块", "code", "code");
+    // 记住上次的语言：绝大多数人一段笔记里只写一种语言，这里一键就够
+    const lang: string = lastCodeLang();
+    add(`代码块 · ${lang}`, "code", "code", lang);
+    menu.addItem((item) =>
+      item
+        .setTitle("代码块（换语言）…")
+        .setIcon("languages")
+        .onClick(() => this.pickCodeLang()),
+    );
     add("引用", "quote", "quote");
     add("表格", "table", "table");
     menu.showAtPosition({ x: rect.left, y: rect.bottom + 4, width: rect.width });
   }
 
   /**
-   * 在选中节点下面插入一个块。
+   * 选一个代码块语言再插入：菜单里「换语言」走这条路。
    *
-   * 块是这个节点的**内容**（卡片里多一行），不是子节点 —— 见 types.ts 的 BlockInfo。
-   * 写完不动选中框：块不是节点，没有行可以选，而且用户多半接着操作同一个节点。
+   * 行号先抓在手里：弹 Modal 会让画布失焦，选中集可能被清掉，
+   * 等用户选完语言再去读 selectedLine 就是 -1 了。
    */
-  private insertBlock(kind: BlockKind): void {
+  private pickCodeLang(): void {
     const line: number = this.selectedLine;
+    if (line < 0) return;
+    new CodeLangModal(this.app, (lang: string) => {
+      rememberCodeLang(lang);
+      this.insertBlockAt(line, "code", lang);
+    }).open();
+  }
+
+  private insertBlock(kind: BlockKind, lang?: string): void {
+    this.insertBlockAt(this.selectedLine, kind, lang);
+  }
+
+  /**
+   * 在指定节点下面插入一个块。
+   *
+   * 块是**宿主的子节点**（独立节点、只读），不是卡片里多一行 —— 见 types.ts 的 BlockInfo。
+   * 写完不动选中框：用户多半接着操作同一个节点。
+   */
+  private insertBlockAt(line: number, kind: BlockKind, lang?: string): void {
     if (line < 0) {
       new Notice("obmind：先选中一个节点");
       return;
@@ -3924,7 +3952,7 @@ export class MindmapView extends ItemView {
       new Notice("obmind：块是只读叶子，不能在它下面再插块");
       return;
     }
-    const out = this.editSvc.insertBlock({ snap, line, kind });
+    const out = this.editSvc.insertBlock({ snap, line, kind, lang });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
       return;

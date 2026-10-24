@@ -109,6 +109,8 @@ export interface InsertBlockInput {
   /** 把块挂到哪个节点上（宿主行号） */
   line: number;
   kind: BlockKind;
+  /** 代码块的语言标识（python / js / …）；引用与表格忽略 */
+  lang?: string;
 }
 
 export class EditService {
@@ -379,7 +381,7 @@ export class EditService {
     if (src.blockNode) return error("块是只读叶子，不能在里面再插块");
 
     const plan = insertBlockPlan(
-      { src, step: input.snap.step, unit: input.snap.unit },
+      { src, step: input.snap.step, unit: input.snap.unit, lang: input.lang },
       input.kind,
     );
     const lines: string[] = input.snap.content.split("\n");
