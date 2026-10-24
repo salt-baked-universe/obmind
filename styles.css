@@ -623,12 +623,31 @@
   text-align: center;
 }
 
-/* 块节点在渲染完成前（或渲染失败时）的占位：至少能看出这里有个代码块 / 公式，
-   而不是整块凭空消失。 */
-.obmind-canvas .obmind-block {
-  color: var(--text-faint);
-  font-size: 12px;
-  font-style: italic;
+/* 块（代码 / 引用 / 表格 / 公式）在卡片里只占一行。
+   为什么只有一行：一张两百行的代码卡会把整张图的布局比例拉垮 ——
+   markmap 是按内容尺寸算节点间距的，块越大全图越稀。
+   全文在笔记里，悬停给出前几行（title 属性）。
+   块不是节点：它挂在宿主节点上，选中、拖动的都是宿主本身。 */
+.obmind-canvas .obmind-block-pill {
+  display: block;
+  margin-top: 4px;
+  padding: 1px 7px 2px;
+  border-radius: 5px;
+  border-left: 2px solid var(--interactive-accent, #4a7dff);
+  background: var(--background-secondary, rgba(127, 127, 127, 0.12));
+  color: var(--text-muted, #888);
+  font-size: 11.5px;
+  font-style: normal;
+  line-height: 1.55;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  cursor: default;
+}
+.obmind-canvas .obmind-block-pill[data-kind="quote"] {
+  border-left-color: var(--color-purple, #a05fbf);
+}
+.obmind-canvas .obmind-block-pill[data-kind="table"] {
+  border-left-color: var(--color-cyan, #2aa198);
 }
 
 /* 原地编辑框。
@@ -653,10 +672,12 @@
 }
 
 /* 拖动改变父子关系的视觉反馈。
-   拖拽中的源节点淡出，跟随鼠标显示「落点」：
-   落在卡片中部 = 变成子节点（描边框），落在上下沿 = 排到前后（横线）。 */
+   拖动的那一整块（根 + 全部后代，1.18.4 起整块平移）一起带这个 class：
+   块跟着鼠标走，原位不再有残影，所以只轻微减淡表示「还没落定」。
+   父节点原有的落点提示保留：落在卡片中部 = 变成子节点（描边框），
+   落在上下沿 = 排到前后（横线）。 */
 .obmind-canvas .markmap-node.obmind-dragging {
-  opacity: 0.32;
+  opacity: 0.86;
 }
 
 .obmind-drop-layer {

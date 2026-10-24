@@ -6,7 +6,10 @@ import { buildTree } from "../src/domain/syntax";
 import { collectSrc } from "../src/edit/move";
 import { moveNode, moveNodes } from "../src/edit/move";
 import { blockRange } from "../src/edit/move";
+import { subtreeEndOf } from "../src/edit/create";
+import { insertBlockPlan } from "../src/edit/block";
 import { EditService } from "../src/app/EditService";
+import { planProjection } from "../src/app/plan";
 import { nodeBarPosition } from "../src/ui/nodeBarPosition";
 import { formatStats, treeStats } from "../src/domain/stats";
 import {
@@ -589,6 +592,271 @@ console.log("\n=== T17: 节点 → 新笔记（命名 / 文件夹 / 模板） ==
   );
   assert(linkLiteral("重点", "重点") === "[[重点]]", "别名与标题相同则不写别名");
   assert(linkLiteral("重点", "a|b") === "[[重点|ab]]", "别名里的 | 会截断链接，去掉");
+}
+
+
+// ---------------------------------------------------------------------------
+console.log("\n=== T18: 块依附（代码 / 引用 / 表格 归前一个节点，不是子节点） ===");
+{
+  // 用户的真实写法：纯正文、块顶格。以前这里块会变成「父节点」的兄弟，
+  // 还把后面那个缩进节点吞成自己的孩子。
+  const content = [
+    "父节点",
+    "  子节点",
+    "```python",
+    "print(1)",
+    "```",
+    "  下一个子节点",
+  ].join("\n");
+  const { nodes } = parse(content);
+  const tree = buildTree(content, "test.md", { render: (s) => s });
+
+  assert(nodes.length === 3, "块不再是树节点（只有 父 / 子 / 下一个）");
+  const zi = nodes.find((n) => n.text === "子节点")!;
+  assert(zi.blockStart === 2 && zi.blockEnd === 4, "块的行区间记在宿主节点的 src 上");
+  assert(zi.endLine === 1, "endLine 只算软换行，不把块算成节点正文");
+  const next = nodes.find((n) => n.text === "下一个子节点")!;
+  assert(next.depth === 2, "后面紧跟的缩进节点没被块吞掉");
+  type N = { content: string; children?: N[] };
+  const root = tree as unknown as N;
+  const host = root.children?.[0]?.children?.[0];
+  assert(!!host && host.content.includes("obmind-block-pill"), "块在宿主卡片里是一行 pill");
+  assert(nodes.length === 3 && !nodes.some((n) => n.text.startsWith("代码块")), "卡片外不再多出一个「代码块」节点");
+
+  // 引用：连续多行合成一个块
+  const q = parse(["父", "  子", "> 第一行", "> 第二行", "  下一个"].join("\n"));
+  const qz = q.nodes.find((n) => n.text === "子")!;
+  assert(qz.blockStart === 2 && qz.blockEnd === 3, "连续引用合成一个块");
+  assert(q.nodes.find((n) => n.text === "下一个")!.depth === 2, "引用没把后一个节点吞掉");
+  assert(!q.nodes.some((n) => n.text === "第一行"), "引用内部不再一行一个节点");
+
+  // 表格
+  const t = parse(["父", "  子", "| a | b |", "|---|---|", "| 1 | 2 |", "  下一个"].join("\n"));
+  const tz = t.nodes.find((n) => n.text === "子")!;
+  assert(tz.blockStart === 2 && tz.blockEnd === 4, "表格归前一个节点");
+  assert(t.nodes.find((n) => n.text === "下一个")!.depth === 2, "表格没把后一个节点吞掉");
+
+  // 文首块：前面没有节点 → 挂根
+  const top = buildTree("```txt\n图\n```\n说明", "测试.md", { render: (s) => s });
+  const topRoot = top as unknown as { content: string; payload?: { blocks?: unknown[] } };
+  assert((topRoot.payload?.blocks ?? []).length === 1, "文首的块挂到根节点");
+  assert(topRoot.content.includes("obmind-block-pill"), "根卡片里也有那一行");
+}
+
+console.log("\n=== T19: 移动 / 删除 / 新建都把块算进节点地盘 ===");
+{
+  const content = ["父", "  A", "  B", "```js", "run()", "```"].join("\n");
+  const { nodes, step, unit } = parse(content);
+
+  const bi = nodes.findIndex((n) => n.text === "B");
+  assert(blockRange(nodes, bi).end === 5, "blockRange 的尾巴延伸到块末行");
+  assert(subtreeEndOf(nodes[bi], nodes) === 5, "subtreeEndOf 也算上块");
+
+  // 把 B（带着它的代码块）拖到 A 前面：块行必须原样跟着走
+  const res = moveNode({
+    lines: content.split("\n"),
+    nodes,
+    step,
+    unit,
+    srcLine: nodes[bi].line,
+    targetLine: nodes.find((n) => n.text === "A")!.line,
+    mode: "before",
+  });
+  assert(res.ok, "带块的节点可以移动");
+  if (res.ok) {
+    const out = res.lines;
+    const fenceAt = out.indexOf("```js");
+    assert(fenceAt > 0, "块跟着节点一起搬走了");
+    assert(out[fenceAt + 1] === "run()", "代码内容原样保留");
+    assert(out[fenceAt - 1].trim() === "B", "块紧跟在宿主节点后面");
+    assert(out.indexOf("  A") > fenceAt, "A 被挪到块之后");
+  }
+
+  // 删 B 要把它的块一起删掉，不能留下孤儿代码
+  const svc = new EditService();
+  const snap = { content, nodes, step, unit };
+  const del = svc.removeGroup({ snap, lines: [nodes[bi].line] });
+  assert(del.kind === "write", "删除产出写入计划");
+  if (del.kind === "write") {
+    const out = applySpan(content, del.op);
+    assert(!out.includes("run()"), "代码块跟着节点一起删掉了");
+    assert(out.includes("  A"), "兄弟节点还在");
+  }
+}
+
+console.log("\n=== T20: 操作栏插入块（顶格 / 列表项缩进 / 位置） ===");
+{
+  const plain = parse(["父", "  子", "  兄弟"].join("\n"));
+  const zi = plain.nodes.find((n) => n.text === "子")!;
+  const plan = insertBlockPlan({ src: zi }, "code");
+  assert(plan.insertAfterLine === 1, "插在节点自己那行之后、子节点之前");
+  assert(plan.lines[0] === "```", "正文体系里块顶格（缩进 4 格会退化成缩进代码块）");
+  assert(plan.lines.length === 3, "代码块空壳是三行");
+
+  const list = parse(["- 父", "  - 子"].join("\n"));
+  const li = list.nodes.find((n) => n.text === "子")!;
+  const lp = insertBlockPlan({ src: li }, "quote");
+  assert(lp.lines[0] === "    > ", "列表项里的块缩进到标记之后（否则跳出列表）");
+
+  const table = insertBlockPlan({ src: zi }, "table");
+  assert(table.lines[0].startsWith("| ") && table.lines[1].includes("---"), "表格给了表头与分隔行");
+
+  // 软换行节点：插在续行之后，别把节点自己的几行劈开
+  const multi = parse(["父", "  子", "    续行", "  兄弟"].join("\n"));
+  const mi = multi.nodes.find((n) => n.text.startsWith("子"))!;
+  const mp = insertBlockPlan({ src: mi }, "code");
+  assert(mp.insertAfterLine === mi.endLine, "插在软换行末尾之后");
+  // callout 里的节点：块必须带 `>` 前缀，否则会掉到引用外面
+  const callout = parse(["> [!tip] 示例", "> 先看这段", "> 后面还有"].join("\n"));
+  const cl = callout.nodes.find((n) => n.text === "先看这段")!;
+  const cp = insertBlockPlan({ src: cl }, "code");
+  assert(cp.lines[0] === "> ```", "callout 里的代码块保留 `>` 前缀");
+  assert(cp.lines[1] === ">", "块内空行也要写成 `>`（否则 callout 被截断）");
+  assert(cp.insertAfterLine === cl.line, "插在宿主行之后");
+
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n=== T21: callout 是容器（标题成节点，正文按内部缩进变成子节点） ===");
+{
+  const content = [
+    "> [!NOTE] 工作情况介绍",
+    "> 面试官你好",
+    "> \t1. 子项",
+    "> 顺带一句",
+    "",
+    "后面的正文",
+  ].join("\n");
+  const { nodes } = parse(content);
+
+  const title = nodes.find((n) => n.text === "工作情况介绍");
+  assert(!!title, "callout 有标题时，标题就是节点文字");
+  assert(title!.depth === 1, "标题落在外层缩进算出的深度上");
+  assert(nodes.find((n) => n.text === "面试官你好")!.depth === 2, "正文是标题的子节点");
+  assert(nodes.find((n) => n.text === "子项")!.depth === 3, "callout 内部的缩进继续分层");
+  assert(nodes.find((n) => n.text === "顺带一句")!.depth === 2, "内部缩进退回 0 后回到标题的下一层");
+  assert(nodes.find((n) => n.text === "后面的正文")!.depth === 1, "callout 结束后的正文回到同一层，没被吞");
+
+  // 回写坐标必须指回原行里的正文（`> ` 前缀不能被算进 bodyStart）
+  const body = nodes.find((n) => n.text === "面试官你好")!;
+  assert(body.full.startsWith("> "), "src.full 保留原文的引用前缀");
+  assert(body.full.slice(body.bodyStart, body.bodyEnd) === "面试官你好", "bodyStart/bodyEnd 定位到原文正文");
+  const svc = new EditService();
+  const snap = { content, nodes, step: 2, unit: "" };
+  const op = svc.commit({ snap, src: body, action: "commit", value: "改好了" });
+  assert(op.kind === "write", "callout 里的节点可以正常回写");
+  if (op.kind === "write") {
+    const out = applySpan(content, op.op);
+    assert(out.split("\n")[1] === "> 改好了", "只改正文，`> ` 前缀保留");
+  }
+
+  // 没写标题的 callout：正文第一行顶上，并且不会重复出现在子节点里
+  const noTitle = parse(["> [!abstract]", "> 1. 先滚动", "> \t1. 后摘要", "> 2. 可观测"].join("\n"));
+  const first = noTitle.nodes[0];
+  assert(first.text === "先滚动", "无标题时取正文第一行当标题（列表标记照常剥掉）");
+  assert(noTitle.nodes.filter((n) => n.text === "先滚动").length === 1, "被顶上来的那行不再重复成子节点");
+  assert(noTitle.nodes.find((n) => n.text === "后摘要")!.depth === first.depth + 1, "内部缩进仍然生效");
+  assert(noTitle.nodes.find((n) => n.text === "可观测")!.depth === first.depth, "同级项与顶上来的标题并列，不多套一层");
+}
+
+console.log("\n=== T22: callout 里的代码块照常识别，块仍归上一行 ===");
+{
+  const content = [
+    "> [!tip] 示例",
+    "> 先看代码",
+    "> ```python",
+    "> print(1)",
+    "> ```",
+    "> 再看结论",
+  ].join("\n");
+  const { nodes } = parse(content);
+  assert(nodes.length === 3, "callout 里不出现分行的块节点");
+  const code = nodes.find((n) => n.text === "先看代码")!;
+  assert(code.blockStart === 2 && code.blockEnd === 4, "代码块挂在 callout 内的前一行上");
+  assert(code.depth === 2, "块不影响缩进层级");
+}
+
+
+console.log("\n=== T23: callout 里的新建 / 拖动不会破坏引用结构 ===");
+{
+  const content = ["> [!NOTE] 标题", "> 一", "> 二", "", "外面"].join("\n");
+  const { nodes, step, unit } = parse(content);
+  const svc = new EditService();
+  const snap = { content, nodes, step, unit };
+  const head = nodes.find((n) => n.text === "标题")!;
+  const second = nodes.find((n) => n.text === "二")!;
+
+  // 同级：留在 callout 里，必须带 `>` 前缀
+  const sib = svc.commit({ snap, src: second, action: "sibling", value: "X" });
+  assert(sib.kind === "write", "callout 里能新建同级");
+  if (sib.kind === "write") {
+    const out = applySpan(content, sib.op).split("\n");
+    // commit 会先把当前行改成新值，再插入一行占位节点
+    assert(out[2] === "> X" && out[3] === "> 新节点", "新同级带 `>` 前缀，没掉到引用外面");
+  }
+
+  // 标题的子级：直接在引用第一层，不再缩进
+  const kid = svc.commit({ snap, src: head, action: "child", value: "X" });
+  assert(kid.kind === "write", "callout 标题能新建子级");
+  if (kid.kind === "write") {
+    const out = applySpan(content, kid.op).split("\n");
+    assert(out[3] === "> 新节点", "子级落在引用第一层（不多缩一层）");
+  }
+
+  // 标题的同级：callout 里面所有行都是它的后代，所以必须到引用外面
+  const top = svc.commit({ snap, src: head, action: "sibling", value: "X" });
+  assert(top.kind === "write", "callout 标题能新建同级");
+  if (top.kind === "write") {
+    const out = applySpan(content, top.op).split("\n");
+    assert(out[3] === "新节点", "同级落到引用外面（不带 `>`）");
+  }
+
+  // 拖动：从引用外拖进 callout，行要补上 `>`
+  const outside = nodes.find((n) => n.text === "外面")!;
+  const into = moveNode({ lines: content.split("\n"), nodes, step, unit, srcLine: outside.line, targetLine: second.line, mode: "before" });
+  assert(into.ok, "外面的节点可以拖进 callout");
+  if (into.ok) {
+    assert(into.lines.includes("> 外面"), "拖进去的那行补上了 `>` 前缀");
+  }
+
+  // 拖动：从 callout 里拖出去，行要去掉 `>`
+  const one = nodes.find((n) => n.text === "一")!;
+  const outMove = moveNode({ lines: content.split("\n"), nodes, step, unit, srcLine: one.line, targetLine: outside.line, mode: "after" });
+  assert(outMove.ok, "callout 里的节点可以拖到外面");
+  if (outMove.ok) {
+    assert(outMove.lines.includes("一"), "拖出去的行走出了引用（不再带 `>`）");
+    assert(!outMove.lines.includes("> 一"), "引用前缀已清掉");
+  }
+}
+
+console.log("\n=== T24: 原地改字（patch）必须带出新的源坐标 ===");
+{
+  // 回归：applyPatch 只换 DOM、不动 markmap 的数据。若判定结果里不带新 src，
+  // 视图就没法把 payload.src 换掉 —— 节点显示新文字、点开编辑却是旧的。
+  // 新建节点后第一次改字必然踩到（那时旧 src 是占位文案「新节点」）。
+  const prevTree = buildTree("a\n- b", "t.md", { render: (s) => s });
+  const nextTree = buildTree("a\n- b 改", "t.md", { render: (s) => s });
+  const plan = planProjection({
+    prev: prevTree,
+    next: nextTree,
+    forceStructure: false,
+    sourceSame: false,
+  });
+  assert(plan.kind === "patch", "只改一处文字走 patch");
+  if (plan.kind === "patch") {
+    assert(plan.line === 1, "patch 的行号指向被改的那一行");
+    assert(plan.src.text === "b 改", "patch 带的是**新**文字（旧的是 b）");
+    assert(plan.src.depth === 1, "带出的 src 层级正确（顶格列表项与正文行同为 1）");
+  }
+
+  // 没变化就是 none，别退化成 patch
+  const same = planProjection({
+    prev: prevTree,
+    next: buildTree("a\n- b", "t.md", { render: (s) => s }),
+    forceStructure: false,
+    sourceSame: true,
+  });
+  assert(same.kind === "none", "原文一样 → none");
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

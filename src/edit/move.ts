@@ -89,16 +89,72 @@ function renderIndent(cols: number, unit: string, step: number): string {
 /**
  * 一个节点在原文里占据的行区间：从它自己那行，到它最后一个后代那行。
  * 中间的空行、代码块都会被一起带走——它们属于这一块内容。
+ *
+ * 注意尾巴不一定落在某个节点行上：块（代码 / 引用 / 表格）**依附**在节点上、
+ * 本身不是节点，所以最后一个子节点的块可能一直延伸到块末行。
+ * 只看 `nodes[i].line` 会把块留在原地 —— 搬走节点之后，那段代码就「依附」
+ * 到别人身上去了（内容还在，但导图里跑到了另一个节点下面）。
  */
 export function blockRange(nodes: SrcRef[], index: number): { start: number; end: number } {
   const start: number = nodes[index].line;
   const depth: number = nodes[index].depth;
-  let end: number = start;
+  let end: number = Math.max(start, nodes[index].blockEnd ?? start);
   for (let i = index + 1; i < nodes.length; i++) {
     if (nodes[i].depth <= depth) break;
-    end = nodes[i].line;
+    end = Math.max(end, nodes[i].line, nodes[i].blockEnd ?? nodes[i].line);
   }
   return { start, end };
+}
+
+/**
+ * 行区间 [start, end] 里哪些行是**块**（相对下标）。
+ *
+ * 搬动一个节点时，块行必须逐字保留：
+ * - 加缩进会改掉代码本身的缩进（Java/Python 代码立刻变形）；
+ * - 一旦缩进到 4 格，围栏块在 CommonMark 里就退化成「缩进代码块」，``` 变字面量。
+ * 块按位置归属，所以原样搬走仍然属于同一个节点，不需要任何重排。
+ */
+function frozenIn(nodes: readonly SrcRef[], start: number, end: number): Set<number> {
+  const out = new Set<number>();
+  for (const n of nodes) {
+    const bs: number | undefined = n.blockStart;
+    const be: number | undefined = n.blockEnd;
+    if (bs === undefined || be === undefined) continue;
+    if (be < start || bs > end) continue;
+    const from: number = Math.max(start, bs);
+    const to: number = Math.min(end, be);
+    for (let l = from; l <= to; l++) out.add(l - start);
+  }
+  return out;
+}
+
+/** 这一行的引用前缀（`> ` / `  > `），move 系列要用它把整块搬进/搬出 callout */
+function quoteOf(src: SrcRef): string {
+  const m: RegExpExecArray | null = QUOTE_PREFIX.exec(src.full);
+  return m ? m[0] : "";
+}
+
+/**
+ * 目标位置该用什么引用前缀。
+ *
+ * - 拖到 callout 里的行上：沿用那一层的 `>`（否则块会掉到引用外面）；
+ * - 拖到 callout 的**标题**上：`child` 是进到 callout 里面（保留 `>`），
+ *   而 before / after 是「跟这个 callout 平级」，必须到引用外面（清空 `>`）。
+ */
+function targetQuoteFor(tgt: SrcRef, mode: DropMode): string {
+  const head: boolean = /^[ \t]*>[ \t]?\[!/.test(tgt.full);
+  if (head && mode !== "child") return "";
+  return quoteOf(tgt);
+}
+
+/** 把整块行的引用前缀统一换成目标位置的前缀（缩进、标记、块内容都原样保留） */
+function rebaseQuote(block: string[], to: string): string[] {
+  return block.map((line: string) => {
+    if (line.trim() === "") return line;
+    const { quote, ws, body } = splitLine(line);
+    if (quote === to) return line;
+    return to + ws + body;
+  });
 }
 
 /** 把一块行整体平移缩进；delta 为 0 的行原样保留（不动原文写法） */
@@ -107,11 +163,14 @@ function shiftBlock(
   delta: number,
   unit: string,
   step: number,
+  frozen?: Set<number>,
 ): string[] {
   if (delta === 0) return block.slice();
 
-  return block.map((line: string): string => {
+  return block.map((line: string, i: number): string => {
     if (line.trim() === "") return line;
+    // 块（代码 / 引用 / 表格）是内容，不是结构：一个字符都不动
+    if (frozen?.has(i)) return line;
     const { quote, ws, body } = splitLine(line);
     const cols: number = colsOfIndent(ws);
     const next: number = Math.max(0, cols + delta);
@@ -120,13 +179,24 @@ function shiftBlock(
   });
 }
 
-/** 标题块只改 `#` 数量，正文子行不动（它们的深度由标题栈自动跟随） */
-function rewriteHeadingBlock(block: string[], fromBase: number, toBase: number): string[] {
+/**
+ * 标题块只改 `#` 数量，正文子行不动（它们的深度由标题栈自动跟随）。
+ *
+ * 块行同样不动：shell / yaml 里的 `# 注释` 也会命中标题正则，
+ * 跟着改级数就把代码改坏了。
+ */
+function rewriteHeadingBlock(
+  block: string[],
+  fromBase: number,
+  toBase: number,
+  frozen?: Set<number>,
+): string[] {
   const delta: number = toBase - fromBase;
   if (delta === 0) return block.slice();
 
-  return block.map((line: string): string => {
+  return block.map((line: string, i: number): string => {
     if (line.trim() === "") return line;
+    if (frozen?.has(i)) return line;
     const m: RegExpExecArray | null = HEADING_RE.exec(line);
     if (!m) return line;
     const level: number = Math.min(6, Math.max(1, m[1].length + delta));
@@ -185,13 +255,17 @@ export function moveNode(input: MoveInput): MoveResult {
 
   const block: string[] = lines.slice(srcBlock.start, srcBlock.end + 1);
   if (block.length === 0) return { ok: false, reason: "空节点" };
+  /** 块行原样搬（不加缩进、不改 `#` 级数） */
+  const frozen: Set<number> = frozenIn(nodes, srcBlock.start, srcBlock.end);
 
   // 插入位置：before 插在目标行之前；after 插在目标整块之后。
   // child 拖到标题上时插在标题行的正下方（成为第一个子节点）——
   // 若插到整块末尾，会落到该标题最后一个小节的后面，深度就比预期深一层。
+  // 「正下方」要跳过标题自己依附的块，否则新节点会插在块前面，
+  // 而块归「前一个节点」—— 于是块就改挂在刚插进来的新节点上了。
   const insertAfterHeading: boolean = mode === "child" && tgt.heading;
   const rawInsertAt: number = insertAfterHeading
-    ? tgt.line + 1
+    ? Math.min((tgt.blockEnd ?? tgt.line) + 1, lines.length)
     : mode === "before"
       ? tgt.line
       : Math.min(tgtBlock.end + 1, lines.length);
@@ -204,7 +278,7 @@ export function moveNode(input: MoveInput): MoveResult {
     const tgtLevel: number = tgt.level ?? 1;
     const newLevel: number = mode === "child" ? tgtLevel + 1 : tgtLevel;
     if (newLevel > 6) return { ok: false, reason: "标题层级超过 6 级了" };
-    rewritten = rewriteHeadingBlock(block, srcLevel, newLevel);
+    rewritten = rewriteHeadingBlock(block, srcLevel, newLevel, frozen);
   } else {
     const srcCols: number = colsOf(src.full);
     const tgtCols: number = colsOf(tgt.full);
@@ -219,8 +293,9 @@ export function moveNode(input: MoveInput): MoveResult {
       newCols = tgtCols; // 变成目标的兄弟：缩进与目标一致
     }
 
-    rewritten = shiftBlock(block, newCols - srcCols, unit, step);
+    rewritten = shiftBlock(block, newCols - srcCols, unit, step, frozen);
   }
+  rewritten = rebaseQuote(rewritten, targetQuoteFor(tgt, mode));
 
   // 先删后插，注意插入点落在被删区间之后时要前移
   const rest: string[] = lines.slice(0, srcBlock.start).concat(lines.slice(srcBlock.end + 1));
@@ -307,7 +382,7 @@ export function moveNodes(input: MoveGroupInput): MoveResult {
   // 插入点：和 moveNode 同一套算法
   const insertAfterHeading: boolean = mode === "child" && tgt.heading;
   const rawInsertAt: number = insertAfterHeading
-    ? tgt.line + 1
+    ? Math.min((tgt.blockEnd ?? tgt.line) + 1, lines.length)
     : mode === "before"
       ? tgt.line
       : Math.min(tgtBlock.end + 1, lines.length);
@@ -316,12 +391,13 @@ export function moveNodes(input: MoveGroupInput): MoveResult {
   const extracted: Array<{ block: string[]; bad?: string }> = blocks.map((b) => {
     const src: SrcRef = nodes[b.idx];
     const block: string[] = lines.slice(b.start, b.end + 1);
+    const frozen: Set<number> = frozenIn(nodes, b.start, b.end);
     if (src.heading) {
       const srcLevel: number = src.level ?? 1;
       const tgtLevel: number = tgt.level ?? 1;
       const newLevel: number = mode === "child" ? tgtLevel + 1 : tgtLevel;
       if (newLevel > 6) return { block, bad: "标题层级超过 6 级了" };
-      return { block: rewriteHeadingBlock(block, srcLevel, newLevel) };
+      return { block: rewriteHeadingBlock(block, srcLevel, newLevel, frozen) };
     }
     const srcCols: number = colsOf(src.full);
     const tgtCols: number = colsOf(tgt.full);
@@ -334,7 +410,7 @@ export function moveNodes(input: MoveGroupInput): MoveResult {
     } else {
       newCols = tgtCols; // 变成目标的兄弟：缩进与目标一致
     }
-    return { block: shiftBlock(block, newCols - srcCols, unit, step) };
+    return { block: shiftBlock(block, newCols - srcCols, unit, step, frozen) };
   });
   for (const e of extracted) {
     if (e.bad) return { ok: false, reason: e.bad };
@@ -353,7 +429,10 @@ export function moveNodes(input: MoveGroupInput): MoveResult {
   let insertAt: number = rawInsertAt - before;
   if (insertAt < 0) insertAt = 0;
 
-  const rewritten: string[] = extracted.map((e) => e.block).flat();
+  const quote: string = targetQuoteFor(tgt, mode);
+  const rewritten: string[] = extracted
+    .map((e) => rebaseQuote(e.block, quote))
+    .flat();
   rest.splice(insertAt, 0, ...rewritten);
 
   if (rest.join("\n") === lines.join("\n")) {

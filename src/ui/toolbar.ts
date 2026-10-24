@@ -34,6 +34,7 @@ export type ToolbarActionId =
   | "outdent"
   | "delete"
   | "newNote"
+  | "block"
   | "help";
 
 export interface ToolbarButton {
@@ -98,6 +99,8 @@ export function createIconButton(
   onAction: (id: ToolbarActionId) => void,
 ): HTMLButtonElement {
   const btn = parent.createEl("button", { cls: "clickable-icon" });
+  // 记下动作名：菜单类按钮要把菜单弹在自己下方，调用方靠这个找锚点
+  btn.dataset.action = spec.id;
   setIcon(btn, spec.icon);
   if (btn.childElementCount === 0 && (btn.textContent ?? "").trim() === "" && spec.fallback) {
     btn.setText(spec.fallback);
@@ -210,6 +213,10 @@ export const NODE_GROUPS: readonly ToolbarGroup[] = [
       // 「建笔记」紧跟着两个「建节点」：用户心里它们是同一类动作（从这一行长出东西），
       // 只是长出来的是节点还是一篇笔记。它只在节点还没有双链时出现（见 syncToolbar）。
       { id: "newNote", icon: "file-plus", label: "新建笔记并双链", key: "Ctrl+N", fallback: "记" },
+      // 「插入块」也是从这一行长出来的东西，但它有三种（代码 / 引用 / 表格），
+      // 所以按钮点开的是一个小菜单，而不是再排三个图标 —— 浮动条只有一行宽，
+      // 窄侧栏里多三个图标就会溢出画布。
+      { id: "block", icon: "brackets", label: "插入内容块（代码 / 引用 / 表格）", fallback: "块" },
       { id: "edit", icon: "pencil", label: "编辑节点", key: "F2 / 双击", fallback: "改" },
       { id: "outdent", icon: "corner-up-left", label: "提升一级", key: "Shift+Tab", fallback: "提" },
     ],

@@ -16,6 +16,7 @@
 
 import type { ThemeSpec } from "../theme";
 import type { NodePainter } from "./painter";
+import { isTracing, traceLog, traceLogEvery } from "./trace";
 
 export interface FrameSource {
   svg: () => SVGSVGElement | null;
@@ -28,6 +29,8 @@ export class FrameScheduler {
   private frame = 0;
   /** 全量绘制发现「还有节点没长全」时的重试计数，避免无限排帧 */
   private retries = 0;
+  /** 漂移自检排的那一帧（合并，见 scheduleDrift） */
+  private driftFrame = 0;
 
   constructor(
     private readonly painter: NodePainter,
@@ -36,8 +39,16 @@ export class FrameScheduler {
 
   /** 请求一次全量绘制（本帧内多次请求合并成一次） */
   requestAll(): void {
-    if (this.source.blocked()) return;
-    if (this.frame !== 0) return;
+    if (this.source.blocked()) {
+      // 重建期间被挡掉是正常的（DOM 是半成品），重建结束的 paintNow 会补上。
+      // 但若重建已经结束还一直出现这一句，说明 phase 卡在 rebuilding —— 图就不会再更新。
+      traceLog("paint.request.blocked");
+      return;
+    }
+    if (this.frame !== 0) {
+      traceLog("paint.request.merged");
+      return;
+    }
     this.frame = window.requestAnimationFrame(() => {
       this.frame = 0;
       this.paintNow();
@@ -62,6 +73,9 @@ export class FrameScheduler {
     // 最多补 3 次（一帧一次），之后放手：那些节点可能真的是空内容。
     if (pending > 0 && this.retries < 3 && !this.source.blocked()) {
       this.retries++;
+      // 加上这一遍，屏幕上会连着两三帧「卡片还没包上」—— 若日志里 pending 一直不降，
+      // 说明有节点永远量不出几何（空内容 / 尺寸为 0），那才是空白卡片的真凶
+      traceLog("paint.retry", { pending, retries: this.retries });
       this.frame = window.requestAnimationFrame(() => {
         this.frame = 0;
         this.paintNow();
@@ -69,6 +83,7 @@ export class FrameScheduler {
       return;
     }
     this.retries = 0;
+    this.scheduleDrift();
   }
 
   /**
@@ -82,6 +97,42 @@ export class FrameScheduler {
     const spec = this.source.spec();
     if (!spec) return;
     this.painter.paintMoved(els, spec);
+    this.scheduleDrift();
+  }
+
+  /**
+   * 下一帧核对「线有没有跟上节点」。
+   *
+   * 为什么是「下一帧」而不是当场：`paintMoved` 是**同步**补画的（同一帧），
+   * 当场比对必然全对，等于什么都没测。等一帧之后，浏览器已经把这一帧画出去了，
+   * 此时 DOM 里的 `d` 就是用户看到的那根线 —— 它和按当前几何重算出来的
+   * 差多少，就是屏幕上真实存在的偏差。
+   *
+   * 只在开日志时排：一次自检要对全部节点读属性，热路径上不能常开。
+   */
+  private scheduleDrift(): void {
+    if (!isTracing()) return;
+    if (this.driftFrame !== 0) return;
+    this.driftFrame = window.requestAnimationFrame(() => {
+      this.driftFrame = 0;
+      const svg = this.source.svg();
+      if (!svg || this.source.blocked()) return;
+      const rep = this.painter.measureDrift(svg);
+      // max>1 才出声：亚像素的舍入差是 round2 带来的，不算飘。
+      // 200ms 限流：折叠动画里每帧都会有一条，全记会把有用的事件冲掉。
+      // hidden>0 单独报：那是「线被摘掉没还回去」，偏差计算看不出来（d 可能还是对的）。
+      if (rep.max > 1 || rep.hidden > 0) {
+        traceLogEvery("drift", 200, "link.drift", {
+          n: rep.checked,
+          max: Math.round(rep.max),
+          hidden: rep.hidden,
+          shifted: rep.shifted,
+          skip: rep.skipped,
+          frozen: rep.frozen,
+          worst: rep.worst.slice(0, 2).join("|"),
+        });
+      }
+    });
   }
 
   cancel(): void {
@@ -105,6 +156,10 @@ export class FrameScheduler {
   /** 缓存全清（重建后元素引用全部作废） */
   reset(): void {
     this.cancel();
+    if (this.driftFrame !== 0) {
+      window.cancelAnimationFrame(this.driftFrame);
+      this.driftFrame = 0;
+    }
     this.retries = 0;
     this.painter.reset();
   }

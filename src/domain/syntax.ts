@@ -14,8 +14,43 @@ interface RawLine {
   text: string;
   headingLevel: number | null;
   src: SrcRef;
-  /** 非空表示这是一整个块（代码块 / 公式块），不做行内渲染 */
-  block?: BlockInfo;
+  /**
+   * 依附在这一行上的块（代码 / 公式 / 引用 / 表格），按出现顺序。
+   *
+   * 注意它**不是**一个独立的 RawLine：块不参与缩进栈，所以既不会算出深度、
+   * 也不会被当成某个节点的孩子 —— 这正是「块吞掉后面紧跟的节点」那个 bug 的根源。
+   */
+  blocks?: BlockInfo[];
+  /**
+   * 所属 callout 区域编号（-1 / undefined = 不在 callout 里）。
+   *
+   * callout 是**容器**而不是块：`> [!NOTE] 标题` 自己是一个节点，里面每一行都是
+   * 它的后代。原因是用户的问答笔记整篇正文都在 callout 里，收成一个 pill 等于
+   * 把整篇内容藏起来（实测 10 篇核心笔记全中）。
+   */
+  region?: number;
+  /** 本行是某个 callout 的标题时，值是那个 callout 的区域编号 */
+  calloutRoot?: number;
+  /** 标题是从正文第一行顶上来的（区域内的层级要整体上移一层） */
+  promoted?: boolean;
+}
+
+/**
+ * 送给行级解析的「虚拟行」：callout 正文已经剥掉一层 `>`，
+ * 但行号与字符偏移仍指回原文，回写才不会错位。
+ */
+interface VLine {
+  text: string;
+  /** 原文行号 */
+  orig: number;
+  /** text 在原文行里的起始偏移（剥掉的前缀长度） */
+  off: number;
+  /** 所属 callout 区域编号，-1 = 不在 callout 里 */
+  region: number;
+  /** 本行是 callout 标题行时，记下它属于哪个区域 */
+  calloutRoot?: number;
+  /** 标题取自正文第一行（callout 没写标题） */
+  promoted?: boolean;
 }
 
 interface FenceInfo {
@@ -108,9 +143,159 @@ function dedentBlock(text: string, prefix: string): string {
     .join("\n");
 }
 
+/** Obsidian callout 的头部行：`> [!note] 标题`（可缩进，可带 `+` / `-` 折叠标记） */
+const CALLOUT_HEAD = /^([ \t]*)>[ \t]?\[!([A-Za-z-]+)\][+-]?[ \t]*(.*)$/;
+
+/** 去掉一层 `>` 前缀，返回剩余文本与它在原行里的起始偏移 */
+function stripQuote(line: string): { text: string; off: number } {
+  const m: RegExpExecArray | null = /^[ \t]*>[ \t]?/.exec(line);
+  if (!m) return { text: line, off: 0 };
+  return { text: line.slice(m[0].length), off: m[0].length };
+}
+
+/**
+ * 把原文行摊平成「虚拟行」：callout 的 `>` 前缀在这一步剥掉。
+ *
+ * 为什么 callout 要当容器而不是块：
+ * - 用户的问答笔记里整篇正文都写在 `> [!abstract]` 里面，收成一个 pill 等于
+ *   把图的内容全部藏掉（实测 10 篇核心笔记全中）；
+ * - callout 内部本来就常是列表（`> 1. …` / `> \t1. …`），按 `>` 后的相对缩进
+ *   继续分层正是导图想要的结构。
+ *
+ * 剥掉 `>` 之后，里面的行对行级解析器来说就是普通正文（代码块、表格、列表都能
+ * 照常识别），而 `off` 保证回写时仍然落在原行里对了位置。
+ */
+function buildVLines(allLines: string[], from: number): VLine[] {
+  const out: VLine[] = [];
+  let regionSeq = 0;
+
+  for (let i = from; i < allLines.length; i++) {
+    const head: RegExpExecArray | null = CALLOUT_HEAD.exec(allLines[i]);
+    if (!head) {
+      out.push({ text: allLines[i], orig: i, off: 0, region: -1 });
+      continue;
+    }
+
+    // 区域范围 = 紧跟其后连续的 `>` 行。真正的空行会结束引用
+    // （callout 内部的空行在 Markdown 里必须写成 `>`，所以这里不用特判）。
+    let end: number = i;
+    for (let j = i + 1; j < allLines.length; j++) {
+      if (!/^[ \t]*>/.test(allLines[j])) break;
+      end = j;
+    }
+    const region: number = regionSeq++;
+
+    // 标题：优先取 `[!note]` 后面那句话；没写标题就用正文第一行当标题
+    // （`[!abstract]` 后面直接跟正文的写法很常见，否则卡片上只剩 "abstract"）。
+    const titleRaw: string = head[3].replace(/\s+$/, "");
+    let titleLine: number = i;
+    let titleText: string = titleRaw.trim();
+    let titleOff: number = titleText === "" ? -1 : allLines[i].lastIndexOf(titleText);
+
+    let promoted = false;
+    if (titleText === "") {
+      for (let j = i + 1; j <= end; j++) {
+        const s = stripQuote(allLines[j]);
+        if (s.text.trim() === "") continue;
+        titleLine = j;
+        // 整行交给行级解析：这样 `1. ` 这种标记会照常被剥掉
+        titleText = s.text;
+        titleOff = s.off;
+        promoted = true;
+        break;
+      }
+    }
+    if (titleText === "") {
+      i = end; // 空的 callout：不产生节点
+      continue;
+    }
+
+    out.push({
+      text: titleText,
+      orig: titleLine,
+      off: titleOff,
+      region: -1,
+      calloutRoot: region,
+      promoted,
+    });
+    for (let j = i; j <= end; j++) {
+      // 头部行永远不进正文；无标题时被顶上来的那一行也不能再来一次
+      if (j === i || j === titleLine) continue;
+      const s = stripQuote(allLines[j]);
+      if (s.text.trim() === "") continue;
+      out.push({ text: s.text, orig: j, off: s.off, region });
+    }
+    i = end;
+  }
+
+  return out;
+}
+/**
+ * 把一个块挂到「它前面最近的那个节点行」上。
+ *
+ * 归属只看**位置顺序**，不看缩进 —— 这是整块方案的地基，理由见 types.ts 里
+ * BlockInfo 的注释。文首的块前面没有任何节点，先攒进 rootBlocks，最后挂到根节点。
+ *
+ * 顺手把这个块的行区间记到节点的 src 上（blockStart/blockEnd）：
+ * 移动、删除、算插入位置都要靠它知道「这个节点还占着哪几行」。
+ */
+function attachBlock(
+  raws: RawLine[],
+  rootBlocks: BlockInfo[],
+  block: BlockInfo,
+): void {
+  const owner: RawLine | undefined = raws[raws.length - 1];
+  if (!owner) {
+    rootBlocks.push(block);
+    return;
+  }
+  if (!owner.blocks) owner.blocks = [];
+  owner.blocks.push(block);
+  owner.src.blockStart = owner.blocks[0].startLine;
+  owner.src.blockEnd = block.endLine;
+}
+
+/**
+ * 引用块的那一行文案。
+ *
+ * 为什么不能只写「引用 · 3 行」：用户的笔记里 `>` 几乎都是 Obsidian 的 callout
+ * （`> [!NOTE] 工作情况介绍`），一整篇正文都在里面。只说「引用 · 12 行」的话，
+ * 导图上就只剩一个没有信息量的标签，等于把内容藏没了。
+ * 所以取「第一句有意义的话」当标签：先剥 `[!TYPE]`，同一行还有字就用它，
+ * 否则看下一行；再截断。全文仍在笔记里，悬停能看到前几行。
+ */
+function quoteLabel(indent: string, lines: string[], count: number): string {
+  const strip = (l: string): string =>
+    l
+      .replace(new RegExp(`^${indent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "")
+      .replace(/^\s*>\s?/, "")
+      .replace(/^\s*>\s?/, "")
+      .trim();
+
+  let title = "";
+  for (const l of lines) {
+    const body: string = strip(l);
+    if (body === "") continue;
+    const callout: RegExpExecArray | null = /^\[!([A-Za-z-]+)\][+-]?\s*(.*)$/.exec(body);
+    if (callout) {
+      // 同一行有标题就用标题，没有就继续往下找正文第一句
+      if (callout[2].trim() !== "") {
+        title = callout[2].trim();
+        break;
+      }
+      continue;
+    }
+    title = body;
+    break;
+  }
+
+  const clean: string = title.replace(/[*_`~]/g, "").replace(/\[\[|\]\]/g, "");
+  const short: string = clean.length > 18 ? `${clean.slice(0, 18)}…` : clean;
+  return short === "" ? `引用 · ${count} 行` : `引用 · ${short}`;
+}
+
 /** 制表符按 4 列计。只是把缩进折算成一个可比较的数值，不代表层级语义 */
 const TAB_COLS = 4;
-
 /**
  * 一段缩进（空格 / 制表符混合）折算成列数。
  *
@@ -263,11 +448,24 @@ export function buildTree(
 
   // 2. 收集有效行（跳过空行与分隔线；代码块 / 公式块整块收成一个节点）
   const raws: RawLine[] = [];
+  /** 文首（第一个节点行之前）出现的块，最后挂到根节点上 —— 比如整篇只有一张架构图 */
+  const rootBlocks: BlockInfo[] = [];
   // 软换行合并：记录上一个「可合并」的列表项，后续续行（同缩进、无标记）并入它。
   let lastListRaw: RawLine | null = null;
 
-  for (let idx = lineOffset; idx < allLines.length; idx++) {
-    const line: string = allLines[idx];
+  // callout 在这里摊平成虚拟行（`>` 前缀剥掉）。之后整条解析链路都跑在
+  // 虚拟行上，行级规则的代码不用改；回写靠 v.orig / v.off 换回原文坐标。
+  const vlines: VLine[] = buildVLines(allLines, lineOffset);
+  /** 按虚拟行区间取原文（每行剥掉自己的 `>` 前缀），交给 MarkdownRenderer 渲染 */
+  const rawOf = (a: number, b: number): string =>
+    vlines
+      .slice(a, b + 1)
+      .map((v: VLine) => allLines[v.orig].slice(v.off))
+      .join("\n");
+
+  for (let idx = 0; idx < vlines.length; idx++) {
+    const v: VLine = vlines[idx];
+    const line: string = v.text;
     if (line.trim() === "") {
       lastListRaw = null;
       continue;
@@ -283,49 +481,31 @@ export function buildTree(
 
       if (!fence.single) {
         let j = idx + 1;
-        for (; j < allLines.length; j++) {
-          if (isFenceEnd(allLines[j], fence)) break;
+        for (; j < vlines.length; j++) {
+          if (isFenceEnd(vlines[j].text, fence)) break;
           bodyLines++;
         }
         // 没写收尾围栏时一直吃到文末，不能把后面的正文也当成代码
-        end = Math.min(j, allLines.length - 1);
+        end = Math.min(j, vlines.length - 1);
       }
 
-      const rawBlock: string = allLines.slice(idx, end + 1).join("\n");
+      const rawBlock: string = rawOf(idx, end);
       const label: string =
         fence.kind === "code"
           ? `代码块${fence.lang ? ` · ${fence.lang}` : ""}${bodyLines ? ` · ${bodyLines} 行` : ""}`
-          : "公式";
+          : `公式${bodyLines ? ` · ${bodyLines} 行` : ""}`;
 
-      raws.push({
-        text: label,
-        headingLevel: null,
-        block: {
-          kind: fence.kind,
-          lang: fence.lang,
-          raw: dedentBlock(rawBlock, fence.indent),
-          startLine: idx,
-          endLine: end,
-          lines: fence.single ? 1 : bodyLines,
-        },
-        src: {
-          line: idx,
-          bodyStart: 0,
-          bodyEnd: line.length,
-          full: line,
-          marker: "",
-          indent: fence.indent,
-          checked: null,
-          text: label,
-          heading: false,
-          level: null,
-          depth: 0,
-          endLine: idx,
-          extra: undefined,
-        },
+      attachBlock(raws, rootBlocks, {
+        kind: fence.kind,
+        lang: fence.lang,
+        raw: dedentBlock(rawBlock, fence.indent),
+        startLine: v.orig,
+        endLine: vlines[end].orig,
+        lines: fence.single ? 1 : bodyLines,
+        label,
       });
 
-      // 块节点是结构性节点：打断软换行续行（块与正文之间不再并入）
+      // 块是结构性内容：打断软换行续行（块与正文之间不再并入）
       lastListRaw = null;
       idx = end;
       continue;
@@ -335,13 +515,13 @@ export function buildTree(
     // 表格的信息在「行与列的对齐」里，拆成一行一个节点之后只剩一堆带竖线的碎片，
     // 既看不出关系、也没法排版，所以和代码块一样按块交给 MarkdownRenderer。
     const cols: number =
-      idx + 1 < allLines.length ? tableCols(line, allLines[idx + 1]) : 0;
+      idx + 1 < vlines.length ? tableCols(line, vlines[idx + 1].text) : 0;
     if (cols > 0) {
       // 表格到空行、或不再含竖线的行为止；顺手挡住列表项 / 标题，
       // 否则紧跟着表格的 `- 说明` 会被吸进最后一行单元格。
       let end: number = idx + 1;
-      for (let j = idx + 2; j < allLines.length; j++) {
-        const l: string = allLines[j];
+      for (let j = idx + 2; j < vlines.length; j++) {
+        const l: string = vlines[j].text;
         if (l.trim() === "") break;
         if (!l.includes("|")) break;
         if (/^[ \t]*(?:[-*+]\s+|\d{1,9}[.)]\s+|#{1,6}\s+)/.test(l)) break;
@@ -353,36 +533,53 @@ export function buildTree(
       const rows: number = end - idx - 1;
       const label: string = `表格 · ${cols} 列${rows > 0 ? ` · ${rows} 行` : ""}`;
 
-      raws.push({
-        text: label,
-        headingLevel: null,
-        block: {
-          kind: "table",
-          lang: "",
-          // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
-          raw: dedentBlock(allLines.slice(idx, end + 1).join("\n"), indent),
-          startLine: idx,
-          endLine: end,
-          lines: rows + 1,
-        },
-        src: {
-          line: idx,
-          bodyStart: indent.length,
-          bodyEnd: line.length,
-          full: line,
-          marker: "",
-          indent,
-          checked: null,
-          text: label,
-          heading: false,
-          level: null,
-          depth: 0,
-          endLine: idx,
-          extra: undefined,
-        },
+      attachBlock(raws, rootBlocks, {
+        kind: "table",
+        lang: "",
+        // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
+        raw: dedentBlock(rawOf(idx, end), indent),
+        startLine: v.orig,
+        endLine: vlines[end].orig,
+        lines: rows + 1,
+        label,
       });
 
-      // 块节点是结构性节点：打断软换行续行（块与正文之间不再并入）
+      // 块是结构性内容：打断软换行续行（块与正文之间不再并入）
+      lastListRaw = null;
+      idx = end;
+      continue;
+    }
+
+    // 引用块：连续的 `>` 行合成**一个块**，挂到前面最近的节点上。
+    //
+    // 以前每行 `>` 各成一个节点：引用边界消失，而且最后一行引用会把后面紧跟的
+    // 缩进节点「收养」成自己的孩子（缩进栈看的是列数，引用行剥离后列数为 0，
+    // 下一行却更深）—— 整块结构在用户眼里就是错的。
+    // 顺带修掉「`> ```js` 碎成四行」：块识别现在发生在引用这一层，
+    // 参考块里的 ``` 只是引用原文的一部分，不再单独解析。
+    if (/^[ \t]*>/.test(line)) {
+      let end: number = idx;
+      for (let j = idx + 1; j < vlines.length; j++) {
+        if (!/^[ \t]*>/.test(vlines[j].text)) break;
+        end = j;
+      }
+      const indentMatch: RegExpMatchArray | null = /^[ \t]*/.exec(line);
+      const indent: string = indentMatch ? indentMatch[0] : "";
+      const count: number = end - idx + 1;
+      attachBlock(raws, rootBlocks, {
+        kind: "quote",
+        lang: "",
+        raw: dedentBlock(rawOf(idx, end), indent),
+        startLine: v.orig,
+        endLine: vlines[end].orig,
+        lines: count,
+        label: quoteLabel(
+          indent,
+          vlines.slice(idx, end + 1).map((x: VLine) => x.text),
+          count,
+        ),
+      });
+
       lastListRaw = null;
       idx = end;
       continue;
@@ -458,7 +655,7 @@ export function buildTree(
       merged.src.text += "\n" + bodyText;
       if (!merged.src.extra) merged.src.extra = [];
       merged.src.extra.push(bodyText);
-      merged.src.endLine = idx;
+      merged.src.endLine = v.orig;
       continue;
     }
 
@@ -467,10 +664,11 @@ export function buildTree(
       text: m.text,
       headingLevel: headingMatch ? headingMatch[1].length : null,
       src: {
-        line: idx,
-        bodyStart: m.start,
-        bodyEnd: m.end,
-        full: line,
+        line: v.orig,
+        // 偏移要加回被剥掉的 `>` 前缀，否则回写会写进引用符号里
+        bodyStart: v.off + m.start,
+        bodyEnd: v.off + m.end,
+        full: allLines[v.orig],
         marker,
         indent: ws,
         checked,
@@ -478,8 +676,11 @@ export function buildTree(
         heading,
         level: headingMatch ? headingMatch[1].length : null,
         depth: 0,
-        endLine: idx,
+        endLine: v.orig,
       },
+      region: v.region,
+      calloutRoot: v.calloutRoot,
+      promoted: v.promoted,
     };
     raws.push(raw);
 
@@ -511,27 +712,37 @@ export function buildTree(
   const nodes: { depth: number; raw: RawLine }[] = [];
   const headingStack: number[] = [];
   const indentStack: number[] = [0];
+  /** 每个 callout 区域：标题节点算出来的深度（区域里的内容从它的下一层起算） */
+  const regionBase = new Map<number, number>();
+  /** 每个 callout 区域自己的缩进栈（区域内的缩进从 0 重新起算） */
+  const regionIndent = new Map<number, number[]>();
+  /**
+   * 标题是从正文第一行顶上来的区域：那行原本就在区域的第一层，
+   * 现在它当了标题（上移一层），所以区域内所有行也要跟着上移一层 ——
+   * 否则它的同级项会变成它的孩子，`1. …` / `2. …` 那种大纲会多套一层空壳。
+   */
+  const regionPromoted = new Set<number>();
 
   for (const r of raws) {
     let depth: number;
-    if (hasHeadings && r.headingLevel !== null) {
-      const level: number = r.headingLevel;
-      while (headingStack.length > 0 && headingStack[headingStack.length - 1] >= level) {
-        headingStack.pop();
-      }
-      headingStack.push(level);
-      depth = headingStack.length;
-      // 进入新小节，正文缩进重新从 0 起算
-      indentStack.length = 1;
-      indentStack[0] = 0;
-    } else {
+    const region: number = r.region ?? -1;
+
+    if (r.calloutRoot !== undefined) {
+      // callout 标题行：走外层缩进栈，算完把深度记成这个区域的基准
+      depth = outerDepth(r);
+      regionBase.set(r.calloutRoot, depth);
+      if (r.promoted) regionPromoted.add(r.calloutRoot);
+    } else if (region >= 0) {
+      // callout 内部：缩进从 0 重新起算，深度 = 标题深度 + 1 + 内部层级
+      const stack: number[] = regionIndent.get(region) ?? [0];
       const cols: number = colsOfIndent(r.src.indent);
-      while (indentStack.length > 1 && cols < indentStack[indentStack.length - 1]) {
-        indentStack.pop();
-      }
-      if (cols > indentStack[indentStack.length - 1]) indentStack.push(cols);
-      const base: number = hasHeadings ? headingStack.length : 0;
-      depth = base + indentStack.length;
+      while (stack.length > 1 && cols < stack[stack.length - 1]) stack.pop();
+      if (cols > stack[stack.length - 1]) stack.push(cols);
+      regionIndent.set(region, stack);
+      const shift: number = regionPromoted.has(region) ? 1 : 0;
+      depth = (regionBase.get(region) ?? 0) + stack.length - shift;
+    } else {
+      depth = outerDepth(r);
     }
     if (depth < 1) depth = 1;
 
@@ -539,12 +750,34 @@ export function buildTree(
     nodes.push({ depth, raw: r });
   }
 
+  /** 外层（不在任何 callout 里）的深度：标题栈或缩进栈 */
+  function outerDepth(r: RawLine): number {
+    if (hasHeadings && r.headingLevel !== null) {
+      const level: number = r.headingLevel;
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1] >= level) {
+        headingStack.pop();
+      }
+      headingStack.push(level);
+      // 进入新小节，正文缩进重新从 0 起算
+      indentStack.length = 1;
+      indentStack[0] = 0;
+      return headingStack.length;
+    }
+    const cols: number = colsOfIndent(r.src.indent);
+    while (indentStack.length > 1 && cols < indentStack[indentStack.length - 1]) {
+      indentStack.pop();
+    }
+    if (cols > indentStack[indentStack.length - 1]) indentStack.push(cols);
+    const base: number = hasHeadings ? headingStack.length : 0;
+    return base + indentStack.length;
+  }
+
   // 5. 按深度装配成树
   const root: IPureNode = {
-    content: escapeText(rootName),
+    content: escapeText(rootName) + blockPillsHtml(rootBlocks),
     children: [],
     // step / unit 供双向编辑与拖动复用，与解析规则保持一致
-    payload: { step, indentUnit: unit, hasHeadings },
+    payload: { step, indentUnit: unit, hasHeadings, blocks: rootBlocks },
   };
   const stack: IPureNode[] = [root];
 
@@ -556,21 +789,13 @@ export function buildTree(
     const r: RawLine = n.raw;
     const shown: string =
       r.src.checked === null ? r.src.text : (r.src.checked ? "☑ " : "☐ ") + r.src.text;
-    const node: IPureNode = r.block
-      ? {
-          // 先放一个占位：真正的 HTML 由视图层交给 MarkdownRenderer 渲染后替换。
-          // 必须先定好尺寸再 setData —— markmap 是按 content 里的 DOM 量节点宽高的，
-          // 灌完图再替换内容会和 foreignObject 脱节。
-          content: `<span class="obmind-block">${escapeText(r.text)}</span>`,
-          children: [],
-          // 块节点不给 src：跨多行，改一行就会把块拆坏，故意做成只读
-          payload: { block: r.block },
-        }
-      : {
-          content: render(shown),
-          children: [],
-          payload: { src: r.src },
-        };
+    const node: IPureNode = {
+      // 块作为这个节点的**内容**追加在后面（只占一行），不是子节点。
+      // 尺寸必须在 setData 之前定好 —— markmap 是按 content 里的 DOM 量宽高的。
+      content: render(shown) + blockPillsHtml(r.blocks),
+      children: [],
+      payload: { src: r.src, blocks: r.blocks },
+    };
     (parent ?? root).children.push(node);
     stack[n.depth] = node;
     stack.length = n.depth + 1;
@@ -579,16 +804,29 @@ export function buildTree(
   return root;
 }
 
-/** 找出树里所有块节点（代码块 / 公式块），供视图层统一渲染 */
-export function collectBlocks(
-  root: IPureNode,
-): { node: IPureNode; block: BlockInfo }[] {
-  const out: { node: IPureNode; block: BlockInfo }[] = [];
-  const walk = (n: IPureNode): void => {
-    const block = n.payload?.block as BlockInfo | undefined;
-    if (block && typeof block.raw === "string") out.push({ node: n, block });
-    for (const c of n.children ?? []) walk(c);
-  };
-  walk(root);
-  return out;
+/**
+ * 块在卡片里占的那一行。
+ *
+ * 为什么只有一行：一块两百行的代码会把整张图的布局比例彻底打乱，
+ * 而 markmap 是按内容尺寸算间距的，代价是全图变稀。块的内容在笔记里，
+ * 悬浮提示给出前几行，要看全文就点进笔记。
+ */
+function blockPillsHtml(blocks: BlockInfo[] | undefined): string {
+  if (!blocks || blocks.length === 0) return "";
+  return blocks
+    .map((b: BlockInfo) => {
+      const label: string = b.label ?? b.kind;
+      const hint: string = b.raw.trim().split("\n").slice(0, 6).join("\n");
+      return `<span class="obmind-block-pill" data-kind="${b.kind}" title="${escapeAttr(
+        hint,
+      )}">${escapeText(label)}</span>`;
+    })
+    .join("");
+}
+
+/** 属性值转义：换行在 title 里能显示，但要避免引号把属性截断 */
+function escapeAttr(text: string): string {
+  return escapeText(text)
+    .replace(/"/g, "&quot;")
+    .replace(/\n/g, "&#10;");
 }

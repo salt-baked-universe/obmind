@@ -30,6 +30,7 @@ import {
 } from "./geometry";
 import type { NodeBox } from "./geometry";
 import { branchPathOf, hash32 } from "./colors";
+import { isTracing, traceLog, traceLogEvery } from "./trace";
 
 /**
  * 分支 → 色板槽位。
@@ -107,16 +108,77 @@ export class NodePainter {
   private index = new Map<string, SVGGElement>();
   private indexReady = false;
 
+  /**
+   * 正在被**整块平移**的节点根（拖动中，见 edit/drag.ts）。
+   *
+   * 拖动时块里每个 g 都被写了一份 CSS `translate`，而 `linkPath` 只读
+   * `transform` 属性（不读 CSS translate，见 geometry.ts）—— 所以块根那根
+   * 「父 → 根」的线一旦被画出来，就仍然是按**旧位置**算的坐标，再跟着 g 一起
+   * 平移，屏幕上成了一根两端都不挨着的浮线（用户说的「有线」/「飘线」）。
+   *
+   * 早期版本靠「拖动时把线 `display:none`，重建时 paintAll 顺手还原」来藏，
+   * 但 `applyLink` 里有一句「凡我画过的线都保证可见」的兜底（防 d3 复用元素后
+   * 线永久消失），于是**任何一次重绘都会把线接回去**：拖动的提层动作会产生
+   * childList → 观察器判成结构变化 → 全图重绘 → 线回来了，整段拖动都带着一根线
+   * （现场日志 `drag.links n=1` 之后 170ms 就是 `paint.all boxes=257`）。
+   *
+   * 所以「该不该画」必须是个**谓词**，而不是一次性的「摘掉 / 还回去」动作：
+   * 条件在就在，条件没了下一次绘制自然恢复。失败方向是 fail-open（最坏早一帧
+   * 露线），而不是「忘了还 → 线永久消失」。
+   */
+  private shiftedRoots = new Set<SVGGElement>();
+
+  /**
+   * 本次 paintAll 真正落到 DOM 上的属性写次数。
+   *
+   * 这是「重绘到底贵不贵」唯一可靠的指标：一次 `paintAll` 在 250 节点的图上
+   * 最多能写 ~5 500 个属性（每节点 24 个），而**值没变的重写一样会让浏览器的
+   * style / layout 全部作废**。日志里 `paint.all writes=` 从 5 500 掉到几十，
+   * 才说明「只画该画的」真的做到了；只看 `boxes=` 是看不出来的。
+   */
+  private writes = 0;
+
   constructor(
     private readonly slotOf: SlotResolver = (path: string, size: number) =>
       hash32(branchPathOf(path)) % Math.max(1, size),
   ) {}
 
-  /** 视图重建导图时调用，丢掉所有缓存 */
+  /**
+   * 视图重建导图时调用。
+   *
+   * 只丢「按位置索引」的东西（`index` / `shiftedRoots`），**`entries` 保留**。
+   *
+   * 旧版在这里无条件 `entries.clear()`，理由是「元素引用全部作废」。但 markmap 的
+   * key 是 `父序号.自身序号 + 内容hash`，改一个字只会换掉那一条链上的几个 g，
+   * 其余两百多个 `<g>` 是**同一个元素原样复用**的（d3 按 key join 的结果）。
+   * 缓存一清，紧随其后的那次全量绘制就得对每个节点重写 24 个属性 ——
+   * 250 节点约 5 500 次写，把整张图的 style/layout 全部作废一遍，
+   * 而其中九成以上的值一个都没变。这就是「改个字，整图闪一下」的机械原因。
+   *
+   * 保留是安全的：`entryOf()` 本来就拿 `cached.g === box.g && card.isConnected`
+   * 核对过身份，元素被换掉、或者这个 path 换给了别的 g，都会原地重建一条新 Entry。
+   * 换句话说「失效」这件事已经由身份核对按节点做了，不需要在这里一刀切。
+   */
   reset(): void {
-    this.entries.clear();
     this.index.clear();
     this.indexReady = false;
+    // 重建之后 DOM 全换了，旧元素引用留着只会泄漏（而且 d3 复用元素时
+    // 会让「上一轮的块根」错误地继续藏掉某个正常节点的线）。
+    // 正在拖动的那一块由调用方在 reset 之后重新登记（见 MindmapView.applyTree）。
+    this.shiftedRoots.clear();
+  }
+
+  /** 上一次 `paintAll` 的属性写次数（诊断用：探针/回归测试据此判断缓存有没有命中） */
+  get lastWrites(): number {
+    return this.writes;
+  }
+
+  /** 登记 / 注销「整块平移中」的块根（见字段注释） */
+  markShifted(els: Iterable<SVGGElement>, on: boolean): void {
+    for (const g of els) {
+      if (on) this.shiftedRoots.add(g);
+      else this.shiftedRoots.delete(g);
+    }
   }
 
   /**
@@ -157,13 +219,20 @@ export class NodePainter {
    */
   paintAll(svg: SVGSVGElement, spec: ThemeSpec): number {
     const { boxes, byPath, skipped } = this.collect(svg);
+    // 每次全量绘制一行：boxes 是「画成了几个」，skipped 是「读不到几何的几个」。
+    // skipped>0 时调用方会隔帧重试，日志里应该看到紧跟着的第二条 pending 变小。
     if (boxes.length === 0) return skipped || svg.querySelectorAll("g.markmap-node").length;
 
     // 主题键提到循环外：折叠动画每帧都会走到这里，按节点拼一次字符串
     // 在两千节点的笔记上就是每秒几万次临时分配
     const themeKey = `${spec.id}|${spec.dark ? 1 : 0}`;
+    this.writes = 0;
+    /** 这一遍真正「从头建」的节点数（其余都是命中缓存、一个属性都没写） */
+    let fresh = 0;
     for (const box of boxes) {
       const entry = this.entryOf(box);
+      // themeKey 为空只可能是刚 new 出来的 Entry（applyStyle 一进来就写它）
+      if (entry.themeKey === "") fresh++;
       this.ensureLayers(box.g, entry);
 
       this.applyStyle(box, entry, spec, themeKey);
@@ -177,6 +246,15 @@ export class NodePainter {
     }
 
     this.prune(boxes);
+    // total 要多扫一遍 DOM，只在记日志时算 —— 这段是折叠动画的每帧路径。
+    // writes 是这套渲染唯一的成本指标：它直接等于「这一帧把多少节点的排版作废了」。
+    traceLog("paint.all", {
+      boxes: boxes.length,
+      skipped,
+      fresh,
+      writes: this.writes,
+      total: isTracing() ? svg.querySelectorAll("g.markmap-node").length : undefined,
+    });
     return skipped;
   }
 
@@ -198,6 +276,32 @@ export class NodePainter {
     if (!this.indexReady) this.buildIndex(els);
     if (this.entries.size === 0 && !this.indexReady) return;
 
+    // 一个节点的连线起点取自**父节点**的位置和卡片宽度：父节点动了、自己没动的那一帧，
+    // 它也必须重画，否则线停在上一个位置 —— 就是「飘线」。
+    // 以前没暴露是因为 markmap 每帧无条件重写全部节点的 transform，大家被顺带重画了
+    // 一遍；现在同值重写被过滤掉（见 MindmapView 的 obs.transform），这条得自己补上。
+    // 整片一起动时（折叠动画）子节点本来就在名单里，这个循环不会多出一个元素。
+    const targets = new Set<SVGGElement>(els);
+    /** 想补但索引里找不到的孩子数（>0 说明索引过期，那些线会停在旧位置） */
+    let kidsMissed = 0;
+    for (const g of Array.from(targets)) {
+      const data = (g as SVGGElement & { __data__?: { children?: unknown[] } }).__data__;
+      const kids = data?.children;
+      if (!Array.isArray(kids)) continue;
+      // 子节点的路径**不是** `父路径.下标`：markmap 的 path 由 `state.id` 拼成，
+      // 而 id 是节点自己的编号（折叠/重排后跟下标不是一回事）。
+      // 1.18.4 这里写成 `${path}.${i}`，结果一条都没命中 —— 等于什么都没补，
+      // 「父动子未动」时线就停在上一帧（用户看到的就是飘线）。
+      // 正确做法：问孩子自己的 state.path。
+      for (const kid of kids) {
+        const cp = (kid as { state?: { path?: unknown } } | null)?.state?.path;
+        if (typeof cp !== "string" || cp === "") continue;
+        const cg = this.index.get(cp);
+        if (cg) targets.add(cg);
+        else kidsMissed++;
+      }
+    }
+
     // 同一个 g 在一帧里既是子又是父，几何只读一次
     const seen = new Map<SVGGElement, NodeBox | null>();
     const boxOf = (g: SVGGElement): NodeBox | null => {
@@ -209,31 +313,52 @@ export class NodePainter {
       return box;
     };
 
-    for (const g of els) {
-      // 快速路径：已经在淡出的老节点（折叠出去的子树）只同步透明度就退出。
+    let movedCount = 0;
+    /** 真正重画的线条数：n 与它差得远，说明这一批里大半是「位置没变的下发」 */
+    let relinked = 0;
+    /** 读不到几何的节点数：这些节点的线只能停在旧位置（飘线的另一种来源） */
+    let nogeo = 0;
+    for (const g of targets) {
+      movedCount++;
+      // 快速路径：**正在淡出**的老节点（折叠出去的子树）只同步透明度就退出。
       // 它的 g 正被 markmap 拖向父节点，按 transform 反推出来的路径会被拉成
       // 又长又歪的曲线；保持最后一帧的形状、跟着卡片一起淡掉才自然。
       // 少一次 readNodeBox 也顺便省掉了几次属性读。
+      //
+      // 判据必须区分「淡出」和「淡入」（靠上次写过的值比）：展开时同一批节点
+      // 是 0→1 往上爬，若也走这条冻结路径，线就停在折叠时的位置、卡片已经飞
+      // 出去了 —— 这就是「展开时线飘在中间，过一会儿才啪一下归位」。
       const cached = this.entries.get(nodePathOf(g) ?? "");
       if (cached && cached.g === g && cached.linkD !== "") {
         const v: number = readOpacity(cached.fo);
-        if (v < 1) {
+        if (v < 1 && v <= cached.fade) {
           this.writeFade(cached, v);
           continue;
         }
       }
 
       const box = boxOf(g);
-      if (!box) continue;
+      if (!box) {
+        nogeo++;
+        continue;
+      }
 
       const entry = this.entryOf(box);
-      if (!entry.link) {
+      // 尺寸变了必须在这里补：改一个字走的是 `patch` 通道（只改卡片里那段 HTML，
+      // 不重建树），markmap 随后整树 renderData 一遍，卡片会变宽/变窄 ——
+      // 而**不会有任何一次全量绘制**。旧版只在「第一次在这个通道见到它」时补尺寸，
+      // 于是「文字改长了、卡片还是旧宽度」只能靠一次全量绘制兜底，那一次就是
+      // 「改个字整图闪一下」的另一半原因（另一半见 reset() 的注释）。
+      //
+      // 三个 apply* 各自带「值没变就直接 return」的快路径，所以这段常开是安全的：
+      // 折叠动画里 250 个节点每帧走一遍也只有几十次数值比较。
+      if (!entry.link || entry.w !== box.w || entry.h !== box.h) {
         // 第一次在这个通道见到它（全量绘制时它还没几何）：只建图层不写尺寸的话，
         // 会得到一堆宽高未设置的 <rect> —— 视觉上就是这张卡片消失了。
-        // 顺手把样式、尺寸、收放点一起补齐。
         this.ensureLayers(box.g, entry);
         this.applyStyle(box, entry, spec, `${spec.id}|${spec.dark ? 1 : 0}`);
         this.applySize(box, entry);
+        // 收放点贴在卡片右沿，宽度一变它就得跟着挪
         this.applyCircle(box, entry);
       }
       this.syncFade(box, entry);
@@ -248,7 +373,18 @@ export class NodePainter {
       if (!parentG) continue;
       const parent = boxOf(parentG);
       if (!parent) continue;
-      this.applyLink(box, parent, entry, spec);
+      if (this.applyLink(box, parent, entry, spec)) relinked++;
+    }
+
+    // 折叠动画里每帧都会走到这里，限流记「这一批动了几个节点」。
+    // 数值持续接近节点总数就说明「只动了一两个节点」被放大成了全量重画。
+    if (isTracing()) {
+      traceLogEvery("moved", 500, "paint.moved", {
+        n: movedCount,
+        links: relinked,
+        miss: kidsMissed,
+        nogeo,
+      });
     }
   }
 
@@ -302,7 +438,13 @@ export class NodePainter {
   /** 取（或重建）节点缓存。g 被 markmap 重建、元素掉出 DOM 时都要重置。 */
   private entryOf(box: NodeBox): Entry {
     const cached = this.entries.get(box.path);
-    if (cached && cached.g === box.g && cached.card?.isConnected) return cached;
+    if (cached && cached.g === box.g && cached.card?.isConnected) {
+      // 同一个 g 里 markmap 仍可能把 foreignObject 换掉（改内容走的就是这条 join）。
+      // 缓存里那份引用一旦失效，`syncFadeFor` / `paintMoved` 读透明度会读到
+      // 一个脱离文档的元素（永远返回 1），淡出判据就失效了。顺手刷新，成本一次赋值。
+      cached.fo = box.fo;
+      return cached;
+    }
 
     const g = box.g;
     const entry: Entry = {
@@ -330,7 +472,9 @@ export class NodePainter {
 
   /** 节点被 markmap 移除后，缓存跟着清掉（path 可能被复用） */
   private prune(boxes: NodeBox[]): void {
-    if (this.entries.size === boxes.length) return;
+    if (this.entries.size === 0) return;
+    // 刻意不写「数量相同就 return」：删一个又加一个时数量不变、成员变了，
+    // 死条目会留到下一次靠 entryOf 的身份检查兜底。250 次 Map.has 换一次确定性。
     const alive = new Set(boxes.map((b) => b.path));
     for (const key of Array.from(this.entries.keys())) {
       if (!alive.has(key)) this.entries.delete(key);
@@ -363,6 +507,7 @@ export class NodePainter {
     g.insertBefore(entry.shadow, anchor);
     g.insertBefore(entry.link, anchor);
     g.insertBefore(entry.card, anchor);
+    this.writes += 3;
     entry.circle = g.querySelector<SVGCircleElement>(":scope > circle");
   }
 
@@ -415,6 +560,7 @@ export class NodePainter {
 
     // 文字色写在 foreignObject 上，节点内容继承（这个不会被 markmap 冲掉）
     box.fo.style.color = style.fg;
+    this.writes += 6;
   }
 
   /**
@@ -438,10 +584,29 @@ export class NodePainter {
     entry.fade = v;
 
     const text: string = v >= 1 ? "" : String(v);
-    if (entry.card) entry.card.style.opacity = text;
-    if (entry.shadow) entry.shadow.style.opacity = text;
-    if (entry.link) entry.link.style.opacity = text;
-    if (entry.circle) entry.circle.style.opacity = text;
+    let n = 0;
+    if (entry.card) {
+      entry.card.style.opacity = text;
+      n++;
+    }
+    if (entry.shadow) {
+      entry.shadow.style.opacity = text;
+      n++;
+    }
+    if (entry.link) {
+      entry.link.style.opacity = text;
+      n++;
+    }
+    if (entry.circle) {
+      entry.circle.style.opacity = text;
+      n++;
+    }
+    this.writes += n;
+
+    // v<1 意味着我们把「卡片/线」也写成半透明了 —— 屏幕上就是那一块变淡。
+    // 折叠动画里这每帧都会发生几百次，所以限流：只留「最近 200ms 里发生过几次」。
+    // 关着日志时 isTracing() 先短路，不进 traceLogEvery 的 Map 查找。
+    if (v < 1 && isTracing()) traceLogEvery("fade", 200, "fade.write", { v });
     return v;
   }
 
@@ -465,6 +630,9 @@ export class NodePainter {
       entry.shadow.setAttribute("y", String(s.y));
       entry.shadow.setAttribute("width", String(s.w));
       entry.shadow.setAttribute("height", String(s.h));
+      this.writes += 8;
+    } else {
+      this.writes += 4;
     }
   }
 
@@ -505,10 +673,16 @@ export class NodePainter {
     // 重新拿到的旧 DOM 对不上（实测过，隐藏了就再也不会显回来）。
     const hidden: boolean = circle.style.display === "none";
     if (!box.hasChildren) {
-      if (!hidden) circle.style.display = "none";
+      if (!hidden) {
+        circle.style.display = "none";
+        this.writes++;
+      }
       return;
     }
-    if (hidden) circle.style.display = "";
+    if (hidden) {
+      circle.style.display = "";
+      this.writes++;
+    }
 
     const nativeCx = Number.parseFloat(circle.getAttribute("cx") ?? "");
     const nativeCy = Number.parseFloat(circle.getAttribute("cy") ?? "");
@@ -522,6 +696,7 @@ export class NodePainter {
     // 变换原点在圆点自身中心，所以 translate 之后再做 scale 只改大小、不改位置：
     // 直径 12 → 8.4，圆心仍精确落在卡片右沿（实测，见 .tmp 的 paint 用例）。
     circle.style.transform = `translate(${offset.x}px, ${offset.y}px) scale(${FOLD_SCALE})`;
+    this.writes++;
   }
 
   /** 自绘连线：父卡片右边缘中点 → 子卡片左边缘中点 */
@@ -530,14 +705,35 @@ export class NodePainter {
     parent: NodeBox,
     entry: Entry,
     spec: ThemeSpec,
-  ): void {
+  ): boolean {
     const link = entry.link;
-    if (!link) return;
+    if (!link) return false;
+
+    // 整块平移中的块根：这根线的坐标是拿 `transform` 属性算的，不含拖动写的
+    // CSS `translate`，画出来必然是错的（见 shiftedRoots 的注释）。这里**只保证
+    // 它是隐藏的**，既不写 d、也不更新缓存 —— 松手重建之后几何变了，d 自然会
+    // 重算；判据消失后下面那句「保证可见」也会把它接回来，不需要谁记得还。
+    if (this.shiftedRoots.has(box.g)) {
+      if (link.style.display !== "none") {
+        link.style.display = "none";
+        this.writes++;
+      }
+      return false;
+    }
+
+    // 拖动时会把这根线 `display: none` 摘掉（见 edit/drag.ts）。而 markmap 重建
+    // 之后 d3 很可能**复用同一个 g 与同一根 path**（key 没变）—— 那个 display 会留着，
+    // 我们的绘制又只写 d / stroke、从不碰 display，于是这根线永久消失。
+    // 所以凡是我们画过的线，都保证它是可见的（读一次 style.display 比写一次便宜）。
+    if (link.style.display !== "") {
+      link.style.removeProperty("display");
+      this.writes++;
+    }
 
     const branch: string = spec.colors[this.slotOf(box.path, spec.colors.length) % spec.colors.length];
     const d = linkPath(box, parent);
     if (entry.linkD === d && entry.linkBranch === branch && entry.linkWidth === spec.linkWidth) {
-      return;
+      return false;
     }
     entry.linkD = d;
     entry.linkBranch = branch;
@@ -548,5 +744,120 @@ export class NodePainter {
     link.setAttribute("stroke", branch);
     link.setAttribute("stroke-width", String(spec.linkWidth));
     link.setAttribute("stroke-linecap", "round");
+    this.writes += 5;
+    return true;
+  }
+
+  /**
+   * 核对「DOM 里那根线」和「按当前几何应该画的那根线」差多少 —— 只给日志用。
+   *
+   * 这是「飘线」唯一能自证的指标：连线是 `f(子卡片, 父卡片)` 的纯函数，
+   * 只要拿当前的 `transform` / `width` / `height` 重算一遍，和 `d` 属性比数字，
+   * 差值就是**屏幕上真实看到的那截偏差**（用户单位；乘画布 scale 就是像素）。
+   *
+   * 几个刻意的排除：
+   * - 根节点没有线；
+   * - 正在淡出（`fo.opacity < 1`）的节点：折叠时我们**故意**冻结形状让它跟着淡掉，
+   *   不是 bug，算进去只会把真问题淹掉；
+   * - 读不到几何的节点单独计数（`skip`）—— 这类节点画不出线，
+   *   `skip` 长期不为 0 就说明有节点永远量不出宽高。
+   *
+   * 只在开日志时调用，成本 ≈ 一次全量属性读。
+   */
+  measureDrift(svg: SVGSVGElement): DriftReport {
+    const nodes: SVGGElement[] = Array.from(
+      svg.querySelectorAll<SVGGElement>("g.markmap-node"),
+    );
+    const boxes = new Map<string, NodeBox>();
+    for (const g of nodes) {
+      const box = readNodeBox(g);
+      if (box) boxes.set(box.path, box);
+    }
+
+    const report: DriftReport = {
+      checked: 0,
+      skipped: nodes.length - boxes.size,
+      frozen: 0,
+      hidden: 0,
+      shifted: 0,
+      max: 0,
+      worst: [],
+    };
+
+    for (const g of nodes) {
+      const path = nodePathOf(g);
+      if (!path) continue;
+      const box = boxes.get(path);
+      if (!box || box.depth === 0) continue;
+      const link = g.querySelector<SVGPathElement>(`:scope > path.${CLS_LINK}`);
+      if (!link) continue;
+      // 正在整块拖动的块根：线是我们**故意**藏掉的（见 shiftedRoots），
+      // 算进 hidden 会让这个唯一的「线不见了」告警在拖动时一直响。
+      if (this.shiftedRoots.has(g)) {
+        report.shifted++;
+        continue;
+      }
+      // 被摘掉的线：只有拖动会写 display:none，正常应该在重建的 paintAll 里还原。
+      // 偏差计算看不出它（d 可能还是对的），所以必须单独数 —— 「线不见了」
+      // 和「线歪了」是两种完全不同的 bug。
+      if (link.style.display === "none") {
+        report.hidden++;
+        continue;
+      }
+      if (readOpacity(box.fo) < 1) {
+        report.frozen++;
+        continue;
+      }
+      const parent = boxes.get(parentPathOf(path));
+      if (!parent) continue;
+
+      report.checked++;
+      const want: string = linkPath(box, parent);
+      const have: string = link.getAttribute("d") ?? "";
+      if (want === have) continue;
+      const d: number = pathDelta(want, have);
+      if (d > report.max) report.max = d;
+      if (d > 1) {
+        const label: string = (g.textContent ?? "").trim().slice(0, 10) || path;
+        report.worst.push(`${label} ${d.toFixed(1)}`);
+      }
+    }
+    report.worst.sort((a, b) => Number(b.split(" ")[1]) - Number(a.split(" ")[1]));
+    return report;
   }
 }
+
+export interface DriftReport {
+  /** 真正核对过的线条数 */
+  checked: number;
+  /** 读不到几何的节点数 */
+  skipped: number;
+  /** 淡出中、刻意冻结的节点数 */
+  frozen: number;
+  /** 被 `display: none` 摘掉、还没还原的线条数（「线不见了」） */
+  hidden: number;
+  /** 正在整块拖动、线被刻意藏起来的块根数（不是问题，单独计数） */
+  shifted: number;
+  /** 最大偏差（用户单位，乘画布 scale 即像素） */
+  max: number;
+  /** 偏差 >1 的节点（`名字 12.3`），已按偏差降序 */
+  worst: string[];
+}
+
+/** 两条路径字符串的数字差（逐参数取最大绝对差）；结构不一样就当成最大偏差 */
+function pathDelta(a: string, b: string): number {
+  if (b === "") return MAX_DELTA;
+  const na: string[] = a.match(/-?\d+(?:\.\d+)?/g) ?? [];
+  const nb: string[] = b.match(/-?\d+(?:\.\d+)?/g) ?? [];
+  if (na.length === 0 || na.length !== nb.length) return MAX_DELTA;
+  let max = 0;
+  for (let i = 0; i < na.length; i++) {
+    const d: number = Math.abs(Number(na[i]) - Number(nb[i]));
+    if (!Number.isFinite(d)) return MAX_DELTA;
+    if (d > max) max = d;
+  }
+  return max;
+}
+
+/** 「线没了」和「线歪了 400 像素」在日志里要能区分：前者给一个大到不可能是几何误差的值 */
+const MAX_DELTA = 9999;

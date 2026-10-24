@@ -57,13 +57,17 @@ export type CreateResult =
  *
  * 依赖一个前提：文档顺序与树的前序一致（由缩进/标题推导而来，成立）。
  * 所以「往下扫到第一个不比自己深的行」就是子树边界。
+ *
+ * 块的尾巴要算进来：块依附在节点上、本身不是节点，最后一个子节点可能带着
+ * 一段代码/引用一直延伸到块末行。漏掉它，新建的同级节点会插进块中间 ——
+ * 而块归「前一个节点」，于是那块内容就改挂到新节点上了。
  */
 export function subtreeEndOf(src: SrcRef, nodes: readonly SrcRef[]): number {
-  let end: number = src.line;
+  let end: number = Math.max(src.line, src.blockEnd ?? src.line);
   for (const n of nodes) {
     if (n.line <= src.line) continue;
     if (n.depth > src.depth) {
-      end = n.line;
+      end = Math.max(end, n.line, n.blockEnd ?? n.line);
       continue;
     }
     // 同层或更浅：子树到此结束
@@ -89,9 +93,14 @@ export function planCreate(input: CreateInput): CreateResult {
   const insertAfterLine: number = subtreeEndOf(src, nodes);
   const focusLine: number = insertAfterLine + 1;
 
+  // callout 的标题行（`> [!NOTE] xxx`）：它不是列表项，`mark` 会算出 `[!NOTE] `，
+  // 照搬会凭空造出一个新 callout；而它的「同级」必须落到引用**外面**，
+  // 因为 callout 里面任何一行都是它的后代。
+  const calloutHead: boolean = /^[ 	]*>[ 	]?\[!/.test(src.full);
+
   if (mode === "sibling") {
-    const quote: string = quoteOf(src);
-    let mark: string = markOf(src);
+    const quote: string = calloutHead ? "" : quoteOf(src);
+    let mark: string = calloutHead ? "" : markOf(src);
     if (!src.heading) mark = resetOrdered(mark);
     return {
       ok: true,
@@ -112,6 +121,19 @@ export function planCreate(input: CreateInput): CreateResult {
         insertAfterLine,
         focusLine,
         line: `${quote}${"#".repeat(level)} ${text}`,
+      },
+    };
+  }
+
+  // callout 的标题：子节点就是引用里的第一层，不能再缩进
+  // （缩进一个步长会掉进「正文第一行的孩子」那一层）
+  if (calloutHead) {
+    return {
+      ok: true,
+      plan: {
+        insertAfterLine,
+        focusLine,
+        line: quoteOf(src) + text,
       },
     };
   }

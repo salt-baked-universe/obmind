@@ -20,6 +20,7 @@
 
 import type { DropMode, EditorAction, SrcRef, Span, WriteOp } from "../types";
 import { planCreate, subtreeEndOf, type CreateMode } from "../edit/create";
+import { insertBlockPlan, type BlockKind } from "../edit/block";
 import { indentBy, parseEditorValue, rewriteNode } from "../edit/text";
 import { moveNode, moveNodes, blockRange } from "../edit/move";
 
@@ -101,6 +102,13 @@ export interface RemoveGroupInput {
   snap: EditSnapshot;
   /** 要删除的节点行号（多个，可含嵌套）；重叠范围会自动合并 */
   lines: number[];
+}
+
+export interface InsertBlockInput {
+  snap: EditSnapshot;
+  /** 把块挂到哪个节点上（宿主行号） */
+  line: number;
+  kind: BlockKind;
 }
 
 export class EditService {
@@ -350,6 +358,33 @@ export class EditService {
       },
       focusLine: focusLine >= 0 ? focusLine : undefined,
     };
+  }
+
+  /**
+   * 在选中节点下面插入一个块（代码 / 引用 / 表格）。
+   *
+   * 插入位置在「节点自己那几行之后、子节点之前」，不是子树末尾 ——
+   * 块归「前一个节点」，插到末尾就归给了最后一个后代。
+   *
+   * 写完之后选中框仍留在原节点上（不是新块）：块不是节点，没有行可以选；
+   * 而且用户接下来多半还想接着操作这个节点。
+   */
+  insertBlock(input: InsertBlockInput): EditOutcome {
+    const src = this.nodeAt(input.snap, input.line);
+    if (!src) return error("找不到要插入块的节点");
+
+    const plan = insertBlockPlan({ src }, input.kind);
+    const lines: string[] = input.snap.content.split("\n");
+    const at: number = plan.insertAfterLine;
+    const span: Span = {
+      // start === end 表示「插在这一行之前」，所以 at + 1 才是「at 之后」
+      start: at + 1,
+      end: at + 1,
+      lines: plan.lines,
+      checkLine: at,
+      checkText: lines[at] ?? "",
+    };
+    return { kind: "write", op: { kind: "span", span }, focusLine: src.line };
   }
 
   /** 某个节点在树里的父节点行号；根节点返回 -1（删完用它把选中挪过去） */

@@ -19,7 +19,7 @@ import type { ParseOptions } from "./types";
 
 export type { SrcRef, BlockInfo, ParseOptions } from "./types";
 export type { BuildTreeOptions } from "./domain/syntax";
-export { colsOfIndent, indentOfCols, detectIndent, collectBlocks } from "./domain/syntax";
+export { colsOfIndent, indentOfCols, detectIndent } from "./domain/syntax";
 export { renderInline } from "./render/inlineHtml";
 
 /**

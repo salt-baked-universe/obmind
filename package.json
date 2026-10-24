@@ -1,7 +1,7 @@
 {
   "name": "obmind",
-  "version": "1.17.3",
-  "description": "Turn the current note's outline (filename as root, indentation as hierarchy) into an interactive mindmap.",
+  "version": "1.18.11",
+  "description": "Turn the current note's headings and indentation into an interactive, XMind-style mindmap that edits the note back.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -13,8 +13,8 @@
     "mindmap",
     "outline"
   ],
-  "author": "",
-  "license": "MIT",
+  "author": "郭源潮",
+  "license": "GPL-3.0-or-later",
   "dependencies": {
     "markmap-common": "^0.18.0",
     "markmap-lib": "^0.18.0",

@@ -13,6 +13,7 @@
 
 import type { EditorAction } from "../types";
 import type { ThemeSpec } from "../theme";
+import { isTracing, traceLogEvery } from "../render/trace";
 
 export type { EditorAction } from "../types";
 
@@ -21,7 +22,12 @@ export interface InlineEditorOptions {
   target: SVGGElement;
   value: string;
   spec: ThemeSpec;
-  /** 打开时全选（新建节点用，用户直接打字覆盖占位文本） */
+  /**
+   * 打开时全选。
+   *
+   * 现在所有入口都传 true（双击 / Enter / F2 / 空格 / 新建节点）：节点的「改字」
+   * 基本是整句重写，带选区进来第一个字符就能覆盖全部；想插字按一下 ←/→ 即可。
+   */
   selectAll?: boolean;
   onFinish: (action: EditorAction, value: string) => void;
 }
@@ -151,6 +157,16 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     ta.style.height = "1px";
     const needed: number = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
+
+    // 落位真的变了才记：短时间内多条说明编辑框在跳（背后节点还在被 markmap 挪），
+    // 那在屏幕上就是「输入框飘在半空闪一下」
+    if (isTracing()) {
+      traceLogEvery("edit.place", 100, "edit.place", {
+        x: Math.round(rect.left - base.left),
+        y: Math.round(rect.top - base.top),
+        w: Math.round(rawW),
+      });
+    }
     return true;
   };
 
@@ -282,9 +298,11 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
 
   fo.style.visibility = "hidden";
   place();
-  ta.focus();
-  if (options.selectAll) ta.select();
-  else ta.setSelectionRange(ta.value.length, ta.value.length);
+  // preventScroll：编辑框就在视口里，focus 时再滚一下会把画布带偏一格
+  ta.focus({ preventScroll: true });
+  // 全选必须在 focus **之后**：某些浏览器 focus 会把选区折回末尾。
+  if (options.selectAll === false) ta.setSelectionRange(ta.value.length, ta.value.length);
+  else ta.select();
 
   return {
     close: (): void => {

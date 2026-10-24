@@ -4,8 +4,6 @@ import {
   Notice,
   WorkspaceLeaf,
   MarkdownView,
-  MarkdownRenderer,
-  Component,
   TFile,
   debounce,
   normalizePath,
@@ -14,18 +12,28 @@ import {
 import type { WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
-import { collectBlocks, renderInline } from "./parser";
-import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
+import { renderInline } from "./parser";
+import type { DropMode, SrcRef, WriteOp } from "./types";
 import { resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
 import { NodePainter } from "./render/painter";
+import { measureLayoutLag, translateOf } from "./render/geometry";
 import { BranchColors, branchKey, branchPathOf, hash32 } from "./render/colors";
 import { FrameScheduler } from "./render/frame";
+import {
+  traceBindSvg,
+  isTracing,
+  traceElapsed,
+  traceLog,
+  traceLogEvery,
+  traceSince,
+} from "./render/trace";
 import { waitStableSize } from "./render/viewport";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { firstChildRef, stepVisible, visibleLeafRefs } from "./domain/nav";
 import type { NavNode } from "./domain/nav";
 import { parseEditorValue } from "./edit/text";
+import type { BlockKind } from "./edit/block";
 import { openInlineEditor } from "./edit/inlineText";
 import type { EditorAction, InlineEditorHandle } from "./edit/inlineText";
 import { applyOp, findEditor } from "./edit/writer";
@@ -60,7 +68,7 @@ import { NodeBar } from "./ui/nodeBar";
 import { isTypingTarget } from "./ui/keyGuard";
 import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
-import { planProjection } from "./app/plan";
+import { explainDiff, planProjection } from "./app/plan";
 import {
   buildSvgText,
   exportFileName,
@@ -80,10 +88,13 @@ type MarkmapOptions = NonNullable<Parameters<typeof Markmap.create>[1]>;
 /** 快捷键说明面板的内容。改一处就够，不必再维护标记里的长 tooltip。 */
 const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["单击", "选中节点（之后可用下面的按键）"],
-  ["选中后", "画布右侧浮出操作条：新建子级 / 同级、新建笔记、编辑、提升、删除"],
+  ["选中后", "画布右侧浮出操作条：新建子级 / 同级、新建笔记、插入块、编辑、提升、删除"],
   ["双击 / F2 / 空格", "原地编辑（空格不需要先用鼠标点进画布）"],
   ["Tab / Enter", "新建子级 / 新建同级"],
   ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
+  ["插入块", "在选中节点下面加代码块 / 引用 / 表格，卡片里只占一行"],
+  ["块的位置", "块跟着它上面那一行走（不看缩进），拖动/删除时整块一起搬"],
+  ["Callout", "`> [!note] 标题` 当容器：标题成节点，正文按 `>` 后的缩进挂在它下面"],
   ["↑ ↓", "换选中：在末级节点之间前后走（不落到分支上）"],
   ["← →", "换选中：父级 / 子级（折叠着会自动展开）"],
   ["Shift+Tab", "提升一级"],
@@ -108,6 +119,81 @@ function errText(err: unknown): string {
   return String(err);
 }
 
+/**
+ * 子树节点数，只给日志用。
+ *
+ * 调用方会先用 `isTracing()` 兜一下：这函数要遍历整棵树，
+ * 关着日志时连算都不该算。
+ */
+function countNodes(root: IPureNode): number {
+  let n = 1;
+  for (const child of root.children ?? []) n += countNodes(child);
+  return n;
+}
+
+/** 原文行数，只给日志用（判断这次变化是不是「插了一行」） */
+function countLines(text?: string): number {
+  if (!text) return 0;
+  let n = 1;
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;
+  return n;
+}
+
+/**
+ * 归一化一段「人读的文字」，用于比对「编辑框的值」与「卡片上显示的字」。
+ *
+ * 两者来源不同（一个是源码行文本、一个是渲染后的 HTML），行内标记、空白、
+ * 复选框符号必然有差异，不归一化就会天天误报。
+ */
+function normalizeLabel(s: string): string {
+  return s
+    .replace(/[\s\u00a0]+/g, "")
+    .replace(/[*_`~]/g, "")
+    .replace(/[☑☐]/g, "")
+    .replace(/\[[ xX]\]/g, "");
+}
+
+/**
+ * 调用来源（只给日志用）。
+ *
+ * 「整树重排」有好几个可能的发起者：markmap 自己的 ResizeObserver 防抖、
+ * 我们的 reflowNow、setData 收尾、面板切换……光看事件顺序分不清，
+ * 而该不该拦完全取决于是谁叫的。取栈里最前面的三个函数名足够定位。
+ */
+function callerOf(): string {
+  const stack: string | undefined = new Error().stack;
+  if (!stack) return "?";
+  const names: string[] = [];
+  for (const raw of stack.split("\n").slice(1)) {
+    // 跳过本函数与包出来那一层（都是我们自己，没有信息量）
+    if (raw.includes("callerOf") || raw.includes("patchedRender") || raw.includes("tracedTransition")) continue;
+    const m = /at\s+([^\s(]+)/.exec(raw);
+    names.push(m ? m[1].replace(/\s+/g, "_") : "?");
+    if (names.length >= 3) break;
+  }
+  return names.join("<");
+}
+
+/** 日志里认节点用的短标签：剥掉 content 里的标签取前几个字（不然全是 `<span cla...`） */
+function nodeLabel(g: SVGGElement): string {
+  const d = (g as SVGGElement & { __data__?: IPureNode }).__data__;
+  const raw: string = String(d?.content ?? "");
+  const text: string = raw.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, 10) : "?";
+}
+
+/**
+ * 从 inline style 的旧值里抠出 opacity。
+ *
+ * `attributeOldValue` 给的是**整条 style 属性**（如 `opacity: 0.42;`），
+ * 不是单个声明的旧值，所以这里要自己解析。
+ */
+function styleOpacityOf(raw: string | null): string {
+  if (!raw) return "-";
+  const m = /opacity:\s*([^;]+)/.exec(raw);
+  return m ? m[1].trim() : "-";
+}
+
 /** 导出提示里报文件大小，单位只在需要时出现 */
 function formatSize(bytes: number): string {
   return bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
@@ -125,6 +211,35 @@ const MIN_VIEWPORT = 40;
 const DECOR_CLASSES = ["obmind-node-card", "obmind-node-shadow", "obmind-node-link"];
 
 /**
+ * 观察器的配置。
+ *
+ * - class：markmap 重排会重写节点 class（会把选中态抹掉）；
+ * - style：节点文字的 opacity（淡入淡出），卡片要跟着淡；
+ * - width/height：**只在值真的变了时才算数**（靠 `attributeOldValue` 过滤）。
+ *
+ *   为什么会加回来：卡片宽度是照 `foreignObject` 的 width 画的，而它是另一套
+ *   元素，属性变了不会自己变大。markmap 在 `_relayout` 之后会写一次 width，
+ *   但那次重排的**位置通常没变**（改文字只往右长，x/y 不动）—— transform 通道
+ *   被同值过滤掉，class 通道只补选中框，于是**一次绘制都不会发生**，
+ *   卡片永远停在旧宽度、新文字直接溢出边框（用户截图）。
+ *
+ *   它不贵：width/height 由 markmap 在每次 `renderData` 里写一次（不是每帧，
+ *   折叠动画写的只有 transform），同值走 oldValue 比较直接丢。
+ * - `attributeOldValue`：日志里要能写出「opacity 从 0.42 变成 0.58」这种斜坡，
+ *   才分得清「重建时被抄了一次 0」和「真有一条过渡在跑」。只影响记录多带一个
+ *   字符串，不参与任何判断。
+ *
+ * 抽成常量是因为 `raiseNodes` 里重新 `observe` 时要用同一份。
+ */
+const OBSERVE_OPTIONS: MutationObserverInit = {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ["transform", "class", "style", "width", "height"],
+  attributeOldValue: true,
+};
+
+/**
  * 这条 childList 记录是不是「我们往节点里插装饰」造成的。
  *
  * 判据刻意收得很窄：只有「目标就是节点 g」且「增删的全是带装饰 class 的元素」
@@ -140,6 +255,25 @@ function isOwnDecoration(rec: MutationRecord): boolean {
   return nodes.every(
     (n: Node) => n instanceof Element && DECOR_CLASSES.some((c) => n.classList.contains(c)),
   );
+}
+
+/**
+ * 这条 childList 记录是不是「节点卡片里的文字重新渲染了一遍」。
+ *
+ * `foreignObject` 里面那层 div 就是文字本身。改字走的是 `patch` 通道
+ * （只换 innerHTML、不重建树），markmap 自己重排时也会重建那层内容 ——
+ * 两者产生的记录都被当成「结构变化」，于是每次改一个字都要多付一次全量绘制：
+ * `applyPatch → reflowSoon → renderData → paintNow`（第一次）
+ * ＋ 观察器这一批 `requestAll → paintAll`（第二次）。
+ *
+ * 它不可能是节点增删：节点的 `<g>` 在 foreignObject **外面**，谁插删节点都
+ * 不会把记录落在 fo 内部。
+ */
+function isContentChurn(rec: MutationRecord): boolean {
+  const target = rec.target;
+  if (!(target instanceof Element)) return false;
+  // closest 含自身：目标可能就是 foreignObject（markmap 换整层内容时）
+  return target.closest("foreignObject") !== null;
 }
 
 /**
@@ -234,6 +368,27 @@ export class MindmapView extends ItemView {
    * MutationObserver 回调在微任务里跑，赶在浏览器绘制之前，用户看不到那一帧。
    */
   private fadeGuardUntil = 0;
+  /**
+   * 「收尾重排」窗口：见 `attachSettleHook`。
+   *
+   * markmap 自己对每个节点的内容 div 挂了 ResizeObserver（100ms 防抖 → renderData），
+   * 而重建/改字之后它必然会再跑一遍整树重排。那一刻若 duration 已经恢复成 180，
+   * 整张图就重新动画一次（实测 304 节点里挪了 303 个，最大 102px）。
+   * 窗口内它的重排一律按 duration 0 跑，跑完补一次全量绘制。
+   */
+  private settleUntil = 0;
+  /** 用户正在手动折叠/展开：这时候的重排是「该有动画」的，别压 */
+  private toggleIntent = false;
+  /**
+   * 上一次重建结束的时刻（performance.now()）。
+   *
+   * 只给日志用：现在每次重建之后都有一次「整树又动了一遍」的波峰，需要回答
+   * 「它离重建结束多久」——同一个值在不同机器/不同笔记上差得很多，
+   * 没有这个计时就只能猜。
+   */
+  private rebuildEndAt = 0;
+  /** 重建后的落位追踪：逐帧采样用的 rAF 句柄（0 = 没在跑） */
+  private trajRaf = 0;
   /** 状态闸门 + 重建串行化（替代原来的 refreshing / pending / rebuilding / pendingRefresh） */
   private readonly rt: ViewRuntime;
   private currentSpec: ThemeSpec | null = null;
@@ -272,6 +427,25 @@ export class MindmapView extends ItemView {
   private selectedLines: Set<number> = new Set();
   /** 主选中节点（最后交互的那个）：单节点操作（改字/缩进/删除）作用于它，也是框选/拖动锚点 */
   private primaryLine = -1;
+  /**
+   * 「上一次往 DOM 上刷选中态时的 (结构代数, 选中集合) 」。
+   *
+   * `paintSelection` 每次都要遍历全部节点做 `srcOf()` + `classList.toggle()`，
+   * 而它被调用的地方太多：每次 refresh（**哪怕 plan 判定「什么都没变」**）、
+   * 每次重排、每次重建、每次提交编辑的收尾。打一个字能触发三轮 250 节点全扫。
+   *
+   * 但真正需要动的只有两种情况：选中集合变了，或者节点 `<g>` 被换过一批
+   * （重建 / markmap 重排把 class 整段重写）。用一个字符串键把这两件事拼起来，
+   * 键没变就直接返回 —— 那条路径上一次写下的 class 一定还在。
+   */
+  private selectionKey = "";
+  /**
+   * 结构代数：每次重建导图 / 整树重排 +1。
+   *
+   * 用来让 `selectionKey` 知道「DOM 上那些 class 已经不可信了」，
+   * 同时不必为每次重建单独维护一份「哪些元素是新的」。
+   */
+  private structureGen = 0;
   /**
    * Shift+单击 的区间起点，记的是「上一次不带 Shift 选中/加选的那个节点」。
    *
@@ -338,14 +512,6 @@ export class MindmapView extends ItemView {
    * 反向计算锚点比直接存全文更容易错，而一篇纯文本才几十 KB。
    */
   private history: HistoryState = EMPTY_HISTORY;
-  /** 块级渲染（代码块/公式块）用到的组件，下次重建前统一释放 */
-  private blockParts: Component[] = [];
-  /**
-   * 块渲染结果缓存：`kind|lang|raw` → HTML。
-   * 每打一个字都会重建整棵树，不缓存的话一篇有几十个代码块的笔记
-   * 每次按键都要重新跑一遍高亮/MathJax，输入会明显发滞。
-   */
-  private blockCache = new Map<string, string>();
 
   // --- 读写分离：视图只做「事件 → 用例 → 投影」，不自己算文本变更 ---------
   /** 写路径：编辑意图 → 写入计划（纯计算，不碰文件、不弹提示） */
@@ -457,6 +623,8 @@ export class MindmapView extends ItemView {
     svg.style.width = "100%";
     svg.style.height = "100%";
     this.svgEl = svg;
+    // 探针要一个具体的 svg 才能逐帧采样（frames 档）
+    traceBindSvg(svg);
 
     // 节点操作条挂在画布上（不是节点 DOM 里）：它的位置按卡片的屏幕坐标算，
     // 不参与 SVG 的坐标系，缩放/平移都不用重算内部布局。
@@ -534,8 +702,11 @@ export class MindmapView extends ItemView {
     // 拖动改变父子关系
     this.drag = new DragController(svg, canvas, {
       srcOf: (g: SVGGElement) => this.srcOf(g),
-      onDrop: (srcLine: number, targetLine: number, mode: DropMode) =>
+      groupLines: (line: number) => this.groupOf(line),
+      onDrop: (srcLine: number, targetLine: number, mode: DropMode): boolean =>
         this.onNodeDrop(this.groupOf(srcLine), targetLine, mode),
+      raiseNodes: (els: SVGGElement[]) => this.raiseNodes(els),
+      onShift: (roots: SVGGElement[], on: boolean) => this.painter.markShifted(roots, on),
     });
 
     // 左键在空白区拖拽 = 框选（ctrl/shift 加选）；命中节点的拖动交给 DragController。
@@ -604,6 +775,139 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 给 markmap 自己那次「收尾重排」压时间。
+   *
+   * 现场日志里每次 `rebuild.end` 之后 700–800ms 都会冒出一次 `obs.class n=全部节点`
+   * ——那是 markmap 在跑 `renderData`（`w.attr("class")` 写在每一个节点上）。
+   * 它来自构造时挂在**每个节点内容 div** 上的 ResizeObserver：
+   * 新节点的 div 是在 `setData` 里才被 observe 的，浏览器布局完成后立刻报一次
+   * 尺寸变化，防抖 100ms 后就是一次整树重排。
+   *
+   * 问题是那时我们早已把 duration 恢复成 180，于是整张图重新动画一遍。
+   * `tmp/resizeProbe2.ts`（304 节点，加两个节点后重建）实测：
+   *
+   * ```
+   * [1744.9] rebuild.end          ← 我们画完，duration 已恢复 180
+   * [1860.0] renderData#4 start duration=180
+   * 位置差异 moved=303/304 max=101.9px
+   * ```
+   *
+   * 也就是说重建结束时画的那一遍是**中间态**，一百毫秒后整张图又滑 100px 到位 ——
+   * 用户看到的就是「改完字画面再抖一下」，动到一半的线看着就是「飘线」。
+   *
+   * 这里把实例的 `renderData` 包一层：落在窗口内就压成 duration 0，跑完立刻补一次
+   * 全量绘制（这一遍才是最终布局）。用户手动折叠/展开会先清掉窗口 —— 那种动画
+   * 是用户要看的，不能压。
+   */
+  private attachSettleHook(mm: Markmap): void {
+    // 折叠圆点走的是 markmap 自己的 handleClick → this.toggleNode，
+    // 命中实例属性，所以包这一层两条入口都能拦住。
+    const origToggle = mm.toggleNode.bind(mm);
+    const patchedToggle = async (node: never, recursive?: boolean): Promise<void> => {
+      this.toggleIntent = true;
+      // 用户出手了，收尾窗口立刻作废：否则待会儿那次防抖重排会把折叠动画中途掐断
+      this.settleUntil = 0;
+      try {
+        await origToggle(node, recursive);
+      } finally {
+        this.toggleIntent = false;
+      }
+    };
+    (mm as unknown as { toggleNode: typeof patchedToggle }).toggleNode = patchedToggle;
+
+    const origRender = mm.renderData.bind(mm);
+    const patchedRender = async (target?: INode): Promise<void> => {
+      // **每一次** renderData 都要留痕。
+      //
+      // 原来只记 `settle.pass` / `settle.catch` 这两种结果，于是「日志里整棵树动了一次、
+      // 却没有对应的 settle 行」这种情况无法解释 —— 只能猜「是不是别的路径写的 transform」。
+      // 现在入口无条件记一行：dur=此刻的 duration（0 表示调用方自己就要求瞬间到位）、
+      // arg=折叠时传进来的那个节点（整树重排时为空）、from=调用来源。
+      // 判据：看到一批 transform 写入，就在它之前找 `render.enter`；找不到 → 那次写入
+      // 来自**更早创建的那条过渡**（去 `tr.create` 里按 dur 与 n 对号）。
+      if (isTracing()) {
+        const t = target as (INode & { state?: { path?: string } }) | undefined;
+        traceLog("render.enter", {
+          dur: mm.options.duration,
+          phase: this.rt.phase,
+          left: Math.round(this.settleUntil - performance.now()),
+          arg: t?.state?.path ?? "-",
+          from: callerOf(),
+        });
+      }
+      // 重建期间照原样跑（applyTree 已经把 duration 置 0，这里再包一层会打架）；
+      // duration 已经是 0 说明调用方自己就是按「瞬间到位」来的（reflowNow），
+      // 这时**不要消费窗口** —— 后面 markmap 自己那次防抖重排才是要拦的对象。
+      //
+      // 这里**必须包含 `editing`**。原来只放行 `idle`，于是「打开编辑框之后
+      // markmap 自己那次防抖重排」永远漏网：现场日志里那条
+      // `settle.pass dur=180 phase=editing left=453` 就是它 —— 250 个节点一起
+      // 播 180ms 位移，用户看到的就是「一进编辑（或改完字）整张图滑一下」。
+      // 编辑态下更该压平：这期间屏幕上有一个浮层输入框贴着某张卡片，
+      // 底下的图一动，输入框就得跟着重贴位置，看起来就是抖。
+      const inWindow: boolean =
+        this.rt.phase !== "rebuilding" &&
+        this.toggleIntent === false &&
+        mm.options.duration !== 0 &&
+        performance.now() < this.settleUntil;
+      if (!inWindow) {
+        // 没拦下来的每一次整树重排都会重写全部 transform。位置若和重建时不同，
+        // 屏幕上就是「整张图又滑一下」——但只看事件流分不清它是谁叫的：
+        // dur=0 说明别的路径已经把它压成瞬间了；dur=180 才是真正漏掉的动画。
+        // 现场日志里重建后 230–425ms 必有一次「252 个节点全动」，
+        // 而它前后都没有 settle.catch，就是在这里留痕的。
+        traceLog("settle.pass", {
+          dur: mm.options.duration,
+          phase: this.rt.phase,
+          left: Math.round(this.settleUntil - performance.now()),
+          // 取栈很贵，只有真在记录时才做
+          from: isTracing() ? callerOf() : undefined,
+        });
+        return origRender();
+      }
+
+      this.settleUntil = 0;
+      const prev: number = mm.options.duration;
+      traceLog("settle.catch", { duration: prev });
+      mm.setOptions({ duration: 0 });
+      try {
+        await origRender();
+      } finally {
+        mm.setOptions({ duration: prev });
+      }
+      if (this.rt.phase === "rebuilding") return;
+      // 位置在下一 tick 才写进 transform（d3 的 0ms 过渡也异步），
+      // 这里先排一次全量：observer 的 transform 通道会同步补连线，这一遍兜尺寸与收放点。
+      // 编辑态也排：这一遍现在几乎不写属性（缓存按 g 身份保留），
+      // 但能把「重排后卡片尺寸变了」的那一个节点补正。
+      this.frames.requestAll();
+    };
+    (mm as unknown as { renderData: typeof patchedRender }).renderData = patchedRender;
+
+    // 再包一层 `transition(sel)`：markmap 里**所有**会写 transform / 半径 / 位置的地方
+    // 都经过它（`renderData` 里 10 处，`fit`/`ensureVisible` 也走它）。
+    // 记下「谁在什么时候创建了一条多大的过渡、当时 duration 是多少」，
+    // 才能在日志里解释「这批 transform 是谁写的」——尤其是那些**创建得很早、
+    // 落地得很晚**的过渡（它们的写入发生在 creation + duration 之后，
+    // 现场会表现为「重建结束 260ms 后整树又动一下，却没有 render.enter」）。
+    const withTransition = mm as unknown as { transition?: (sel: unknown) => unknown };
+    const origTransition = withTransition.transition?.bind(mm);
+    if (typeof origTransition === "function") {
+      withTransition.transition = function tracedTransition(sel: unknown): unknown {
+        if (isTracing()) {
+          const sized = sel as { size?: () => number };
+          traceLog("tr.create", {
+            dur: mm.options.duration,
+            n: typeof sized.size === "function" ? sized.size() : -1,
+            from: callerOf(),
+          });
+        }
+        return origTransition(sel);
+      };
+    }
+  }
+
+  /**
    * 监听导图的布局变化，并按变化类型分流。
    *
    * **只听 transform，不听 width/height**。实测（257 节点、折叠一帧动画）：
@@ -623,88 +927,234 @@ export class MindmapView extends ItemView {
    */
   private observeLayout(svg: SVGSVGElement): void {
     this.observer?.disconnect();
-    this.observer = new MutationObserver((records: MutationRecord[]) => {
-      let structural = false;
-      const moved = new Set<SVGGElement>();
-      /** markmap 重写 class 的节点（选中 class 会被它原地抹掉） */
-      const recls = new Set<SVGGElement>();
-      /** foreignObject 透明度变了的节点 g（淡入淡出，要跟着一起淡） */
-      const faded = new Set<SVGGElement>();
+    this.observer = new MutationObserver((records: MutationRecord[]) =>
+      this.handleMutations(records),
+    );
+    this.observer.observe(svg, OBSERVE_OPTIONS);
+  }
 
-      for (const rec of records) {
-        if (rec.type === "childList") {
-          // 我们自己往节点 g 里插卡片/阴影/连线也会产生 childList。那不是
-          // 结构变化 —— 若当成结构变化，每次首次绘制都会再触发一次全量重绘，
-          // 折叠动画一开始就凭空多跑一遍。
-          if (!isOwnDecoration(rec)) structural = true;
-          continue;
+  /**
+   * 观察器的回调体（单独抽成方法，是为了能被 `raiseNodes` 手动调用一次 ——
+   * 见那里的注释：提层前先把积压的记录消化掉，不能直接丢掉）。
+   */
+  private handleMutations(records: MutationRecord[]): void {
+    let structural = false;
+    const moved = new Set<SVGGElement>();
+    /**
+     * 文字层宽高真的变了的节点。
+     *
+     * 和 `moved` 分开是因为**它们往往不重叠**：改一段文字让卡片往右长，
+     * 节点坐标一点没动（transform 同值被过滤），线也不用重画，只有卡片尺寸要跟上。
+     * 混进 `moved` 会让 `obs.transform` 的 jump 统计失真。
+     */
+    const resized = new Set<SVGGElement>();
+    /** markmap 重写 class 的节点（选中 class 会被它原地抹掉） */
+    const recls = new Set<SVGGElement>();
+    /** foreignObject 透明度变了的节点 g（淡入淡出，要跟着一起淡） */
+    const faded = new Set<SVGGElement>();
+    /**
+     * 本批「文字层透明度被改」的明细（`节点 old→new`）。
+     *
+     * 这是「闪烁」最直接的证据：重建本该瞬间到位（duration 0），
+     * 若日志里出现 `0.42→0.58` 这种斜坡，就说明有一条过渡没被挡掉、
+     * 而我们的卡片正在跟着它一起透明。
+     */
+    const fades: string[] = [];
+    /** 本批被 fadeGuard 当场抹掉的次数（正常应该覆盖所有 <1 的写入） */
+    let guardStrips = 0;
+    /** 本批「非装饰」childList 记录数：>0 就是真结构变化 */
+    let childRecords = 0;
+    /** 本批里单个节点的最大位移（px）：只用来记日志，回答「画面到底跳了多少」 */
+    let jumpPx = 0;
+
+    for (const rec of records) {
+      if (rec.type === "childList") {
+        // 我们自己往节点 g 里插卡片/阴影/连线也会产生 childList。那不是
+        // 结构变化 —— 若当成结构变化，每次首次绘制都会再触发一次全量重绘，
+        // 折叠动画一开始就凭空多跑一遍。
+        //
+        // 卡片里那段文字（foreignObject 内部）重新渲染也不是结构变化：
+        // 节点的增删只会落在 `<g>` 上，落不到 fo 里面去。见 isContentChurn。
+        if (!isOwnDecoration(rec) && !isContentChurn(rec)) {
+          structural = true;
+          childRecords++;
         }
+        continue;
+      }
 
-        const target = rec.target;
+      const target = rec.target;
 
-        // markmap 的 renderData 里有一句 `w.attr("class", ...)` —— 它把每个节点的
-        // class 重写一遍。**内存里的选中态不会变**，但 DOM 上的 obmind-selected
-        // 被抹掉了，表现就是「编辑完（或过一会儿）选中框自己没了」，
-        // 而 selectedLine 还指着那一行：再按 Tab 会凭空多出一个子级。
-        // 它每次重排都会触发（内容尺寸变化 → 它自己的 ResizeObserver → 100ms 后重排），
-        // 所以必须当成事件来跟，不能只在重建后补一次。
-        if (rec.attributeName === "class") {
-          if (target instanceof SVGGElement && target.classList.contains("markmap-node")) {
-            recls.add(target);
-          }
-          continue;
-        }
-
-        // 节点内文字的透明度：markmap 折叠/展开时每帧写一次。
-        // 我们的卡片/连线/收放点是自绘的，得跟着它一起淡，否则「字淡没了、方块还在飞」。
-        if (rec.attributeName === "style") {
-          const parent = target.parentElement;
-          if (
-            target instanceof SVGForeignObjectElement &&
-            parent instanceof SVGGElement &&
-            parent.classList.contains("markmap-node")
-          ) {
-            // 重建收尾这一小段里，< 1 的 opacity 是 d3 的 enter 过渡（不是折叠动画）。
-            // duration 0 的重建本该瞬间到位，可过渡仍然异步到下一帧 —— 那一帧画出来
-            // 就是「新建节点时整排兄弟卡片没字」。这里当场抹掉，赶在绘制之前。
-            if (this.inFadeGuard() && target.style.opacity !== "") {
-              target.style.opacity = "";
-              continue;
-            }
-            faded.add(parent);
-          }
-          continue;
-        }
-
+      // 文字层（foreignObject）的宽高：卡片尺寸唯一的输入源。
+      // 只比值 —— markmap 每次 renderData 都会把 250 个节点的 width/height
+      // 无条件重写一遍，同值的那批必须直接丢掉，否则每次重排都是一次全量重绘。
+      if (rec.attributeName === "width" || rec.attributeName === "height") {
         if (
-          !(target instanceof SVGGElement) ||
-          !target.classList.contains("markmap-node")
+          target instanceof SVGForeignObjectElement &&
+          target.getAttribute(rec.attributeName) !== rec.oldValue
         ) {
-          continue;
+          const parent = target.parentElement;
+          if (parent instanceof SVGGElement && parent.classList.contains("markmap-node")) {
+            resized.add(parent);
+          }
         }
-        moved.add(target);
+        continue;
       }
 
-      if (structural) {
-        this.frames.requestAll();
-      } else if (moved.size > 0) {
-        // 同步重绘，不走 rAF：d3 刚在这一帧的 rAF 回调里写完 transform，
-        // MutationObserver 回调紧跟着在微任务里跑 —— 此刻重画连线仍是同一帧，
-        // 线和节点一起落位。排到下一个 rAF 就会晚一帧，动画里看着线在追节点。
-        this.frames.paintMoved(moved);
+      // markmap 的 renderData 里有一句 `w.attr("class", ...)` —— 它把每个节点的
+      // class 重写一遍。**内存里的选中态不会变**，但 DOM 上的 obmind-selected
+      // 被抹掉了，表现就是「编辑完（或过一会儿）选中框自己没了」，
+      // 而 selectedLine 还指着那一行：再按 Tab 会凭空多出一个子级。
+      // 它每次重排都会触发（内容尺寸变化 → 它自己的 ResizeObserver → 100ms 后重排），
+      // 所以必须当成事件来跟，不能只在重建后补一次。
+      if (rec.attributeName === "class") {
+        if (target instanceof SVGGElement && target.classList.contains("markmap-node")) {
+          recls.add(target);
+        }
+        continue;
       }
-      if (recls.size > 0) this.paintSelectionOn(recls);
-      if (faded.size > 0) this.frames.syncFade(faded);
-    });
-    this.observer.observe(svg, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      // class：markmap 重排会重写节点 class（会把选中态抹掉），
-      // style：节点文字的 opacity（淡入淡出），卡片要跟着淡。
-      // 都不含 width/height —— 那个它每帧都写一遍同值，听了就是每帧全量重绘。
-      attributeFilter: ["transform", "class", "style"],
-    });
+
+      // 节点内文字的透明度：markmap 折叠/展开时每帧写一次。
+      // 我们的卡片/连线/收放点是自绘的，得跟着它一起淡，否则「字淡没了、方块还在飞」。
+      if (rec.attributeName === "style") {
+        const parent = target.parentElement;
+        if (
+          target instanceof SVGForeignObjectElement &&
+          parent instanceof SVGGElement &&
+          parent.classList.contains("markmap-node")
+        ) {
+          // 重建收尾这一小段里，< 1 的 opacity 是 d3 的 enter 过渡（不是折叠动画）。
+          // duration 0 的重建本该瞬间到位，可过渡仍然异步到下一帧 —— 那一帧画出来
+          // 就是「新建节点时整排兄弟卡片没字」。这里当场抹掉，赶在绘制之前。
+          if (this.inFadeGuard() && target.style.opacity !== "") {
+            target.style.opacity = "";
+            guardStrips++;
+            continue;
+          }
+          // style 里改的不一定是 opacity：编辑器打开时那层 `visibility: hidden`
+          // 也走这条分支（见 edit/inlineText.ts）。那种改动跟淡入淡出无关，
+          // 混进来会在日志里留下一条 `obs.fade 节点 -->-` 的假证据 ——
+          // 上一份现场日志里三条 obs.fade 全是它，白让人怀疑「谁把文字弄透明了」。
+          const before: string = styleOpacityOf(rec.oldValue);
+          const after: string = target.style.opacity === "" ? "-" : target.style.opacity;
+          if (before === after) continue;
+          faded.add(parent);
+          // 只留少量明细：折叠动画一秒几百条，全记会把有用的行冲掉
+          if (fades.length < 6) {
+            fades.push(`${nodeLabel(parent)} ${before}->${after}`);
+          }
+        }
+        continue;
+      }
+
+      if (
+        !(target instanceof SVGGElement) ||
+        !target.classList.contains("markmap-node")
+      ) {
+        continue;
+      }
+      // markmap 的 `renderData` 会**无条件**把每个节点的 transform 重写一遍
+      // （走 selectAll.merge 的 transition），值往往一模一样；折叠动画里更是
+      // 每帧写一遍。同值重写不是「动了」——放进去就等于每帧重画几百条
+      // 一模一样的连线，而日志里的 n 也永远是全量，看不出「真挪了几个」。
+      if (rec.oldValue !== null) {
+        const raw = target.getAttribute("transform");
+        if (raw === rec.oldValue) continue;
+        // 位移差就是「这一批画面真实挪了多少像素」——闪烁的量化证据
+        const from = translateOf(rec.oldValue);
+        const to = translateOf(raw);
+        if (from && to) {
+          const d: number = Math.hypot(to.x - from.x, to.y - from.y);
+          if (d > jumpPx) jumpPx = d;
+        }
+      }
+      moved.add(target);
+    }
+
+    if (structural) {
+      // 结构变化那一批里通常**同时**有一堆 transform 变化（新节点 enter 前后，
+      // 兄弟整列让位）。只 requestAll 的话，全量绘制要等到下一帧 ——
+      // 中间这一帧屏幕上就是「卡片已经到新位置、线还停在旧位置」。
+      // 先把这一批同步补一遍（成本只和本批节点数成正比），再让全量兜尺寸与收放点。
+      if (moved.size > 0) this.frames.paintMoved(moved);
+      this.frames.requestAll();
+      // jump / dt 是这一批最要紧的两个数：
+      // - jump：本批单点最大位移（px）。重建之后 300ms 又冒出 jump=100 就是「图又跳了一下」；
+      // - dt：距上次重建结束多少毫秒。同一个 jump 在重建当帧出现是正常的落位，
+      //   在 +400ms 出现才是有人又重排了一遍。
+      traceLog("obs.structural", {
+        recs: records.length,
+        child: childRecords,
+        moved: moved.size,
+        jump: Math.round(jumpPx),
+        dt: Math.round(performance.now() - this.rebuildEndAt),
+      });
+    } else if (moved.size > 0) {
+      // 同步重绘，不走 rAF：d3 刚在这一帧的 rAF 回调里写完 transform，
+      // MutationObserver 回调紧跟着在微任务里跑 —— 此刻重画连线仍是同一帧，
+      // 线和节点一起落位。排到下一个 rAF 就会晚一帧，动画里看着线在追节点。
+      this.frames.paintMoved(moved);
+      // 折叠动画里每帧一批；限流到 100ms 一条，用来回答「什么时候又有一大批节点在动」
+      // ——改字重排完之后若还冒出一批，就是 markmap 自己那个 100ms 防抖重排又跑了一遍。
+      // jump = 这一批里单个节点最大位移（px）：>50 且出现在 rebuild 之后 = 画面又整体跳了一下。
+      traceLogEvery("transform", 100, "obs.transform", {
+        n: moved.size,
+        jump: Math.round(jumpPx),
+      });
+    }
+    // 只变宽变高、位置没动的那批：单独补一次增量绘制（每节点只有 8 个属性写）。
+    // 不做这一步的后果就是用户截图那张：新文字比旧卡片宽，直接顶出边框，
+    // 而且要等到下一次**别的原因**触发全量绘制才会回正。
+    if (resized.size > 0 && !structural) {
+      this.frames.paintMoved(resized);
+      traceLog("obs.resize", { n: resized.size });
+    }
+    if (recls.size > 0) {
+      this.paintSelectionOn(recls);
+      traceLog("obs.class", { n: recls.size });
+    }
+    if (guardStrips > 0) traceLog("guard.strip", { n: guardStrips });
+    if (faded.size > 0) {
+      // 少量节点的透明变化逐条记（「某几个卡片莫名变透明」的可疑现场就是它），
+      // 成批淡出（折叠动画）只记数量，否则一秒几百行把有用信息冲掉
+      if (faded.size <= 3) {
+        for (const f of fades) traceLog("obs.fade", { node: f });
+      } else {
+        traceLog("obs.fadeBatch", { n: faded.size, guard: this.inFadeGuard() });
+      }
+    }
+  }
+
+  /**
+   * 把一批节点 g 提到父容器末尾（拖动时用，SVG 没有 z-index）。
+   *
+   * 两件事必须一起做：
+   * 1. 先把**积压**的记录交给 `handleMutations` —— 直接 `disconnect` 会把它们
+   *    一起丢掉，那批记录里可能正有「节点动了」，丢了线就停在旧位置；
+   * 2. 提层本身产生的 childList 记录必须**吞掉**：每个 `appendChild` 会产生两条
+   *    （add=0/rem=1 与 add=1/rem=0，实测），被当成结构变化就会触发一次全图重绘，
+   *    而重绘会把拖动块刚刚摘掉的对外线接回来 —— 现场日志 `drag.links n=1`
+   *    之后 170ms 冒出 `paint.all boxes=257`，接着整段拖动都带着一根线。
+   *
+   * 用 `disconnect` + 重新 `observe` 而不是「按 class 猜哪条是我干的」：
+   * 回调可能被主线程拖后几百毫秒（日志里 9713 → 9879），那时 class 早被摘掉了，
+   * 启发式必然失效。
+   */
+  private raiseNodes(els: SVGGElement[]): void {
+    const parent: Element | null = els[0]?.parentElement ?? null;
+    if (!parent) return;
+    const ob = this.observer;
+    const svg = this.svgEl;
+    if (ob) {
+      const pending: MutationRecord[] = ob.takeRecords();
+      if (pending.length > 0) this.handleMutations(pending);
+      ob.disconnect();
+    }
+    try {
+      for (const g of els) parent.appendChild(g);
+    } finally {
+      if (ob && svg) ob.observe(svg, OBSERVE_OPTIONS);
+    }
+    traceLog("drag.raise", { n: els.length });
   }
 
   /**
@@ -968,6 +1418,9 @@ export class MindmapView extends ItemView {
       case "newNote":
         void this.createNoteForSelected();
         break;
+      case "block":
+        this.openBlockMenu();
+        break;
       case "delete":
         this.removeNode();
         break;
@@ -1014,6 +1467,8 @@ export class MindmapView extends ItemView {
       bar.setEnabled("sibling", onAny);
       bar.setEnabled("outdent", onNode);
       bar.setEnabled("delete", onNode);
+      // 插入块也是「从这一行长出东西」，多选时没有唯一宿主，只能单选
+      bar.setEnabled("block", onAny && this.selectedLines.size === 1);
       // 「新建笔记」不是置灰而是隐藏：节点已经有双链时它没有任何意义，
       // 留一个灰图标在那儿，用户只会反复点它试为什么点不动（见 canCreateNoteFor）
       bar.setHidden("newNote", !this.canCreateNoteFor(src));
@@ -1059,7 +1514,7 @@ export class MindmapView extends ItemView {
   /** 编辑选中节点（操作栏的铅笔按钮） */
   private editSelected(): void {
     const node = this.findNodeByLine(this.selectedLine);
-    if (node) this.startEdit(node, false);
+    if (node) this.startEdit(node);
   }
 
   /**
@@ -1471,56 +1926,6 @@ export class MindmapView extends ItemView {
     this.emptyEl?.hide();
   }
 
-  /**
-   * 把代码块 / 公式块交给 Obsidian 自己的 MarkdownRenderer 渲染。
-   *
-   * 为什么不自己渲染：
-   * - 公式要么引 katex（打包多 300KB，还要带一整套字体），要么自己写 LaTeX 解析，都不划算；
-   * - 代码高亮同理，Obsidian 内部已有一套且跟随主题配色。
-   * 走官方渲染器的额外好处是观感和笔记里完全一致，用户不用适应两套排版。
-   *
-   * 必须在 setData **之前**跑完：markmap 是按 content 里的 DOM 量节点宽高的，
-   * 先用占位灌图、事后再替换内容，节点尺寸会和实际文字脱节（裁剪或留白）。
-   */
-  private async renderBlocks(tree: IPureNode, file: TFile): Promise<void> {
-    const jobs = collectBlocks(tree);
-    // 上一轮的组件（MathJax、语法高亮注册）先释放，否则每刷新一次堆一批
-    for (const part of this.blockParts) part.unload();
-    this.blockParts = [];
-    if (jobs.length === 0) return;
-
-    await Promise.all(
-      jobs.map(async ({ node, block }: { node: IPureNode; block: BlockInfo }) => {
-        const key = `${block.kind}|${block.lang}|${block.raw}`;
-        const cached: string | undefined = this.blockCache.get(key);
-        if (cached !== undefined) {
-          node.content = cached;
-          return;
-        }
-
-        const holder = document.createElement("div");
-        const part = new Component();
-        // 先 load：MarkdownRenderer 会把高亮/MathJax 渲染器作为子组件挂上来，
-        // 父组件没 load 的话子组件不会启动，公式就一直是原始 `$$…$$`。
-        part.load();
-        this.blockParts.push(part);
-        try {
-          await MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
-          const html: string = holder.innerHTML.trim();
-          if (html !== "") {
-            node.content = html;
-            // 缓存控制在几百条，够覆盖正常切换；无限涨没意义
-            if (this.blockCache.size > 300) this.blockCache.clear();
-            this.blockCache.set(key, html);
-          }
-        } catch (err) {
-          // 渲染失败就保留占位（「代码块 · js · 12 行」），至少不整块消失
-          console.warn("[obmind] 代码块/公式块渲染失败，保留占位", err);
-        }
-      }),
-    );
-  }
-
   /** 把主题应用到画布与 svg 上（背景、CSS 变量、卡片开关） */
   private applyTheme(spec: ThemeSpec): void {
     const changed = !this.currentSpec || this.currentSpec.id !== spec.id ||
@@ -1624,6 +2029,8 @@ export class MindmapView extends ItemView {
     //   · markmap 的包围盒还是空的（rect 宽高为 0）：内容全堆在原点，看上去一片空白；
     //   · 视口尺寸为 0 时 fit 出来的 scale = 0：整张图缩成一个点。
     if (!this.fitHealthy()) {
+      // 包围盒空 / scale 为 0：这一次适配等于把图留在模糊状态，紧接着会重试
+      traceLog("fit.unhealthy", { tries, k: this.zoomScale().toFixed(3) });
       if (tries < 4) {
         this.pendingFit = true;
         this.scheduleFitRetry(tries);
@@ -1631,6 +2038,8 @@ export class MindmapView extends ItemView {
       return;
     }
     this.fittedSize = size;
+    // 每次 fit 都会动整张图的缩放：短时间内连续出现多条 = 画面在整体抖
+    traceLog("fit.done", { w: size.w, h: size.h, k: this.zoomScale().toFixed(3), tries });
   }
 
   /** fit 之后的自检：包围盒非空、缩放比例是有效正数 */
@@ -1722,6 +2131,7 @@ export class MindmapView extends ItemView {
   }
 
   private async project(rev: number, knownContent?: string): Promise<void> {
+    const t0 = traceSince();
     this.syncThemeButton();
 
     if (!this.svgEl) return;
@@ -1783,6 +2193,28 @@ export class MindmapView extends ItemView {
       sourceSame: prev !== null && prev.content === content,
     });
 
+    // 走哪条通道决定了「会不会闪」：none/patch 都不重建 DOM，
+    // 只有结构通道要 setData 换掉整批 g —— 日志里看到 rebuild 就该往重建链路想。
+    // why 是「为什么必须重建」（见 app/plan.ts 的 StructureReason）：
+    // 改一个字却出现 why=line/depth，说明是行号位移或缩进变了，不是文字变了。
+    traceLog("refresh.plan", {
+      kind: plan.kind,
+      why: plan.kind === "structure" ? plan.reason : undefined,
+      at: plan.kind === "structure" ? plan.at : plan.kind === "patch" ? plan.line : undefined,
+      lines: isTracing() ? `${countLines(prev?.content)}->${countLines(content)}` : undefined,
+      nodes: isTracing() ? `${countNodes(prev?.tree ?? tree)}->${countNodes(tree)}` : undefined,
+      file: file.basename,
+      load: traceElapsed(t0),
+    });
+
+    // why 只说「哪一类原因」，这里把「具体哪几个节点、行号/文字怎么变的」也写下来。
+    // 一次复现就能定位，不必再来一轮。
+    if (isTracing() && plan.kind === "structure" && prev) {
+      for (const detail of explainDiff(prev.tree, tree, 4)) {
+        traceLog("refresh.diff", { detail });
+      }
+    }
+
     if (plan.kind === "none") {
       this.snapshot = {
         content,
@@ -1799,7 +2231,7 @@ export class MindmapView extends ItemView {
     // 只改了一处文字：直接换那个节点的 DOM，不 setData。
     // markmap 的 key 里带内容哈希，setData 会让整棵树重新 enter（DOM 全量重建）；
     // 而它自己对节点内容挂了 ResizeObserver，尺寸一变会重排，这就是官方支持的增量路径。
-    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content)) {
+    if (plan.kind === "patch" && this.applyPatch(plan.line, plan.content, plan.src)) {
       this.snapshot = {
         content,
         tree,
@@ -1817,9 +2249,8 @@ export class MindmapView extends ItemView {
     // 不接住的话用户折起来的分支每次编辑都会全弹开。
     applyFolds(tree, collectFolds(this.mm?.state.data));
 
-    // 代码块/公式块必须在 setData 前渲染成真正的 HTML，
-    // 否则 markmap 量到的是占位字符串的尺寸
-    await this.renderBlocks(tree, file);
+    // 块（代码 / 引用 / 表格）已经在解析层变成节点 content 里的一行了，
+    // 不需要再交给 MarkdownRenderer —— 那是「展开渲染」时代的事
     if (this.rt.stale(rev)) return;
 
     const restructure = (): Promise<void> => this.applyTree(tree);
@@ -1830,6 +2261,7 @@ export class MindmapView extends ItemView {
       // 这里先建实例、再 setData，最后用无动画的 fitInstant 适配。
       this.mm = Markmap.create(this.svgEl, this.buildOptions(spec));
       this.applyZoomFilter();
+      this.attachSettleHook(this.mm);
       this.snapshot = {
         content,
         tree,
@@ -1878,9 +2310,13 @@ export class MindmapView extends ItemView {
    *
    * @returns false 表示这个节点当前不在 DOM 里（折叠/已被替换），只能退回全量重建
    */
-  private applyPatch(line: number, content: string): boolean {
+  private applyPatch(line: number, content: string, src: SrcRef): boolean {
     const g = this.findNodeByLine(line);
-    if (!g) return false;
+    if (!g) {
+      // 节点不在 DOM 里（折叠 / 刚被换掉）→ 这次会退回结构重建，下次就看到 rebuild 了
+      traceLog("patch.miss", { line });
+      return false;
+    }
 
     const fo = g.querySelector<SVGForeignObjectElement>(":scope > foreignObject");
     // markmap 的结构是 foreignObject.markmap-foreign > div > div，最内层承载内容
@@ -1891,20 +2327,47 @@ export class MindmapView extends ItemView {
     // 视觉上就是文字闪一下（「提交即预览」已经把新文字画上去了，这里多数时候是同值）。
     const changed: boolean = box.innerHTML !== content;
     if (changed) box.innerHTML = content;
+    // changed=false 是正常路径（预览已经铺过），日志里出现大量 true 说明预览没接上
+    traceLog("patch.apply", { line, changed });
 
     // 同步写回 markmap 手里的节点数据：后续拖动等逻辑读的是 DOM，
     // 但下次结构重建前若有其它代码看 state.data，内容不能是旧的。
     // 刻意不动 state.key —— 一改 key 就等于宣布「这是新节点」，patch 就白做了。
+    //
+    // **src 必须一起换（1.18.5）**：编辑框的初始文本来自 `payload.src.text`，
+    // 而 patch 通道是唯一不改这棵树的路径 —— 不写回去，节点上显示的是新内容、
+    // 点开编辑却是上一次的文字（新建节点后第一次改字必然踩到：那句话就是「新节点」）。
     const data = (g as SVGGElement & { __data__?: INode }).__data__;
-    if (data) data.content = content;
+    if (data) {
+      data.content = content;
+      const payload = data.payload as { src?: SrcRef } | undefined;
+      if (payload && payload.src) {
+        const before: string = payload.src.text;
+        // 换引用而不是 Object.assign：新行可能少了 endLine / blockStart 之类的字段，
+        // 逐字段覆盖会把这些「上一次才有」的值留下来，于是 startEdit 会误判成多行节点。
+        payload.src = src;
+        traceLog("patch.src", { line, from: before.slice(0, 12), to: src.text.slice(0, 12) });
+      } else {
+        // 拿不到 payload 就没法回写 —— 下一步必然又是「显示新字、编辑旧字」
+        traceLog("patch.src.miss", { line });
+      }
+    }
 
-    // 尺寸可能变了（文字变长/变短）。立刻量一次让卡片先跟上，
-    // markmap 稍后自己重排时会把 width/height 覆盖成最终值，届时 observer 会再刷一次。
+    // 尺寸可能变了（文字变长/变短）。立刻量一次让卡片先跟上。
+    //
+    // 量完必须当场把**这一个节点**画一遍：`fo.width` 是 markmap 的文字层，
+    // 我们的卡片是另一个 `<rect>` —— 改属性不会让它自己变大。以前这里指望
+    // 「随后的 reflowNow 会画一次」，但那条路在编辑态被相位闸门挡掉了
+    // （见 reflowNow 的注释），于是卡片停在旧宽度：新文字比卡片宽，直接顶出
+    // 边框（用户截图），而且之后**没有任何事件**会来修它。
+    // paintMoved 是同步的，只写这个节点（命中缓存时约 8 个属性），成本可忽略；
+    // 邻居让位仍然交给 reflowSoon 的整树重排。
     const w: number = box.scrollWidth;
     const h: number = box.scrollHeight;
     if (w > 0 && h > 0) {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h));
+      this.frames.paintMoved([g]);
     }
     // 幂等：内容没换（提交即预览已经铺过）就不必再排一次整树布局
     if (changed) this.reflowSoon();
@@ -1927,8 +2390,25 @@ export class MindmapView extends ItemView {
    * 排到下一帧而不是立刻跑：previewText 与随后的 applyPatch 会在同一轮里各改一次，
    * 合并成一次重排就够。
    */
+  /**
+   * 是否正在重建（DOM 是半成品，绘制与重排都得让路）。
+   *
+   * 单独抽成方法而不是写 `this.rt.phase === "rebuilding"` 两次：TS 会把第一次
+   * 早退的窄化**一直带到 await 之后**，第二次同样的比较会报「两个类型没有重叠」——
+   * 而那一处恰恰是必须保留的判断（`renderData` 期间可能又开始一轮重建）。
+   */
+  private rebuilding(): boolean {
+    return this.rt.phase === "rebuilding";
+  }
+
   private reflowSoon(): void {
-    if (this.reflowFrame !== 0) return;
+    if (this.reflowFrame !== 0) {
+      // 合并掉一次：previewText 和随后的 applyPatch 会在同一轮里各改一次，
+      // 正常现象。若这里频繁出现而 reflow.start 不多，说明重排被合并得过头。
+      traceLog("reflow.coalesce");
+      return;
+    }
+    traceLog("reflow.soon");
     this.reflowFrame = window.requestAnimationFrame(() => {
       this.reflowFrame = 0;
       void this.reflowNow();
@@ -1942,9 +2422,28 @@ export class MindmapView extends ItemView {
 
     // 撞上重建就别插手：这一帧的 DOM 正在被 setData 换掉，再调一次 renderData
     // 只会把半成品重排一遍（还会重写 opacity/class）。重建结束的 paintNow 会做同一件事。
-    if (this.rt.phase !== "idle") return;
+    //
+    // **编辑态要放行**（1.18.10）。判据以前是 `!== "idle"`，于是「提交即预览」
+    // 那次重排永远被跳过 —— 预览是在 phase 还是 editing 的时候调的，而写盘是异步的，
+    // rAF 早就到了：日志里就是一串 `reflow.skip phase=editing`。
+    // 跳过之后写盘的 applyPatch 又因为「预览已经把 innerHTML 铺成一样」不请求重排，
+    // 结果是这个节点**一次绘制都没发生**：文字层换了新宽度，自绘卡片还是旧 rect，
+    // 屏幕上就是「文字溢出卡片边框」，且永远不会自己恢复。
+    // 编辑态下 DOM 是完整的（编辑框是浮层，原文只是 visibility: hidden），安全。
+    if (this.rebuilding()) {
+      traceLog("reflow.skip", { phase: this.rt.phase });
+      return;
+    }
 
+    const t0 = traceSince();
+    // duration 进日志：这条路径临时把它改成 0，恢复时若 prev 已经是 0 会退回 180。
+    // 若日志里反复出现「duration=180 而本来应该是别的值」，动画速度就被改过了。
+    traceLog("reflow.start", { duration: mm.options.duration });
     const prev: number = mm.options.duration;
+    // 这一遍 renderData 会让内容 div 再一次「变尺寸」，markmap 自己的防抖回调
+    // 100ms 后还会再排一次（现场日志：reflow.rendered 之后 200ms 又冒一个
+    // obs.class n=全部节点 + paint.moved n=全部节点）。同一个窗口把那次也压平。
+    this.settleUntil = performance.now() + 1200;
     mm.setOptions({ duration: 0 });
     try {
       await mm.renderData();
@@ -1953,12 +2452,18 @@ export class MindmapView extends ItemView {
     } finally {
       // prev 可能已经是 0（上一次重排还没收尾）：退回默认值，别把动画永久关掉
       mm.setOptions({ duration: prev > 0 ? prev : 180 });
+      traceLog("reflow.rendered", { dt: traceElapsed(t0), prev });
     }
 
     // 等 renderData 的这几帧里可能又开始了一轮重建：别用刚被换掉的 DOM 去画
-    if (this.rt.phase !== "idle") return;
+    if (this.rebuilding()) {
+      traceLog("reflow.abort", { phase: this.rt.phase });
+      return;
+    }
     // 节点位置变了，卡片/连线要按新几何重新摆；renderData 同时会把每个节点的
     // class 整段重写（attr("class", …)），选中标记会被抹掉，所以顺手补回。
+    // 整树重排 = 「DOM 上的 class 全部不可信」，代数 +1 强制重刷一次。
+    this.structureGen++;
     this.frames.paintNow();
     this.paintSelection();
   }
@@ -1989,37 +2494,261 @@ export class MindmapView extends ItemView {
     this.rt.setPhase("rebuilding");
     // 挡住这一轮重建的淡入（见 fadeGuardUntil）：`setData` 内部的 await 会让出
     // 一两帧给浏览器，那几帧若不挡，用户看到的就是「整排兄弟卡片文字消失」。
-    // 窗口只要覆盖「重建中 + 重建后 d3 收尾那一两帧」，别开太长 ——
-    // 这段时间里用户去点收放点折叠，淡出也会被一起抹掉。
+    //
+    // **窗口必须从 `setData` 返回之后才开始算**。1.18.1 的日志实测：251 个节点的
+    // `setData` 同步阻塞 400–550ms，而这里原本的 50ms 是调用前就开始计时的 ——
+    // 也就是整个 setData 期间窗口早就过期（日志里 `guardLeft=-468`），
+    // 真正会写 opacity 的那批 enter/exit 过渡恰好发生在 setData 返回后的 1–2 帧
+    // （日志：`rebuild.end` 之后 2.7ms 冒出 `obs.fadeBatch n=72 guard=false`），
+    // 于是卡片被抄成半透明、下一帧再恢复 —— 闪的就是这一下。
+    // 所以在 `await` 之后再重设一次窗口（见下面），这里只是先挡住中途那几帧。
     this.fadeGuardUntil = performance.now() + 50;
+
+    // 记录起点：下面每一步的 dt 都是「距上一阶段」。
+    // 注意 guard 窗口是从**现在**算的 50ms —— 若 setData 本身跑了 200ms，
+    // 收尾阶段其实已经没有保护了（日志里 guardLeft 为负就是这个意思）。
+    const t0 = traceSince();
+    traceLog("rebuild.start", {
+      duration: mm.options.duration,
+      nodes: isTracing() ? countNodes(tree) : undefined,
+    });
+
     const prev: number = mm.options.duration;
     mm.setOptions({ duration: 0 });
     try {
       await mm.setData(tree);
+      // 真正的 enter/exit 过渡从这一刻才开始（setData 内部那次 await 期间主线程
+      // 一直被占着，d3 的 timer 根本轮不到）。窗口在这里重设，才真的盖住那 1–2 帧。
+      // 120ms：足够 d3 跑完 duration 0 的收尾，又短到不会误伤用户手点的折叠淡出。
+      this.fadeGuardUntil = performance.now() + 120;
+      // 同理：markmap 自己挂的 ResizeObserver 会在 setData 之后（现场实测 700–800ms）
+      // 再跑一遍整树重排，那时 duration 已恢复成 180 → 整张图重播一遍动画。
+      // 给它一个 1.2s 的窗口，落进来就按 duration 0 跑（见 attachSettleHook）。
+      this.settleUntil = performance.now() + 1200;
+      traceLog("rebuild.setData", { dt: traceElapsed(t0) });
+
       // 旧节点是走 transition 移除的，即使 duration=0 也要等一个 tick。
       // 这期间它们还在 DOM 里、文字已透明，但我们的卡片是不透明的 ——
       // 同步重绘会把这些「幽灵卡片」按旧几何画出来，屏幕上就会闪出几个空框。
-      this.dropDetached();
+      let step = traceSince();
+      const ghosts: number = this.dropDetached();
+      traceLog("rebuild.ghost", {
+        n: ghosts,
+        dt: traceElapsed(step),
+        guardLeft: Math.round(this.fadeGuardUntil - performance.now()),
+      });
+
       // 重建期间没挡住的残余（比如 observer 还没跑到的那几条记录）在这里清掉：
       // 位置已经是瞬间到位的，任何 < 1 的透明度都不该留下来。
-      this.clearFade();
+      step = traceSince();
+      const faded: number = this.clearFade();
+      traceLog("rebuild.clearFade", { n: faded, dt: traceElapsed(step) });
+
       // 刚 enter 的节点 markmap 还没来得及写 width/height（它下一次 renderData 才量），
       // 此刻全量绘制会读不到几何 → 新节点第一帧**没有卡片**，只有裸文字。
       // 缺尺寸的才去量（scrollWidth 会强制同步布局，不能对所有节点做）。
-      this.measureMissing();
-      // 结构变了，缓存的 g/元素引用可能已经对应到别的节点上，全部作废重来
+      step = traceSince();
+      const measured: number = this.measureMissing();
+      traceLog("rebuild.measure", { n: measured, dt: traceElapsed(step) });
+
+      // 丢掉「按位置索引」的缓存（path → g）与「整块平移中」的登记。
+      // **绘制缓存不丢**：d3 按 key join，没变的节点复用同一个 `<g>`，
+      // 全丢会让紧接着的 paintAll 对每个节点重写 24 个属性（250 节点 ≈ 5 500 次写），
+      // 把整张图的 style/layout 全部作废 —— 而其中九成值根本没变。
+      // 单条失效交给 entryOf 的身份核对（g 换了就重建那一条）。
       this.frames.reset();
+      // 必须在画之前清：拖动块是用 CSS `translate` 跟着鼠标走的，
+      // 而 d3 重建时很可能**复用同一个 g**（key 没变）—— 那份 translate 会留在
+      // 新节点上，于是卡片带着整个鼠标位移被画到错误的位置，连线还被拉成一条斜的
+      // （用户说的「飘线」）。现场日志 `drag.shift.gone ms=672` 就是这个窗口。
+      //
+      // 但「正在拖的那一块」不能清：用户放手后立刻抓下一个节点时，上一次的重建
+      // 正好在这时收尾，无条件全清会把手上这块当场拽回原处。
+      const liveMembers: Set<SVGGElement> = new Set(this.drag?.liveMembers() ?? []);
+      const liveRoots: SVGGElement[] = this.drag?.liveRoots() ?? [];
+      this.drag?.settleNow();
+      this.sweepDragShift(liveMembers);
+      // reset 已经把登记清空了，这里只把还在手上的块根补回去
+      if (liveRoots.length > 0) this.painter.markShifted(liveRoots, true);
+      // 画之前先把「DOM 位置」追平「布局真值」——这是「新建节点后子树飘走再飘回来」的解药。
+      //
+      // `await setData()` 返回的那一刻，DOM 里的 transform 还是 enter 起点
+      // （`renderData` 里那句同步的 `$.attr("transform", …)`，全量 enter 时统一是根节点右下角），
+      // 终点要等 d3 那条 duration=0 的过渡在第一帧才写进来。
+      // 而我们的卡片是**按 transform 画的** —— 这一刻画下去，卡片就落在根节点角落，
+      // 于是屏幕上「新建的那个节点和它后面所有节点一起飘到远处」，等 d3 写完再跳回来。
+      // 探针实测（`tmp/lagProbe.ts`，77 节点插一个）：setData 返回 +1ms 时 **75 个节点**
+      // 位置与 `state.rect` 不符、最大偏 **1260px**，一帧后归零（每节点只出现过 2 个
+      // transform 值 = 一次瞬移，不是动画）。
+      // 这里既然已经把 duration 置 0 了（语义就是「瞬间到位」），就把终点直接写进去，
+      // 让 d3 第一帧无事可做。实测追平后再看 40 帧：一次都没被改回去。
+      const synced = this.syncStalePositions();
+      if (synced.n > 0) traceLog("rebuild.syncPos", { n: synced.n, max: Math.round(synced.max) });
+      step = traceSince();
       this.frames.paintNow();
+      // 这一遍画下去之后，卡片位置与「布局真值」(`state.rect`) 差多少？
+      //
+      // 关键判据：**卡片是按 DOM 里的 transform 画的，而 transform 是 d3 过渡的第一帧
+      // 才写进去的**。`await setData()` 返回时，刚 enter 的节点还停在 `renderData` 里
+      // 那句同步 `$.attr("transform", …)` 写的起点（= 根节点的右下角）。
+      // 所以这里 lag>0 就说明「这一帧画下去的卡片是错的」，max 就是它偏了多少像素；
+      // 紧接着的 `f.traj` 会逐帧给出「它什么时候才回来」。
+      if (isTracing()) {
+        const lag = measureLayoutLag(svg);
+        traceLog("paint.lag", {
+          lag: lag.n,
+          max: Math.round(lag.max),
+          fresh: lag.fresh,
+          worst: lag.worst,
+        });
+      }
+      traceLog("rebuild.paint", { dt: traceElapsed(step), total: traceElapsed(t0) });
     } finally {
       mm.setOptions({ duration: prev });
       this.rt.setPhase("idle");
+      this.rebuildEndAt = performance.now();
+      traceLog("rebuild.end", { total: traceElapsed(t0) });
     }
 
     // 重建换掉了整批 g：选中高亮和节点浮动条都要按行号重新挂回去。
     // 不挂的话，折叠再展开、拖一次节点之后，「选中」在视觉上就凭空丢了，
     // 而 selectedLine 其实还指着那一行 —— 用户按 Tab 会莫名其妙多出一个子级。
+    // 代数 +1：让 paintSelection 知道「DOM 上那些 obmind-selected 已经不可信了」。
+    this.structureGen++;
     this.paintSelection();
     this.syncToolbar();
+    this.startTrajTrace();
+  }
+
+  /**
+   * 把 DOM 里落后的 `transform` 直接写成布局真值 `state.rect`。
+   *
+   * 只在重建路径调用（那时 `duration` 已经是 0，「瞬间到位」本来就是它的语义）。
+   * 返回改了几个、最大偏差多少（-1 表示没量）。
+   *
+   * 三个边界：
+   * - `state.rect` 宽高为 0 = `_relayout` 还没把这个节点算进去（新 enter 且内容没量出来），
+   *   跳过 —— 交给 markmap 下一次 renderData 与我们的 `obs.resize` 通道。
+   * - 值相同就不写（绝大多数节点都不变，这一步对它们零成本）。
+   * - d3 那条过渡的第一帧会读当前值当起点，所以写完它算出来的插值就是「原地不动」，
+   *   不会把值改回去（探针 `tmp/lagProbe.ts` 场景 B 验过 40 帧）。
+   */
+  private syncStalePositions(): { n: number; max: number } {
+    const svg = this.svgEl;
+    const mm = this.mm;
+    if (!svg || !mm) return { n: 0, max: 0 };
+    // 有过渡在跑就别插手：那样会打断真正的动画（折叠、markmap 自己的收尾重排）
+    if (mm.options.duration !== 0) return { n: 0, max: 0 };
+    let n = 0;
+    let max = 0;
+    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
+      const rect = (
+        g as SVGGElement & {
+          __data__?: { state?: { rect?: { x: number; y: number; width: number; height: number } } };
+        }
+      ).__data__?.state?.rect;
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      const at = translateOf(g.getAttribute("transform"));
+      if (!at) continue;
+      const d: number = Math.hypot(at.x - rect.x, at.y - rect.y);
+      if (d <= 0.5) continue;
+      if (d > max) max = d;
+      g.setAttribute("transform", `translate(${rect.x},${rect.y})`);
+      n++;
+    }
+    return { n, max };
+  }
+
+  /**
+   * 重建之后逐帧记录「卡片画的 vs 布局真值」的差距（只在开日志时跑）。
+   *
+   * 为什么非要逐帧：`paint.lag` 只拍一张快照，只能说「这一刻画错了」；用户说的
+   * 「飘到远处再飘回来」到底是**一次瞬移**（一帧错、几帧后跳回来）还是
+   * **一条 180ms 的过渡**（十几帧连续中间值），只有连续采样能分开 —— 两者的修法
+   * 完全不同：前者要改绘制时机，后者要去掐那条过渡的 duration。
+   *
+   * 采样内容：`lag`=位置与 `state.rect` 不一致的节点数、`max`=最大偏差、`worst`=最差的那个、
+   * `fresh`=`state.rect` 还是 0 的节点数（布局压根没把它算进去）。
+   * 判读：`lag` 从大变小、若干帧后归零 → 瞬移；`lag` 连续十几帧都 >0 且 `max` 单调变小
+   * → 真的是动画在飞。
+   */
+  private startTrajTrace(): void {
+    if (!isTracing()) return;
+    if (this.trajRaf !== 0) {
+      window.cancelAnimationFrame(this.trajRaf);
+      this.trajRaf = 0;
+    }
+    const t0 = performance.now();
+    // 1600ms 上限：现场最慢的收尾重排是 700–800ms，再留一倍余量。
+    // 正常情况下 2–3 帧就落定，整个循环只写两三行。
+    const deadline = t0 + 1600;
+    let sawLag = false;
+    let quiet = 0;
+    const tick = (): void => {
+      this.trajRaf = 0;
+      const el = this.svgEl;
+      if (!el) return;
+      const rep = measureLayoutLag(el);
+      const t: number = Math.round(performance.now() - t0);
+      if (rep.n > 0) {
+        sawLag = true;
+        quiet = 0;
+        traceLog("f.traj", {
+          t,
+          lag: rep.n,
+          max: Math.round(rep.max),
+          fresh: rep.fresh,
+          worst: rep.worst,
+        });
+      } else if (sawLag) {
+        // 落定那一帧也记一条（用户真正看到的「回到正确位置」就是这个时刻）
+        quiet++;
+        traceLog("f.traj", { t, lag: 0, fresh: rep.fresh, note: "settled" });
+        if (quiet >= 2) return;
+      }
+      if (performance.now() > deadline) {
+        traceLog("f.traj.end", { t, sawLag });
+        return;
+      }
+      this.trajRaf = window.requestAnimationFrame(tick);
+    };
+    this.trajRaf = window.requestAnimationFrame(tick);
+  }
+
+  /**
+   * 清掉拖动留下的整块位移（CSS `translate`）与拖动态。
+   *
+   * 拖动时给块里每个 `g` 写一份 `translate`（见 edit/drag.ts）。松手会触发一次
+   * 重建，**但 d3 是按 key 复用元素的**：拖动的节点只要 key 没变，换上去的还是
+   * 同一个 `<g>`，而我们写在 style 上的位移没人清 —— 卡片就带着整个鼠标位移被
+   * 画在错误的位置，连线从原父节点斜斜地拉过来。
+   *
+   * 现场日志里 `drag.shift.gone ms=672` 说明这个窗口能有 672ms 长：
+   * 松手时块停在鼠标处（这是设计）、线也被还原（这一步是 bug），
+   * 于是屏幕上出现一根两端都不挨着的线 —— 就是「飘线」。
+   *
+   * 所以不靠「谁记得清」，而是在重建收尾统一扫一遍。正常情况下这里一个都扫不到。
+   *
+   * @param skip 正在被拖的那一批：清掉它们的位移等于「拖到一半跳回去」
+   */
+  private sweepDragShift(skip: Set<SVGGElement>): void {
+    const svg = this.svgEl;
+    if (!svg) return;
+    let n = 0;
+    for (const g of Array.from(
+      // 只有我们自己会往节点 g 上写 translate（收放点写的是 circle 的 transform）
+      svg.querySelectorAll<SVGGElement>('g.markmap-node[style*="translate"]'),
+    )) {
+      if (skip.has(g)) continue;
+      g.style.removeProperty("translate");
+      n++;
+    }
+    if (n > 0) traceLog("drag.shift.sweep", { n });
+    // class 也可能被复用的元素带过来：留着就是那个节点永远半透明
+    for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node.obmind-dragging"))) {
+      if (skip.has(g)) continue;
+      g.classList.remove("obmind-dragging");
+    }
   }
 
   /**
@@ -2032,15 +2761,22 @@ export class MindmapView extends ItemView {
    *
    * 用 `removeProperty` 而不是写 `"1"`：属性没了，markmap 后面的过渡想插值
    * 也能从默认值继续，不会被我留的 inline 值卡住。
+   *
+   * @returns 清掉了几个（> 0 说明重建期间确实有淡入漏网）
    */
-  private clearFade(): void {
+  private clearFade(): number {
     const svg = this.svgEl;
-    if (!svg) return;
+    if (!svg) return 0;
+    let n = 0;
     for (const fo of Array.from(
       svg.querySelectorAll<SVGForeignObjectElement>("g.markmap-node > foreignObject"),
     )) {
-      if (fo.style.opacity !== "") fo.style.removeProperty("opacity");
+      if (fo.style.opacity !== "") {
+        fo.style.removeProperty("opacity");
+        n++;
+      }
     }
+    return n;
   }
 
   /**
@@ -2052,10 +2788,13 @@ export class MindmapView extends ItemView {
    *
    * 只处理缺失的节点：`scrollWidth` 会强制同步布局，对两千个节点逐个读
    * 就是一次几十毫秒的卡顿，而正常情况下缺失的只有刚加的那一两个。
+   *
+   * @returns 补了几个（新建节点时应该是 1，出现十几说明 markmap 这一轮没量全）
    */
-  private measureMissing(): void {
+  private measureMissing(): number {
     const svg = this.svgEl;
-    if (!svg) return;
+    if (!svg) return 0;
+    let n = 0;
     for (const fo of Array.from(
       svg.querySelectorAll<SVGForeignObjectElement>("g.markmap-node > foreignObject"),
     )) {
@@ -2069,8 +2808,10 @@ export class MindmapView extends ItemView {
       if (bw > 0 && bh > 0) {
         fo.setAttribute("width", String(bw));
         fo.setAttribute("height", String(bh));
+        n++;
       }
     }
+    return n;
   }
 
   /**
@@ -2080,11 +2821,13 @@ export class MindmapView extends ItemView {
    * 用**对象身份**比对，不能用 path：拖动之后旧节点的 path 很可能和新树里
    * 某个节点的 path 撞上（比如都叫 "0.0.1"），按 path 判断会漏掉它，
    * 于是屏幕上多出一个和真节点重叠的幽灵卡片。
+   *
+   * @returns 删掉了几个（正常情况下是 0，或者只有被折叠掉的那一两个）
    */
-  private dropDetached(): void {
+  private dropDetached(): number {
     const svg = this.svgEl;
     const root = this.mm?.state.data;
-    if (!svg || !root) return;
+    if (!svg || !root) return 0;
 
     const alive = new Set<unknown>();
     const walk = (n: INode): void => {
@@ -2093,10 +2836,18 @@ export class MindmapView extends ItemView {
     };
     walk(root);
 
+    let n = 0;
     for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
       const data: unknown = (g as SVGGElement & { __data__?: unknown }).__data__;
-      if (!data || !alive.has(data)) g.remove();
+      if (!data || !alive.has(data)) {
+        // 记前几个的名字：`rebuild.ghost n=10` 只说数量，说不出「被换掉的是哪几个」，
+        // 而那正是判断「为什么这次要重建」的关键（比如每次都是同一个父节点）
+        if (isTracing() && n < 3) traceLog("rebuild.ghostItem", { node: nodeLabel(g) });
+        g.remove();
+        n++;
+      }
     }
+    return n;
   }
 
   // -------------------------------------------------------------------------
@@ -2684,6 +3435,15 @@ export class MindmapView extends ItemView {
     const svg = this.svgEl;
     if (svg) {
       const sel = this.selectedLines;
+      // 「结构代数 + 选中集合」都没变 → DOM 上的 class 一定是上一次写下的状态，
+      // 一个都不用碰。这条早退是空转 refresh（plan 判 none）唯一的成本来源：
+      // 250 次 querySelectorAll 迭代 + 250 次 srcOf + 250 次 classList.toggle。
+      const key = `${this.structureGen}|${Array.from(sel).sort((a, b) => a - b).join(",")}`;
+      if (key === this.selectionKey) {
+        this.nodeBar?.setVisible(sel.size === 1);
+        return;
+      }
+      this.selectionKey = key;
       for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
         const on: boolean = sel.has(this.srcOf(g)?.line ?? -1);
         g.classList.toggle("obmind-selected", on);
@@ -2788,7 +3548,7 @@ export class MindmapView extends ItemView {
       const line: number = this.selectedLine;
       if (line < 0) return;
       const g = this.findNodeByLine(line);
-      if (g) this.startEdit(g, false);
+      if (g) this.startEdit(g);
     }
   }
 
@@ -2824,7 +3584,7 @@ export class MindmapView extends ItemView {
 
     // 必须拦默认：否则空格会把侧栏/页面往下滚一格，编辑框跟着跳
     e.preventDefault();
-    this.startEdit(g, false);
+    this.startEdit(g);
   }
 
   /**
@@ -2880,6 +3640,59 @@ export class MindmapView extends ItemView {
       return;
     }
     if (this.selectedLines.size > 0) this.applySelection([], -1, false);
+  }
+
+  /**
+   * 浮动条上的「插入块」：弹一个小菜单选类型。
+   *
+   * 为什么不排三个图标：浮动条只有一行，窄侧栏（240px）里多三个图标就直接溢出画布。
+   * 菜单锚在按钮正下方 —— 用按钮自己的 rect 而不是鼠标位置，键盘/触控板点也一样。
+   */
+  private openBlockMenu(): void {
+    const line: number = this.selectedLine;
+    if (line < 0) return;
+    const anchor = this.nodeBar?.el.querySelector<HTMLElement>('[data-action="block"]');
+    const rect: DOMRect | null = anchor ? anchor.getBoundingClientRect() : null;
+    if (!rect || rect.width < 1) return;
+
+    const menu = new Menu();
+    const add = (title: string, icon: string, kind: BlockKind): void => {
+      menu.addItem((item) =>
+        item
+          .setTitle(title)
+          .setIcon(icon)
+          .onClick(() => this.insertBlock(kind)),
+      );
+    };
+    add("代码块", "code", "code");
+    add("引用", "quote", "quote");
+    add("表格", "table", "table");
+    menu.showAtPosition({ x: rect.left, y: rect.bottom + 4, width: rect.width });
+  }
+
+  /**
+   * 在选中节点下面插入一个块。
+   *
+   * 块是这个节点的**内容**（卡片里多一行），不是子节点 —— 见 types.ts 的 BlockInfo。
+   * 写完不动选中框：块不是节点，没有行可以选，而且用户多半接着操作同一个节点。
+   */
+  private insertBlock(kind: BlockKind): void {
+    const line: number = this.selectedLine;
+    if (line < 0) {
+      new Notice("obmind：先选中一个节点");
+      return;
+    }
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
+
+    const out = this.editSvc.insertBlock({ snap, line, kind });
+    if (out.kind === "error") {
+      new Notice(`obmind：${out.reason}`);
+      return;
+    }
+    if (out.kind === "none") return;
+    void this.applyPlan(file, out.op);
   }
 
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
@@ -2964,7 +3777,7 @@ export class MindmapView extends ItemView {
       return;
     }
 
-    this.startEdit(g, false);
+    this.startEdit(g);
   }
 
   /**
@@ -2972,18 +3785,20 @@ export class MindmapView extends ItemView {
    *
    * 为什么不能走行区间替换：一行会被搬到很远的位置，中间所有行号都会变。
    * 分成「先删后插」两次写，中间那一瞬间笔记就是坏的（节点丢一半）。
+   *
+   * @returns 是否真的发出了写入（拖动块要不要留在鼠标位置等重建，看这个）
    */
-  private onNodeDrop(srcLines: number[], targetLine: number, mode: DropMode): void {
+  private onNodeDrop(srcLines: number[], targetLine: number, mode: DropMode): boolean {
     const file = this.targetFile;
     const snap = this.editSnapshot();
-    if (!file || !snap) return;
+    if (!file || !snap) return false;
 
     // Bug 2 修复：多行合并节点暂不支持拖动（续行写回会错位），请在笔记里调整层级。
     for (const srcLine of srcLines) {
       const dragSrc = this.nodeAt(srcLine);
       if (dragSrc && dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
         new Notice("obmind：多行节点暂不支持拖动，请在笔记里调整层级");
-        return;
+        return false;
       }
     }
 
@@ -2993,11 +3808,12 @@ export class MindmapView extends ItemView {
         : this.editSvc.moveGroup({ snap, srcLines, targetLine, mode });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
-      return;
+      return false;
     }
-    if (out.kind === "none") return;
+    if (out.kind === "none") return false;
 
     void this.applyPlan(file, out.op);
+    return true;
   }
 
   /**
@@ -3051,8 +3867,18 @@ export class MindmapView extends ItemView {
     return null;
   }
 
-  /** 打开原地编辑框；根节点（文件名）不可编辑 */
-  private startEdit(g: SVGGElement, selectAll: boolean): void {
+  /**
+   * 打开原地编辑框；根节点（文件名）不可编辑。
+   *
+   * 打开即**全选**，不管从哪条路进来（双击 / Enter / F2 / 空格 / 新建节点）。
+   * 理由：节点的「改字」几乎总是整体重写（一句话重打一遍），而不是在某个字
+   * 后面插一个字。带选区进来时，第一个字符就直接覆盖全部，和 XMind 一致；
+   * 想插字的话按一下 ←/→ 或者点一下就能把选区收掉，代价比「先全选」小得多。
+   *
+   * 曾经只有「新建节点」传 selectAll，其余路径把光标放在末尾 —— 用户反馈
+   * 「点开编辑还要自己先 Ctrl+A」，这正是本轮要求的来源。
+   */
+  private startEdit(g: SVGGElement): void {
     if (this.rt.phase === "editing" || !this.canvasEl) return;
 
     // 重建正在进行时会把这个 g 换掉，等这一轮跑完再按行号重新定位
@@ -3061,7 +3887,7 @@ export class MindmapView extends ItemView {
       if (pendingLine !== undefined) {
         window.setTimeout(() => {
           const next = this.findNodeByLine(pendingLine);
-          if (next) this.startEdit(next, selectAll);
+          if (next) this.startEdit(next);
         }, 80);
       }
       return;
@@ -3083,6 +3909,7 @@ export class MindmapView extends ItemView {
     const spec: ThemeSpec =
       this.currentSpec ?? resolveTheme(this.plugin.settings.theme, false);
     const value: string = this.editorValueOf(src);
+    this.traceEditValue(g, src, value);
 
     this.rt.setPhase("editing");
     const handle = openInlineEditor({
@@ -3090,7 +3917,7 @@ export class MindmapView extends ItemView {
       target: g,
       value,
       spec,
-      selectAll,
+      selectAll: true,
       onFinish: (action: EditorAction, text: string) => {
         this.editorHandle = null;
         void this.commitEdit(action, text, src);
@@ -3102,6 +3929,34 @@ export class MindmapView extends ItemView {
       return;
     }
     this.editorHandle = handle;
+  }
+
+  /**
+   * 「点开编辑，看到的是上一次的文字」这条 bug 的自检。
+   *
+   * 编辑框的初始值来自 `payload.src.text`，而用户看到的是卡片里**渲染后的**文字。
+   * patch 通道（只改 innerHTML、不重建树）最容易让这两者脱节 —— 1.18.5 之前
+   * 就漏了回写 src，症状是「卡片明明已经是新内容，点开却是旧内容」。
+   * 与其等下一次现场复现，不如每次打开编辑框都比一次，对不上就直接写进日志。
+   */
+  private traceEditValue(g: SVGGElement, src: SrcRef, value: string): void {
+    if (!isTracing()) return;
+    const box = g.querySelector<HTMLElement>("foreignObject > div > div");
+    let card = "";
+    if (box) {
+      // 块标签（pill）是我们自己追加的装饰，不属于节点文字，比之前先摘掉
+      const clone = box.cloneNode(true) as HTMLElement;
+      for (const pill of Array.from(clone.querySelectorAll(".obmind-block-pill"))) pill.remove();
+      card = normalizeLabel(clone.textContent ?? "");
+    }
+    const editor = normalizeLabel(value);
+    const stale: boolean = card !== "" && editor !== "" && card !== editor;
+    traceLog("edit.value", {
+      line: src.line,
+      val: editor.slice(0, 12),
+      stale,
+      card: stale ? card.slice(0, 12) : undefined,
+    });
   }
 
   /**
@@ -3119,11 +3974,22 @@ export class MindmapView extends ItemView {
     /** 「提交即预览」的撤销句柄：写失败/计划作废时把 DOM 还原成旧内容 */
     let revertPreview: (() => void) | null = null;
     try {
+      // 提交链路的每一步都留痕：现场「输入完按回车却什么都没写」最难查 ——
+      // 屏幕上没变化时，用户说不清是没提交、被判成「没变」、还是写失败。
+      traceLog("edit.commit", {
+        act: action,
+        line: src.line,
+        val: value.slice(0, 12),
+        same: value === this.editorValueOf(src),
+      });
       if (action === "cancel") return;
 
       const file = this.targetFile;
       const snap = this.editSnapshot();
-      if (!file || !snap) return;
+      if (!file || !snap) {
+        traceLog("edit.commit.nosnap", { file: Boolean(file), snap: Boolean(snap) });
+        return;
+      }
 
       // 先把结果画上去，再去写文件。
       //
@@ -3139,25 +4005,31 @@ export class MindmapView extends ItemView {
         revertPreview?.();
         revertPreview = null;
         this.pendingEditLine = -1;
+        traceLog("edit.commit.error", { reason: out.reason });
         new Notice(`obmind：${out.reason}`);
         return;
       }
       if (out.kind === "none") {
-        // 计划说「不用写」：预览得撤回去，否则会和真实内容对不上
+        // 计划说「不用写」：预览得撤回去，否则会和真实内容对不上。
+        // 「输入了内容却没写进去」就是这个分支 —— 日志里能直接看到当时的值，
+        // 对照 `edit.value`（编辑框打开时的初始值）就知道是不是值本身没变。
         revertPreview?.();
         revertPreview = null;
+        traceLog("edit.commit.none", { line: src.line, val: value.slice(0, 12) });
         return;
       }
 
       if (out.focusLine !== undefined) this.pendingEditLine = out.focusLine;
       const res = await this.runWrite(file, out.op);
       next = res.next;
+      traceLog("edit.commit.ok", { line: src.line, ok: res.ok });
       if (!res.ok) revertPreview?.();
       revertPreview = null;
     } catch (err) {
       revertPreview?.();
       revertPreview = null;
       this.pendingEditLine = -1;
+      traceLog("edit.commit.throw", { msg: errText(err).slice(0, 40) });
       console.error("[obmind] 写回笔记失败", err);
       new Notice("写回笔记失败，详见控制台。");
     } finally {
@@ -3219,7 +4091,12 @@ export class MindmapView extends ItemView {
       parsed.checked === null
         ? parsed.text
         : `${parsed.checked ? "☑" : "☐"} ${parsed.text}`;
-    const html: string = renderInline(shown);
+    // 块那一行不是文字，预览时必须原样留住：只换文字会把 pill 一起抹掉，
+    // 用户编辑一个字就看到「代码块那行凭空消失、提交后又冒出来」。
+    const pills: string = Array.from(box.querySelectorAll(".obmind-block-pill"))
+      .map((el: Element) => el.outerHTML)
+      .join("");
+    const html: string = renderInline(shown) + pills;
 
     const prevHtml: string = box.innerHTML;
     const prevW: string = fo.getAttribute("width") ?? "";
@@ -3229,14 +4106,18 @@ export class MindmapView extends ItemView {
 
     // 卡片尺寸要同步长出来：只换文字不改 foreignObject 宽高的话，会先出现一帧
     // 「新文字溢出旧卡片」，等 markmap 自己重排（100ms 防抖）才回正。
+    //
+    // 而且**必须当场重画这一个节点**：fo.width 是文字层，卡片是另一个 <rect>，
+    // 改属性不会让它变大。预览发生在编辑态，靠 reflowNow 兜不住（它在编辑态
+    // 以前是直接早退的），结果卡片永远停在旧宽度 —— 就是「文字顶出边框」那张截图。
+    // 邻居让位仍交给 reflowSoon 的整树重排；这里只补自己那 8 个属性。
     const w: number = box.scrollWidth;
     const h: number = box.scrollHeight;
     if (w > 0 && h > 0) {
       fo.setAttribute("width", String(w));
       fo.setAttribute("height", String(h));
+      this.frames.paintMoved([g]);
     }
-    // 尺寸变了就得重排：卡片变宽后邻居那一列还没让开，光重画卡片只会压住别人。
-    // 这里不先 paintNow —— 重排完成后 reflowNow 会画一次，省掉一帧错位。
     this.reflowSoon();
 
     return (): void => {
@@ -3244,6 +4125,8 @@ export class MindmapView extends ItemView {
       box.innerHTML = prevHtml;
       if (prevW) fo.setAttribute("width", prevW);
       if (prevH) fo.setAttribute("height", prevH);
+      // 退回旧尺寸也要把卡片画回去，否则写盘失败时留下同样一张「文字溢出」的卡片
+      this.frames.paintMoved([g]);
       this.reflowSoon();
     };
   }
@@ -3303,7 +4186,7 @@ export class MindmapView extends ItemView {
           return;
         }
         const g = this.findNodeByLine(line);
-        if (g) this.startEdit(g, true);
+        if (g) this.startEdit(g);
       });
     });
   }
@@ -3326,12 +4209,13 @@ export class MindmapView extends ItemView {
     }
     this.fittedSize = null;
     this.frames.cancel();
+    if (this.trajRaf !== 0) {
+      window.cancelAnimationFrame(this.trajRaf);
+      this.trajRaf = 0;
+    }
     this.painter.reset();
     this.mm?.destroy();
     this.mm = null;
-    for (const part of this.blockParts) part.unload();
-    this.blockParts = [];
-    this.blockCache.clear();
     this.drag?.destroy();
     this.drag = null;
     this.boxSelect?.destroy();
@@ -3347,6 +4231,7 @@ export class MindmapView extends ItemView {
     this.nodeBar?.destroy();
     this.nodeBar = null;
     this.helpPanel = null;
+    traceBindSvg(null);
     this.svgEl = null;
     this.canvasEl = null;
     this.emptyEl = null;
