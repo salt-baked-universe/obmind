@@ -25,6 +25,7 @@
 import type { IPureNode } from "markmap-common";
 import { colsOfIndent } from "../domain/syntax";
 import type { DropMode, SrcRef } from "../types";
+import { BLOCK_MARK_LINE } from "./block";
 
 /** 从节点树里按行号顺序取出所有源坐标（折叠中的节点也在树里，不会漏） */
 export function collectSrc(root: IPureNode): SrcRef[] {
@@ -97,6 +98,12 @@ function renderIndent(cols: number, unit: string, step: number): string {
  */
 export function blockRange(nodes: SrcRef[], index: number): { start: number; end: number } {
   const start: number = nodes[index].line;
+  // 块是**叶子**：它不接孩子（装配时不写缩进栈），所以地盘就是自己的行区间。
+  // 不早点返回的话，紧跟其后的、缩进更深的正文会被算成「块的子树」—— 删一个
+  // 代码块会把下面整段内容一起带走。
+  if (nodes[index].blockNode) {
+    return { start, end: Math.max(start, nodes[index].blockEnd ?? start) };
+  }
   const depth: number = nodes[index].depth;
   let end: number = Math.max(start, nodes[index].blockEnd ?? start);
   for (let i = index + 1; i < nodes.length; i++) {
@@ -112,7 +119,10 @@ export function blockRange(nodes: SrcRef[], index: number): { start: number; end
  * 搬动一个节点时，块行必须逐字保留：
  * - 加缩进会改掉代码本身的缩进（Java/Python 代码立刻变形）；
  * - 一旦缩进到 4 格，围栏块在 CommonMark 里就退化成「缩进代码块」，``` 变字面量。
- * 块按位置归属，所以原样搬走仍然属于同一个节点，不需要任何重排。
+ *
+ * 例外是「自由块」的代理行（`<!-- obmind:block -->`）：那一行本来就该缩进，
+ * 层级全靠它表达，所以只冻结它下面真正的块行。裸块（没有代理行）整块冻结 ——
+ * 围栏行自己就是层级依据，缩一次就坏。
  */
 function frozenIn(nodes: readonly SrcRef[], start: number, end: number): Set<number> {
   const out = new Set<number>();
@@ -121,7 +131,8 @@ function frozenIn(nodes: readonly SrcRef[], start: number, end: number): Set<num
     const be: number | undefined = n.blockEnd;
     if (bs === undefined || be === undefined) continue;
     if (be < start || bs > end) continue;
-    const from: number = Math.max(start, bs);
+    // 自由块：代理行归节点自己，从它的下一行起才是不能动的块本体
+    const from: number = Math.max(start, n.proxyLine === undefined ? bs : bs + 1);
     const to: number = Math.min(end, be);
     for (let l = from; l <= to; l++) out.add(l - start);
   }
@@ -245,6 +256,12 @@ export function moveNode(input: MoveInput): MoveResult {
     return { ok: false, reason: "不能移到自己的子节点下面" };
   }
 
+  // 块是叶子：它不接孩子（装配时块不写缩进栈），拖成它的孩子只会变成它的兄弟 ——
+  // 图和笔记对不上，所以直接拒绝。插到它前后当兄弟是允许的。
+  if (mode === "child" && tgt.blockNode) {
+    return { ok: false, reason: "块是只读叶子，下面不能挂节点" };
+  }
+
   // 标题与正文互拖：只有「正文 → 标题下当子节点」这一种说得通
   if (src.heading && !tgt.heading) {
     return { ok: false, reason: "标题不能拖到正文节点上" };
@@ -253,10 +270,17 @@ export function moveNode(input: MoveInput): MoveResult {
     return { ok: false, reason: "正文不能和标题平级，只能拖到标题上当子节点" };
   }
 
-  const block: string[] = lines.slice(srcBlock.start, srcBlock.end + 1);
+  let block: string[] = lines.slice(srcBlock.start, srcBlock.end + 1);
   if (block.length === 0) return { ok: false, reason: "空节点" };
   /** 块行原样搬（不加缩进、不改 `#` 级数） */
-  const frozen: Set<number> = frozenIn(nodes, srcBlock.start, srcBlock.end);
+  let frozen: Set<number> = frozenIn(nodes, srcBlock.start, srcBlock.end);
+
+  // 拖一个**裸块** = 顺手把它升级成自由块：在块前面补一行代理行，缩进由它承担，
+  // 块本体一行都不动。用户不需要为了「让块能拖」去手写那行注释。
+  if (src.blockNode === "bound") {
+    block = [BLOCK_MARK_LINE, ...block];
+    frozen = new Set(Array.from({ length: block.length - 1 }, (_v, i) => i + 1));
+  }
 
   // 插入位置：before 插在目标行之前；after 插在目标整块之后。
   // child 拖到标题上时插在标题行的正下方（成为第一个子节点）——

@@ -4662,17 +4662,41 @@ function buildVLines(allLines, from) {
   }
   return out;
 }
-function attachBlock(raws, rootBlocks, block) {
-  const owner = raws[raws.length - 1];
-  if (!owner) {
-    rootBlocks.push(block);
-    return;
-  }
-  if (!owner.blocks)
-    owner.blocks = [];
-  owner.blocks.push(block);
-  owner.src.blockStart = owner.blocks[0].startLine;
-  owner.src.blockEnd = block.endLine;
+var BLOCK_MARK = /^[ \t]*<!--\s*obmind:block\s*-->[ \t]*$/;
+function pushBlock(raws, block, mark, fenceLine, allLines) {
+  var _a, _b, _c;
+  const anchor = mark != null ? mark : fenceLine;
+  const first = anchor.text;
+  const indent = ((_a = /^[ \t]*/.exec(first)) != null ? _a : [""])[0];
+  const src = {
+    line: anchor.orig,
+    bodyStart: indent.length,
+    bodyEnd: first.trimEnd().length,
+    full: (_b = allLines[anchor.orig]) != null ? _b : first,
+    marker: "",
+    indent,
+    checked: null,
+    text: (_c = block.label) != null ? _c : block.kind,
+    heading: false,
+    level: null,
+    // 真正的深度在下面的缩进推导里统一算，这里只是占位
+    depth: 0,
+    endLine: block.endLine,
+    // 整块的行区间：删除、选中、算子树的结束行都要用它
+    blockStart: anchor.orig,
+    blockEnd: block.endLine,
+    blockNode: mark ? "free" : "bound",
+    proxyLine: mark ? anchor.orig : void 0
+  };
+  raws.push({
+    text: src.text,
+    headingLevel: null,
+    src,
+    block,
+    region: anchor.region,
+    calloutRoot: anchor.calloutRoot,
+    promoted: anchor.promoted
+  });
 }
 function quoteLabel(indent, lines2, count) {
   const strip = (l) => l.replace(new RegExp(`^${indent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "").replace(/^\s*>\s?/, "").replace(/^\s*>\s?/, "").trim();
@@ -4788,7 +4812,7 @@ function buildTree(content, fileName, options) {
     }
   }
   const raws = [];
-  const rootBlocks = [];
+  let pendingMark = null;
   let lastListRaw = null;
   const vlines = buildVLines(allLines, lineOffset);
   const rawOf = (a, b) => vlines.slice(a, b + 1).map((v2) => allLines[v2.orig].slice(v2.off)).join("\n");
@@ -4796,6 +4820,11 @@ function buildTree(content, fileName, options) {
     const v2 = vlines[idx];
     const line = v2.text;
     if (line.trim() === "") {
+      lastListRaw = null;
+      continue;
+    }
+    if (BLOCK_MARK.test(line)) {
+      pendingMark = v2;
       lastListRaw = null;
       continue;
     }
@@ -4814,15 +4843,22 @@ function buildTree(content, fileName, options) {
       }
       const rawBlock = rawOf(idx, end);
       const label = fence.kind === "code" ? `\u4EE3\u7801\u5757${fence.lang ? ` \xB7 ${fence.lang}` : ""}${bodyLines ? ` \xB7 ${bodyLines} \u884C` : ""}` : `\u516C\u5F0F${bodyLines ? ` \xB7 ${bodyLines} \u884C` : ""}`;
-      attachBlock(raws, rootBlocks, {
-        kind: fence.kind,
-        lang: fence.lang,
-        raw: dedentBlock(rawBlock, fence.indent),
-        startLine: v2.orig,
-        endLine: vlines[end].orig,
-        lines: fence.single ? 1 : bodyLines,
-        label
-      });
+      pushBlock(
+        raws,
+        {
+          kind: fence.kind,
+          lang: fence.lang,
+          raw: dedentBlock(rawBlock, fence.indent),
+          startLine: v2.orig,
+          endLine: vlines[end].orig,
+          lines: fence.single ? 1 : bodyLines,
+          label
+        },
+        pendingMark,
+        v2,
+        allLines
+      );
+      pendingMark = null;
       lastListRaw = null;
       idx = end;
       continue;
@@ -4844,16 +4880,23 @@ function buildTree(content, fileName, options) {
       const indent = indentMatch ? indentMatch[0] : "";
       const rows = end - idx - 1;
       const label = `\u8868\u683C \xB7 ${cols} \u5217${rows > 0 ? ` \xB7 ${rows} \u884C` : ""}`;
-      attachBlock(raws, rootBlocks, {
-        kind: "table",
-        lang: "",
-        // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
-        raw: dedentBlock(rawOf(idx, end), indent),
-        startLine: v2.orig,
-        endLine: vlines[end].orig,
-        lines: rows + 1,
-        label
-      });
+      pushBlock(
+        raws,
+        {
+          kind: "table",
+          lang: "",
+          // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
+          raw: dedentBlock(rawOf(idx, end), indent),
+          startLine: v2.orig,
+          endLine: vlines[end].orig,
+          lines: rows + 1,
+          label
+        },
+        pendingMark,
+        v2,
+        allLines
+      );
+      pendingMark = null;
       lastListRaw = null;
       idx = end;
       continue;
@@ -4868,23 +4911,31 @@ function buildTree(content, fileName, options) {
       const indentMatch = /^[ \t]*/.exec(line);
       const indent = indentMatch ? indentMatch[0] : "";
       const count = end - idx + 1;
-      attachBlock(raws, rootBlocks, {
-        kind: "quote",
-        lang: "",
-        raw: dedentBlock(rawOf(idx, end), indent),
-        startLine: v2.orig,
-        endLine: vlines[end].orig,
-        lines: count,
-        label: quoteLabel(
-          indent,
-          vlines.slice(idx, end + 1).map((x2) => x2.text),
-          count
-        )
-      });
+      pushBlock(
+        raws,
+        {
+          kind: "quote",
+          lang: "",
+          raw: dedentBlock(rawOf(idx, end), indent),
+          startLine: v2.orig,
+          endLine: vlines[end].orig,
+          lines: count,
+          label: quoteLabel(
+            indent,
+            vlines.slice(idx, end + 1).map((x2) => x2.text),
+            count
+          )
+        },
+        pendingMark,
+        v2,
+        allLines
+      );
+      pendingMark = null;
       lastListRaw = null;
       idx = end;
       continue;
     }
+    pendingMark = null;
     let body = line;
     while (/^\s*>/.test(body))
       body = body.replace(/^\s*>\s?/, "");
@@ -5019,10 +5070,10 @@ function buildTree(content, fileName, options) {
     return base + indentStack.length;
   }
   const root2 = {
-    content: escapeText(rootName) + blockPillsHtml(rootBlocks),
+    content: escapeText(rootName),
     children: [],
     // step / unit 供双向编辑与拖动复用，与解析规则保持一致
-    payload: { step, indentUnit: unit, hasHeadings, blocks: rootBlocks }
+    payload: { step, indentUnit: unit, hasHeadings }
   };
   const stack = [root2];
   for (const n of nodes) {
@@ -5030,13 +5081,15 @@ function buildTree(content, fileName, options) {
     for (let d = n.depth - 2; !parent && d >= 0; d--)
       parent = stack[d];
     const r = n.raw;
+    if (r.block) {
+      (parent != null ? parent : root2).children.push(blockNode(r.block, r.src));
+      continue;
+    }
     const shown = r.src.checked === null ? r.src.text : (r.src.checked ? "\u2611 " : "\u2610 ") + r.src.text;
     const node = {
-      // 块作为这个节点的**内容**追加在后面（只占一行），不是子节点。
-      // 尺寸必须在 setData 之前定好 —— markmap 是按 content 里的 DOM 量宽高的。
-      content: render(shown) + blockPillsHtml(r.blocks),
+      content: render(shown),
       children: [],
-      payload: { src: r.src, blocks: r.blocks }
+      payload: { src: r.src }
     };
     (parent != null ? parent : root2).children.push(node);
     stack[n.depth] = node;
@@ -5044,27 +5097,34 @@ function buildTree(content, fileName, options) {
   }
   return root2;
 }
-function blockPillsHtml(blocks) {
-  if (!blocks || blocks.length === 0)
-    return "";
-  return blocks.map((b) => {
-    var _a;
-    const label = (_a = b.label) != null ? _a : b.kind;
-    const hint = b.raw.trim().split("\n").slice(0, 6).join("\n");
-    return `<span class="obmind-block-pill" data-kind="${b.kind}" title="${escapeAttr(
-      hint
-    )}">${escapeText(label)}</span>`;
-  }).join("");
+function blockNode(b, src) {
+  var _a;
+  const label = (_a = b.label) != null ? _a : b.kind;
+  return {
+    content: `<span class="obmind-block-pill" data-kind="${b.kind}">${escapeText(label)}</span>`,
+    children: [],
+    payload: { block: b, src }
+  };
 }
-function escapeAttr(text) {
-  return escapeText(text).replace(/"/g, "&quot;").replace(/\n/g, "&#10;");
+function collectBlockNodes(root2) {
+  const out = [];
+  const walk = (n) => {
+    var _a, _b;
+    const block = (_a = n.payload) == null ? void 0 : _a.block;
+    if (block && typeof block.raw === "string")
+      out.push({ node: n, block });
+    for (const c of (_b = n.children) != null ? _b : [])
+      walk(c);
+  };
+  walk(root2);
+  return out;
 }
 
 // src/render/inlineHtml.ts
 function escapeHtml(text) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
-function escapeAttr2(text) {
+function escapeAttr(text) {
   return text.replace(/"/g, "&quot;");
 }
 function escapeAttrFull(value) {
@@ -5180,7 +5240,7 @@ function renderInline(raw) {
       const target = targetRaw.trim();
       const path2 = target.split("#")[0] || target;
       const alias = (aliasRaw != null ? aliasRaw : target).trim();
-      return `<a class="internal-link" data-href="${escapeAttr2(path2)}">${alias}</a>`;
+      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${alias}</a>`;
     }
   );
   s = s.replace(
@@ -5188,7 +5248,7 @@ function renderInline(raw) {
     (_m, text, url) => {
       const raw2 = url.trim();
       if (/^(https?:|mailto:|obsidian:|#)/i.test(raw2)) {
-        return `<a href="${escapeAttr2(raw2)}">${text}</a>`;
+        return `<a href="${escapeAttr(raw2)}">${text}</a>`;
       }
       let path2 = raw2;
       try {
@@ -5196,7 +5256,7 @@ function renderInline(raw) {
       } catch (e) {
       }
       path2 = path2.replace(/\.md$/i, "");
-      return `<a class="internal-link" data-href="${escapeAttr2(path2)}">${text}</a>`;
+      return `<a class="internal-link" data-href="${escapeAttr(path2)}">${text}</a>`;
     }
   );
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -7198,13 +7258,15 @@ var DragController = class {
       if (e.button !== 0)
         return;
       const el = e.target;
-      if (el.closest("a") || el.closest("circle"))
+      if (el.closest("a") || el.closest("circle") || el.closest(".copy-code-button"))
         return;
       const g = this.nodeAt(el);
       if (!g)
         return;
       const src = this.cb.srcOf(g);
       if (!src)
+        return;
+      if (src.blockNode === "bound")
         return;
       e.stopPropagation();
       this.origin = g;
@@ -7569,6 +7631,43 @@ function zoomOf(svg) {
   return typeof k === "number" && k > 0 ? k : 1;
 }
 
+// src/edit/block.ts
+var BLOCK_MARK_LINE = "<!-- obmind:block -->";
+var TEMPLATES = {
+  code: ["```", "", "```"],
+  quote: ["> "],
+  table: ["| \u5217 1 | \u5217 2 |", "| --- | --- |", "|  |  |"]
+};
+var LIST_MARK = /^(?:[-*+]\s+|\d{1,9}[.)]\s+)$/;
+function blockIndent(src) {
+  if (src.heading || src.marker === "" || !LIST_MARK.test(src.marker))
+    return "";
+  return src.indent + " ".repeat(colsOfIndent(src.marker) || src.marker.length);
+}
+function quotePrefixOf(src) {
+  const m = /^(?:[ \t]*>[ \t]?)+/.exec(src.full);
+  return m ? m[0] : "";
+}
+function insertBlockPlan(input, kind) {
+  var _a;
+  const { src } = input;
+  const after = Math.max(src.line, src.endLine, (_a = src.blockEnd) != null ? _a : src.line);
+  const quote = quotePrefixOf(src);
+  const listed = blockIndent(src);
+  const step = input.step && input.step > 0 ? input.step : 2;
+  const anchorIndent = listed !== "" ? listed : src.indent + (input.unit || " ".repeat(step));
+  const fenceLines = TEMPLATES[kind].map(
+    (line) => line === "" ? quote.replace(/[ \t]+$/, "") : quote + listed + line
+  );
+  return {
+    insertAfterLine: after,
+    // 代理行排在最前面：块能不能被拖动、能挂到哪一层，全看这一行的缩进
+    lines: [quote + anchorIndent + BLOCK_MARK_LINE, ...fenceLines],
+    // 光标落在块首行（跳过代理行），用户接着就能写内容
+    blockStartLine: after + 2
+  };
+}
+
 // src/edit/move.ts
 var HEADING_RE = /^(#{1,6})(\s+)/;
 var QUOTE_PREFIX = /^(?:\s*>\s?)+/;
@@ -7591,14 +7690,17 @@ function renderIndent(cols, unit, step) {
   return one2.repeat(levels) + " ".repeat(rest);
 }
 function blockRange(nodes, index) {
-  var _a, _b;
+  var _a, _b, _c;
   const start2 = nodes[index].line;
+  if (nodes[index].blockNode) {
+    return { start: start2, end: Math.max(start2, (_a = nodes[index].blockEnd) != null ? _a : start2) };
+  }
   const depth = nodes[index].depth;
-  let end = Math.max(start2, (_a = nodes[index].blockEnd) != null ? _a : start2);
+  let end = Math.max(start2, (_b = nodes[index].blockEnd) != null ? _b : start2);
   for (let i = index + 1; i < nodes.length; i++) {
     if (nodes[i].depth <= depth)
       break;
-    end = Math.max(end, nodes[i].line, (_b = nodes[i].blockEnd) != null ? _b : nodes[i].line);
+    end = Math.max(end, nodes[i].line, (_c = nodes[i].blockEnd) != null ? _c : nodes[i].line);
   }
   return { start: start2, end };
 }
@@ -7611,7 +7713,7 @@ function frozenIn(nodes, start2, end) {
       continue;
     if (be < start2 || bs > end)
       continue;
-    const from = Math.max(start2, bs);
+    const from = Math.max(start2, n.proxyLine === void 0 ? bs : bs + 1);
     const to = Math.min(end, be);
     for (let l = from; l <= to; l++)
       out.add(l - start2);
@@ -7697,16 +7799,23 @@ function moveNode(input) {
   if (tgt.line > srcBlock.start && tgt.line <= srcBlock.end) {
     return { ok: false, reason: "\u4E0D\u80FD\u79FB\u5230\u81EA\u5DF1\u7684\u5B50\u8282\u70B9\u4E0B\u9762" };
   }
+  if (mode === "child" && tgt.blockNode) {
+    return { ok: false, reason: "\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0B\u9762\u4E0D\u80FD\u6302\u8282\u70B9" };
+  }
   if (src.heading && !tgt.heading) {
     return { ok: false, reason: "\u6807\u9898\u4E0D\u80FD\u62D6\u5230\u6B63\u6587\u8282\u70B9\u4E0A" };
   }
   if (!src.heading && tgt.heading && mode !== "child") {
     return { ok: false, reason: "\u6B63\u6587\u4E0D\u80FD\u548C\u6807\u9898\u5E73\u7EA7\uFF0C\u53EA\u80FD\u62D6\u5230\u6807\u9898\u4E0A\u5F53\u5B50\u8282\u70B9" };
   }
-  const block = lines2.slice(srcBlock.start, srcBlock.end + 1);
+  let block = lines2.slice(srcBlock.start, srcBlock.end + 1);
   if (block.length === 0)
     return { ok: false, reason: "\u7A7A\u8282\u70B9" };
-  const frozen = frozenIn(nodes, srcBlock.start, srcBlock.end);
+  let frozen = frozenIn(nodes, srcBlock.start, srcBlock.end);
+  if (src.blockNode === "bound") {
+    block = [BLOCK_MARK_LINE, ...block];
+    frozen = new Set(Array.from({ length: block.length - 1 }, (_v, i) => i + 1));
+  }
   const insertAfterHeading = mode === "child" && tgt.heading;
   const rawInsertAt = insertAfterHeading ? Math.min(((_b = tgt.blockEnd) != null ? _b : tgt.line) + 1, lines2.length) : mode === "before" ? tgt.line : Math.min(tgtBlock.end + 1, lines2.length);
   let insertAt = rawInsertAt;
@@ -8008,13 +8117,15 @@ function swallowNextClick2() {
 var MAX_HEADING = 6;
 var NEW_NODE_TEXT = "\u65B0\u8282\u70B9";
 function subtreeEndOf(src, nodes) {
-  var _a, _b;
-  let end = Math.max(src.line, (_a = src.blockEnd) != null ? _a : src.line);
+  var _a, _b, _c;
+  if (src.blockNode)
+    return Math.max(src.line, (_a = src.blockEnd) != null ? _a : src.line);
+  let end = Math.max(src.line, (_b = src.blockEnd) != null ? _b : src.line);
   for (const n of nodes) {
     if (n.line <= src.line)
       continue;
     if (n.depth > src.depth) {
-      end = Math.max(end, n.line, (_b = n.blockEnd) != null ? _b : n.line);
+      end = Math.max(end, n.line, (_c = n.blockEnd) != null ? _c : n.line);
       continue;
     }
     break;
@@ -8082,37 +8193,6 @@ function planCreate(input) {
   };
 }
 
-// src/edit/block.ts
-var TEMPLATES = {
-  code: ["```", "", "```"],
-  quote: ["> "],
-  table: ["| \u5217 1 | \u5217 2 |", "| --- | --- |", "|  |  |"]
-};
-var LIST_MARK = /^(?:[-*+]\s+|\d{1,9}[.)]\s+)$/;
-function blockIndent(src) {
-  if (src.heading || src.marker === "" || !LIST_MARK.test(src.marker))
-    return "";
-  return src.indent + " ".repeat(colsOfIndent(src.marker) || src.marker.length);
-}
-function quotePrefixOf(src) {
-  const m = /^(?:[ \t]*>[ \t]?)+/.exec(src.full);
-  return m ? m[0] : "";
-}
-function insertBlockPlan(input, kind) {
-  var _a;
-  const { src } = input;
-  const after = Math.max(src.line, src.endLine, (_a = src.blockEnd) != null ? _a : src.line);
-  const quote = quotePrefixOf(src);
-  const indent = blockIndent(src);
-  return {
-    insertAfterLine: after,
-    lines: TEMPLATES[kind].map(
-      (line) => line === "" ? quote.replace(/[ \t]+$/, "") : quote + indent + line
-    ),
-    blockStartLine: after + 1
-  };
-}
-
 // src/app/EditService.ts
 var none2 = (reason) => ({ kind: "none", reason });
 var error = (reason) => ({ kind: "error", reason });
@@ -8148,6 +8228,8 @@ var EditService = class {
     const { snap, src, action, value } = input;
     if (action === "cancel")
       return none2("\u5DF2\u53D6\u6D88");
+    if (src.blockNode)
+      return error("\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u8BF7\u56DE\u7B14\u8BB0\u91CC\u6539");
     const parsed = parseEditorValue(src, value);
     if (parsed.text === "")
       return none2("\u6587\u672C\u4E3A\u7A7A\uFF0C\u4FDD\u6301\u539F\u6837");
@@ -8213,6 +8295,8 @@ var EditService = class {
     const src = this.nodeAt(input.snap, input.line);
     if (!src)
       return error("\u627E\u4E0D\u5230\u8981\u65B0\u5EFA\u7684\u8282\u70B9");
+    if (src.blockNode)
+      return error("\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u5EFA\u8282\u70B9");
     const plan = planCreate({
       src,
       nodes: input.snap.nodes,
@@ -8361,7 +8445,12 @@ var EditService = class {
     const src = this.nodeAt(input.snap, input.line);
     if (!src)
       return error("\u627E\u4E0D\u5230\u8981\u63D2\u5165\u5757\u7684\u8282\u70B9");
-    const plan = insertBlockPlan({ src }, input.kind);
+    if (src.blockNode)
+      return error("\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u91CC\u9762\u518D\u63D2\u5757");
+    const plan = insertBlockPlan(
+      { src, step: input.snap.step, unit: input.snap.unit },
+      input.kind
+    );
     const lines2 = input.snap.content.split("\n");
     const at = plan.insertAfterLine;
     const span = {
@@ -8942,7 +9031,7 @@ function isTypingTarget(target) {
 
 // src/domain/stats.ts
 function treeStats(tree) {
-  var _a;
+  var _a, _b;
   if (!tree)
     return { nodes: 0, depth: 0 };
   let nodes = 0;
@@ -8950,10 +9039,13 @@ function treeStats(tree) {
   const stack = [{ node: tree, level: 1 }];
   while (stack.length > 0) {
     const { node, level: level2 } = stack.pop();
-    nodes++;
-    if (level2 > depth)
-      depth = level2;
-    const children2 = (_a = node.children) != null ? _a : [];
+    const isBlock = !!((_a = node.payload) == null ? void 0 : _a.block);
+    if (!isBlock) {
+      nodes++;
+      if (level2 > depth)
+        depth = level2;
+    }
+    const children2 = (_b = node.children) != null ? _b : [];
     for (const child of children2)
       stack.push({ node: child, level: level2 + 1 });
   }
@@ -9044,8 +9136,22 @@ function srcOf(node) {
   if (!node)
     return null;
   const payload = node.payload;
+  if (payload == null ? void 0 : payload.block)
+    return null;
   const src = payload == null ? void 0 : payload.src;
   return src && typeof src.line === "number" ? src : null;
+}
+function blockOf(node) {
+  var _a, _b, _c;
+  const block = (_a = node == null ? void 0 : node.payload) == null ? void 0 : _a.block;
+  if (!block || typeof block.raw !== "string")
+    return null;
+  return `${(_b = block.kind) != null ? _b : ""}|${(_c = block.lang) != null ? _c : ""}|${block.raw}`;
+}
+function lineOf(node) {
+  var _a;
+  const src = (_a = node == null ? void 0 : node.payload) == null ? void 0 : _a.src;
+  return typeof (src == null ? void 0 : src.line) === "number" ? src.line : void 0;
 }
 function planProjection(input) {
   if (input.forceStructure || input.prev === null) {
@@ -9059,14 +9165,22 @@ function planProjection(input) {
   let at;
   let lineDrift = false;
   const walk = (a, b) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
     if (why !== null)
       return;
-    if (a.content !== b.content) {
+    const ab = blockOf(a);
+    const bb = blockOf(b);
+    if (ab !== null || bb !== null) {
+      if (ab === null || bb === null || ab !== bb) {
+        why = "noSrc";
+        at = (_a = lineOf(b)) != null ? _a : lineOf(a);
+        return;
+      }
+    } else if (a.content !== b.content) {
       const src = srcOf(b);
       if (!src || src.depth === 0) {
         why = "noSrc";
-        at = (_b = src == null ? void 0 : src.line) != null ? _b : (_a = srcOf(a)) == null ? void 0 : _a.line;
+        at = (_c = src == null ? void 0 : src.line) != null ? _c : (_b = srcOf(a)) == null ? void 0 : _b.line;
         return;
       }
       changed++;
@@ -9079,22 +9193,22 @@ function planProjection(input) {
       content = b.content;
       patchSrc = src;
     }
-    const ac = (_c = a.children) != null ? _c : [];
-    const bc = (_d = b.children) != null ? _d : [];
+    const ac = (_d = a.children) != null ? _d : [];
+    const bc = (_e = b.children) != null ? _e : [];
     if (ac.length !== bc.length) {
       why = "children";
-      at = (_e = srcOf(b)) == null ? void 0 : _e.line;
+      at = (_f = srcOf(b)) == null ? void 0 : _f.line;
       return;
     }
     for (let i = 0; i < ac.length; i++) {
       const sa = srcOf(ac[i]);
       const sb = srcOf(bc[i]);
-      if (((_f = sa == null ? void 0 : sa.depth) != null ? _f : -1) !== ((_g = sb == null ? void 0 : sb.depth) != null ? _g : -1)) {
+      if (((_g = sa == null ? void 0 : sa.depth) != null ? _g : -1) !== ((_h = sb == null ? void 0 : sb.depth) != null ? _h : -1)) {
         why = "depth";
-        at = (_h = sb == null ? void 0 : sb.line) != null ? _h : sa == null ? void 0 : sa.line;
+        at = (_i = sb == null ? void 0 : sb.line) != null ? _i : sa == null ? void 0 : sa.line;
         return;
       }
-      if (((_i = sa == null ? void 0 : sa.line) != null ? _i : -1) !== ((_j = sb == null ? void 0 : sb.line) != null ? _j : -1))
+      if (((_j = sa == null ? void 0 : sa.line) != null ? _j : -1) !== ((_k = sb == null ? void 0 : sb.line) != null ? _k : -1))
         lineDrift = true;
       walk(ac[i], bc[i]);
     }
@@ -9126,6 +9240,9 @@ function relabelTree(dst, src) {
       if (ap.src && ap.src.line !== bp.src.line)
         moved.set(ap.src.line, bp.src.line);
       ap.src = bp.src;
+      if (ap.block && bp.block) {
+        ap.block = { ...ap.block, startLine: bp.block.startLine, endLine: bp.block.endLine };
+      }
     }
     for (let i = 0; i < ac.length && ok; i++)
       walk(ac[i], bc[i]);
@@ -9333,8 +9450,9 @@ var HELP_ROWS = [
   ["\u53CC\u51FB / F2 / \u7A7A\u683C", "\u539F\u5730\u7F16\u8F91\uFF08\u7A7A\u683C\u4E0D\u9700\u8981\u5148\u7528\u9F20\u6807\u70B9\u8FDB\u753B\u5E03\uFF09"],
   ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
   ["Ctrl/\u2318+N", "\u6309\u8282\u70B9\u6587\u5B57\u65B0\u5EFA\u4E00\u7BC7\u7B14\u8BB0\uFF0C\u8282\u70B9\u53D8\u6210\u6307\u5411\u5B83\u7684\u53CC\u94FE\uFF08\u53EF\u5957\u6A21\u677F\uFF09"],
-  ["\u63D2\u5165\u5757", "\u5728\u9009\u4E2D\u8282\u70B9\u4E0B\u9762\u52A0\u4EE3\u7801\u5757 / \u5F15\u7528 / \u8868\u683C\uFF0C\u5361\u7247\u91CC\u53EA\u5360\u4E00\u884C"],
-  ["\u5757\u7684\u4F4D\u7F6E", "\u5757\u8DDF\u7740\u5B83\u4E0A\u9762\u90A3\u4E00\u884C\u8D70\uFF08\u4E0D\u770B\u7F29\u8FDB\uFF09\uFF0C\u62D6\u52A8/\u5220\u9664\u65F6\u6574\u5757\u4E00\u8D77\u642C"],
+  ["\u63D2\u5165\u5757", "\u5728\u9009\u4E2D\u8282\u70B9\u4E0B\u9762\u52A0\u4EE3\u7801\u5757 / \u5F15\u7528 / \u8868\u683C\uFF0C\u6309 Obsidian \u539F\u751F\u65B9\u5F0F\u6E32\u67D3\uFF0C\u6210\u4E3A\u72EC\u7ACB\u8282\u70B9"],
+  ["\u5757\u7684\u4F4D\u7F6E", "\u5757\u662F\u4E00\u5F20\u72EC\u7ACB\u5361\u7247\uFF08\u53EA\u8BFB\uFF09\uFF1A\u53CC\u51FB\u4E0D\u8FDB\u7F16\u8F91\uFF0C\u9009\u4E2D\u540E\u53EF\u4EE5\u5220\u9664\u3001\u53EF\u4EE5\u62D6\u5230\u522B\u5904"],
+  ["\u8BA9\u5757\u80FD\u62D6", "\u5728\u5757\u4E0A\u9762\u52A0\u4E00\u884C <!-- obmind:block -->\uFF08\u63D2\u4EF6\u63D2\u5165\u7684\u5757\u4F1A\u81EA\u52A8\u5E26\uFF09"],
   ["Callout", "`> [!note] \u6807\u9898` \u5F53\u5BB9\u5668\uFF1A\u6807\u9898\u6210\u8282\u70B9\uFF0C\u6B63\u6587\u6309 `>` \u540E\u7684\u7F29\u8FDB\u6302\u5728\u5B83\u4E0B\u9762"],
   ["\u2191 \u2193", "\u6362\u9009\u4E2D\uFF1A\u5728\u672B\u7EA7\u8282\u70B9\u4E4B\u95F4\u524D\u540E\u8D70\uFF08\u4E0D\u843D\u5230\u5206\u652F\u4E0A\uFF09"],
   ["\u2190 \u2192", "\u6362\u9009\u4E2D\uFF1A\u7236\u7EA7 / \u5B50\u7EA7\uFF08\u6298\u53E0\u7740\u4F1A\u81EA\u52A8\u5C55\u5F00\uFF09"],
@@ -9501,6 +9619,21 @@ var MindmapView = class extends import_obsidian3.ItemView {
     // 上一次成功投影的结果，下次刷新用它做 diff
     this.snapshot = null;
     this.editorHandle = null;
+    /**
+     * 块渲染用的 Obsidian 子组件（语法高亮 / MathJax / mermaid 的注册都挂在它上面）。
+     *
+     * 必须自己持有并 unload：`MarkdownRenderer.render` 会把渲染器当子组件挂进来，
+     * 不释放的话每刷新一次就堆一批，内存和事件监听都会涨。
+     * key = 文件路径|kind|lang|raw —— 与 blockCache 同构，方便一起淘汰。
+     */
+    this.blockParts = /* @__PURE__ */ new Map();
+    /**
+     * 块渲染结果的 HTML 缓存。
+     *
+     * 同一段代码在一次编辑里会被反复解析（打字、折叠、切主题都重新 parse），
+     * 每次都跑一遍 MarkdownRenderer + MathJax 是纯浪费。
+     */
+    this.blockCache = /* @__PURE__ */ new Map();
     // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
     this.indentStep = 2;
     this.indentUnit = "  ";
@@ -9519,6 +9652,14 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.selectedLines = /* @__PURE__ */ new Set();
     /** 主选中节点（最后交互的那个）：单节点操作（改字/缩进/删除）作用于它，也是框选/拖动锚点 */
     this.primaryLine = -1;
+    /**
+     * 上一次同步过的「文件:行」，避免同一个节点重复滚动。
+     *
+     * 重建（applyTree）之后 `paintSelection` 会被再调一次，选中集没变但 DOM 全新；
+     * 这时候滚一下恰好是对的（用户刚改完这一行），所以判据只按「换行/换文件」，
+     * 不按结构代数。
+     */
+    this.revealedKey = "";
     /**
      * 「上一次往 DOM 上刷选中态时的 (结构代数, 选中集合) 」。
      *
@@ -9597,6 +9738,28 @@ var MindmapView = class extends import_obsidian3.ItemView {
       const file = this.app.vault.getAbstractFileByPath(path2);
       return file instanceof import_obsidian3.TFile ? this.readContent(file) : "";
     });
+    /**
+     * 复制按钮的委托处理。
+     *
+     * 为什么不逐个 addEventListener：块内容是字符串，每次重建都会重新 innerHTML，
+     * 之前绑的监听全丢。委托挂在画布上，重建多少次都有效。
+     */
+    this.onCopyClick = (e) => {
+      var _a, _b, _c;
+      const btn = e.target.closest(".copy-code-button");
+      if (!btn)
+        return;
+      e.preventDefault();
+      e.stopPropagation();
+      const pre = btn.closest("pre");
+      const text = (_c = (_b = (_a = pre == null ? void 0 : pre.querySelector("code")) != null ? _a : pre) == null ? void 0 : _b.textContent) != null ? _c : "";
+      void navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = "\u5DF2\u590D\u5236";
+        window.setTimeout(() => {
+          btn.textContent = "\u590D\u5236";
+        }, 1200);
+      });
+    };
     this.plugin = plugin;
     this.rt = new ViewRuntime((err) => {
       console.error("[obmind] \u91CD\u5EFA\u5BFC\u56FE\u5931\u8D25", err);
@@ -9669,6 +9832,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.canvasEl = canvas;
     canvas.setAttribute("tabindex", "0");
     canvas.addEventListener("keydown", (e) => this.onCanvasKeyDown(e));
+    canvas.addEventListener("click", this.onCopyClick, true);
     this.registerDomEvent(
       this.containerEl,
       "keydown",
@@ -10187,9 +10351,10 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const children2 = (_a = tree.children) != null ? _a : [];
     const seen = /* @__PURE__ */ new Map();
     const keys = children2.map((child) => {
-      var _a2, _b;
-      const base = branchKey((_a2 = child.content) != null ? _a2 : "");
-      const n = (_b = seen.get(base)) != null ? _b : 0;
+      var _a2, _b, _c;
+      const block = (_a2 = child.payload) == null ? void 0 : _a2.block;
+      const base = block ? `\0block:${block.kind}` : branchKey((_b = child.content) != null ? _b : "");
+      const n = (_c = seen.get(base)) != null ? _c : 0;
       seen.set(base, n + 1);
       return n === 0 ? base : `${base}\0${n}`;
     });
@@ -10296,14 +10461,15 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const src = this.nodeAt(this.selectedLine);
     const onNode = src !== null && src.depth > 0;
     const onAny = src !== null;
+    const onBlock = (src == null ? void 0 : src.blockNode) !== void 0;
     const bar = this.nodeBar;
     if (bar) {
-      bar.setEnabled("edit", onNode);
-      bar.setEnabled("child", onAny);
-      bar.setEnabled("sibling", onAny);
-      bar.setEnabled("outdent", onNode);
+      bar.setEnabled("edit", onNode && !onBlock);
+      bar.setEnabled("child", onAny && !onBlock);
+      bar.setEnabled("sibling", onAny && !onBlock);
+      bar.setEnabled("outdent", onNode && !onBlock);
       bar.setEnabled("delete", onNode);
-      bar.setEnabled("block", onAny && this.selectedLines.size === 1);
+      bar.setEnabled("block", onAny && !onBlock && this.selectedLines.size === 1);
       bar.setHidden("newNote", !this.canCreateNoteFor(src));
     }
     const t = this.toolbar;
@@ -10332,6 +10498,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (this.selectedLines.size !== 1)
       return false;
     if (src.depth === 0)
+      return false;
+    if (src.blockNode)
       return false;
     if (src.endLine > src.line)
       return false;
@@ -10367,6 +10535,10 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const src = this.nodeAt(this.selectedLine);
     if (!file || !snap || !src) {
       this.syncToolbar();
+      return;
+    }
+    if (src.blockNode) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u4E0D\u80FD\u6539\u5C42\u7EA7");
       return;
     }
     const out = this.editSvc.commit({
@@ -10599,7 +10771,12 @@ var MindmapView = class extends import_obsidian3.ItemView {
     walk(tree);
     if (!changed)
       return;
-    void this.applyTree(tree);
+    const file = this.targetFile;
+    void (async () => {
+      if (file)
+        await this.renderBlocks(tree, file);
+      await this.applyTree(tree);
+    })();
   }
   /**
    * 撤销 / 重做一步。
@@ -10918,7 +11095,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.clearEmpty();
     const prev = this.snapshot;
     const filter2 = this.plugin.settings.filterFrontmatter;
-    const doc = knownContent === void 0 ? await this.query.load(file.path, file.basename, { filterFrontmatter: filter2 }) : this.query.parse(knownContent, file.basename, { filterFrontmatter: filter2 });
+    const parseOpts = { filterFrontmatter: filter2 };
+    const doc = knownContent === void 0 ? await this.query.load(file.path, file.basename, parseOpts) : this.query.parse(knownContent, file.basename, parseOpts);
     if (this.rt.stale(rev))
       return;
     const keepViewport = this.keepViewport;
@@ -10973,6 +11151,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
       }
     }
     applyFolds(tree, collectFolds((_b = this.mm) == null ? void 0 : _b.state.data));
+    await this.renderBlocks(tree, file);
     if (this.rt.stale(rev))
       return;
     const restructure = () => this.applyTree(tree);
@@ -11149,6 +11328,80 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.structureGen++;
     this.frames.paintNow();
     this.paintSelection();
+  }
+  /**
+   * 把块节点（代码 / 公式 / 表格 / 引用）交给 Obsidian 自己的 MarkdownRenderer 渲染。
+   *
+   * 为什么不自己画：代码高亮、MathJax、mermaid 全在 Obsidian 内部，走官方渲染器的
+   * 额外好处是观感和笔记里**完全一致** —— 用户不用在两套排版之间切换。
+   *
+   * 必须在 setData **之前** await 完成：markmap 的布局读的是
+   * `foreignObject > div > div` 的 scrollWidth/scrollHeight。先灌占位、事后再替换，
+   * 节点尺寸就和真实内容脱节了（卡片被裁、或者留一大块白）。
+   *
+   * 渲染失败或空块时不开天窗：解析层已经往 content 里放了一个薄标签，留着就行。
+   */
+  async renderBlocks(tree, file) {
+    const jobs = collectBlockNodes(tree);
+    if (jobs.length === 0)
+      return;
+    const alive = /* @__PURE__ */ new Set();
+    await Promise.all(
+      jobs.map(async ({ node, block }) => {
+        const key = `${file.path}|${block.kind}|${block.lang}|${block.raw}`;
+        alive.add(key);
+        const cached = this.blockCache.get(key);
+        if (cached !== void 0) {
+          node.content = cached;
+          return;
+        }
+        const holder = document.createElement("div");
+        const part = new import_obsidian3.Component();
+        part.load();
+        try {
+          await import_obsidian3.MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
+          this.decorateCodeBlocks(holder);
+          const html = holder.innerHTML.trim();
+          if (html === "") {
+            part.unload();
+            return;
+          }
+          const wrapped = `<div class="obmind-block-md markdown-rendered">${html}</div>`;
+          node.content = wrapped;
+          if (this.blockCache.size > 300)
+            this.blockCache.clear();
+          this.blockCache.set(key, wrapped);
+          this.blockParts.set(key, part);
+        } catch (err) {
+          part.unload();
+          console.warn("[obmind] \u5757\u6E32\u67D3\u5931\u8D25\uFF0C\u4FDD\u7559\u5360\u4F4D\u6807\u7B7E", err);
+        }
+      })
+    );
+    for (const [key, part] of Array.from(this.blockParts)) {
+      if (alive.has(key))
+        continue;
+      part.unload();
+      this.blockParts.delete(key);
+    }
+  }
+  /**
+   * 给块里的每个 <pre> 配一个复制按钮。
+   *
+   * `MarkdownRenderer.render` 只产 HTML，复制按钮是阅读视图后处理加的，这里没有。
+   * 按钮元素直接写进字符串（innerHTML 序列化会丢事件监听，所以点击统一用
+   * 画布上的事件委托处理，见 onCopyClick）。
+   */
+  decorateCodeBlocks(holder) {
+    for (const pre of Array.from(holder.querySelectorAll("pre"))) {
+      if (pre.querySelector(":scope > .copy-code-button"))
+        continue;
+      const btn = document.createElement("button");
+      btn.className = "copy-code-button";
+      btn.type = "button";
+      btn.textContent = "\u590D\u5236";
+      pre.appendChild(btn);
+    }
   }
   /**
    * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
@@ -11771,6 +12024,45 @@ var MindmapView = class extends import_obsidian3.ItemView {
     void this.mm.ensureVisible(data, { left: pad, right: pad, top: pad, bottom: pad }).catch(() => void 0);
   }
   /**
+   * 选中一个节点 → 把左侧那篇笔记滚到它所在的行（设置项 `syncNoteLine`）。
+   *
+   * 三个「不跳」都是刻意留白的：
+   * - 找不到这篇笔记的编辑器（笔记关掉了 / 只有导图标签）：静默放过，
+   *   不为了跳一下去开标签 —— 那会把用户的分屏布局改掉；
+   * - 阅读模式没有可滚动的位置（CM 实例是隐藏的）：调用无害，滚动不生效；
+   * - 同一个行号已经跳过：`paintSelection` 在每次重建后都会走一遍，
+   *   不去重的话「改一个字 → 整篇重排 → 编辑器又被拽回那一行」。
+   *
+   * 光标会跟着移动，但**不抢焦点**：抢了之后方向键就落进编辑器，
+   * 导图的键盘导航当场失效（而选中的第一反应往往就是接着按方向键）。
+   */
+  revealNoteLine(line) {
+    if (!this.plugin.settings.syncNoteLine)
+      return;
+    if (line < 0)
+      return;
+    const file = this.targetFile;
+    if (!file || file.extension !== "md")
+      return;
+    const key = `${file.path}:${line}`;
+    if (key === this.revealedKey)
+      return;
+    const editor = findEditor(this.app, file);
+    if (!editor)
+      return;
+    const last = Math.max(0, editor.lineCount() - 1);
+    const at = Math.min(Math.max(0, line), last);
+    this.revealedKey = key;
+    try {
+      const from = { line: at, ch: 0 };
+      const to = { line: at, ch: editor.getLine(at).length };
+      editor.scrollIntoView({ from, to }, true);
+      editor.setCursor(from);
+    } catch (err) {
+      console.warn("[obmind] \u540C\u6B65\u7B14\u8BB0\u884C\u53F7\u5931\u8D25", err);
+    }
+  }
+  /**
    * 方向键导航：两条轴各管一件事。
    *
    * 上下只走**末端节点**（没有孩子的、或折叠了的）：折叠的子树在屏幕上不存在，
@@ -11943,6 +12235,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
       }
     }
     (_d = this.nodeBar) == null ? void 0 : _d.setVisible(this.selectedLines.size === 1);
+    if (this.selectedLines.size === 1)
+      this.revealNoteLine(this.primaryLine);
   }
   /**
    * 只修指定节点的选中 class。
@@ -12166,6 +12460,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const snap = this.editSnapshot();
     if (!file || !snap)
       return;
+    const at = this.nodeAt(line);
+    if (at == null ? void 0 : at.blockNode) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u518D\u63D2\u5757");
+      return;
+    }
     const out = this.editSvc.insertBlock({ snap, line, kind });
     if (out.kind === "error") {
       new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
@@ -12186,6 +12485,11 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const snap = this.editSnapshot();
     if (!file || !snap)
       return;
+    const at = this.nodeAt(line);
+    if (at == null ? void 0 : at.blockNode) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u5EFA\u8282\u70B9");
+      return;
+    }
     const out = this.editSvc.create({ snap, line, mode });
     if (out.kind === "error") {
       new import_obsidian3.Notice(`obmind\uFF1A${out.reason}`);
@@ -12239,6 +12543,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     if (target.closest("circle"))
       return;
+    if (target.closest(".obmind-block-md"))
+      return;
     const g = target.closest("g.markmap-node");
     if (!g)
       return;
@@ -12267,7 +12573,15 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return false;
     for (const srcLine of srcLines) {
       const dragSrc = this.nodeAt(srcLine);
-      if (dragSrc && dragSrc.endLine !== void 0 && dragSrc.endLine > dragSrc.line) {
+      if (!dragSrc)
+        continue;
+      if (dragSrc.blockNode === "bound") {
+        new import_obsidian3.Notice("obmind\uFF1A\u8FD9\u4E2A\u5757\u4E0D\u80FD\u62D6\u52A8 \u2014\u2014 \u5728\u5B83\u4E0A\u9762\u52A0\u4E00\u884C <!-- obmind:block --> \u5C31\u80FD\u62D6\u4E86");
+        return false;
+      }
+      if (dragSrc.blockNode)
+        continue;
+      if (dragSrc.endLine !== void 0 && dragSrc.endLine > dragSrc.line) {
         new import_obsidian3.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u6682\u4E0D\u652F\u6301\u62D6\u52A8\uFF0C\u8BF7\u5728\u7B14\u8BB0\u91CC\u8C03\u6574\u5C42\u7EA7");
         return false;
       }
@@ -12367,6 +12681,10 @@ var MindmapView = class extends import_obsidian3.ItemView {
     const src = this.srcOf(g);
     if (!src || ((_b = data == null ? void 0 : data.state) == null ? void 0 : _b.depth) === 0)
       return;
+    if (src.blockNode) {
+      new import_obsidian3.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u8BF7\u56DE\u7B14\u8BB0\u91CC\u6539");
+      return;
+    }
     if (src.endLine !== void 0 && src.endLine > src.line) {
       new import_obsidian3.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u8BF7\u5728\u7B14\u8BB0\u4E2D\u7F16\u8F91");
       return;
@@ -12406,12 +12724,8 @@ var MindmapView = class extends import_obsidian3.ItemView {
       return;
     const box = g.querySelector("foreignObject > div > div");
     let card = "";
-    if (box) {
-      const clone = box.cloneNode(true);
-      for (const pill of Array.from(clone.querySelectorAll(".obmind-block-pill")))
-        pill.remove();
-      card = normalizeLabel((_a = clone.textContent) != null ? _a : "");
-    }
+    if (box)
+      card = normalizeLabel((_a = box.textContent) != null ? _a : "");
     const editor = normalizeLabel(value);
     const stale = card !== "" && editor !== "" && card !== editor;
   }
@@ -12512,8 +12826,7 @@ var MindmapView = class extends import_obsidian3.ItemView {
     if (!fo || !box)
       return null;
     const shown = parsed.checked === null ? parsed.text : `${parsed.checked ? "\u2611" : "\u2610"} ${parsed.text}`;
-    const pills = Array.from(box.querySelectorAll(".obmind-block-pill")).map((el) => el.outerHTML).join("");
-    const html = renderInline(shown) + pills;
+    const html = renderInline(shown);
     const prevHtml = box.innerHTML;
     const prevW = (_b = fo.getAttribute("width")) != null ? _b : "";
     const prevH = (_c = fo.getAttribute("height")) != null ? _c : "";
@@ -12591,6 +12904,10 @@ var MindmapView = class extends import_obsidian3.ItemView {
     this.rt.dispose();
     (_a = this.editorHandle) == null ? void 0 : _a.close();
     this.editorHandle = null;
+    for (const part of this.blockParts.values())
+      part.unload();
+    this.blockParts.clear();
+    this.blockCache.clear();
     (_b = this.observer) == null ? void 0 : _b.disconnect();
     this.observer = null;
     (_c = this.resizeObserver) == null ? void 0 : _c.disconnect();
@@ -12638,7 +12955,8 @@ var DEFAULT_SETTINGS = {
   theme: "follow",
   filterFrontmatter: true,
   navSync: DEFAULT_NAV_SYNC,
-  noteTemplate: ""
+  noteTemplate: "",
+  syncNoteLine: true
 };
 var ObmindSettingTab = class extends import_obsidian4.PluginSettingTab {
   constructor(app, plugin) {
@@ -12654,6 +12972,15 @@ var ObmindSettingTab = class extends import_obsidian4.PluginSettingTab {
         this.plugin.settings.filterFrontmatter = value;
         await this.plugin.saveSettings();
         this.plugin.refreshMindmap();
+      });
+    });
+    new import_obsidian4.Setting(containerEl).setName("\u9009\u4E2D\u8282\u70B9\u540C\u6B65\u7B14\u8BB0\u884C").setDesc(
+      "\u5728\u5BFC\u56FE\u91CC\u9009\u4E2D\u4E00\u4E2A\u8282\u70B9\u65F6\uFF0C\u628A\u540C\u4E00\u7BC7\u7B14\u8BB0\u7684\u7F16\u8F91\u5668\u5149\u6807\u4E0E\u6EDA\u52A8\u4F4D\u7F6E\u8DF3\u8F6C\u5230\u5B83\u6240\u5728\u7684\u884C\u3002\u591A\u9009\u4E0E\u6846\u9009\u4E0D\u8DF3\uFF0C\u907F\u514D\u753B\u9762\u4E71\u7A9C\u3002"
+    ).addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.syncNoteLine);
+      toggle.onChange(async (value) => {
+        this.plugin.settings.syncNoteLine = value;
+        await this.plugin.saveSettings();
       });
     });
     const hint = containerEl.createDiv({ cls: "setting-item-description obmind-nav-hint" });

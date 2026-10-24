@@ -127,6 +127,9 @@ export class EditService {
   commit(input: CommitInput): EditOutcome {
     const { snap, src, action, value } = input;
     if (action === "cancel") return none("已取消");
+    // 块是只读的：它的文字是 MarkdownRenderer 的产物，写回去等于把 HTML 塞进笔记。
+    // 视图层已经拦了一道，这里是纯函数层的兜底（也方便单测）。
+    if (src.blockNode) return error("块是只读的，请回笔记里改");
 
     const parsed = parseEditorValue(src, value);
 
@@ -212,6 +215,7 @@ export class EditService {
   create(input: CreateInput): EditOutcome {
     const src = this.nodeAt(input.snap, input.line);
     if (!src) return error("找不到要新建的节点");
+    if (src.blockNode) return error("块是只读叶子，不能在它下面建节点");
 
     const plan = planCreate({
       src,
@@ -372,8 +376,12 @@ export class EditService {
   insertBlock(input: InsertBlockInput): EditOutcome {
     const src = this.nodeAt(input.snap, input.line);
     if (!src) return error("找不到要插入块的节点");
+    if (src.blockNode) return error("块是只读叶子，不能在里面再插块");
 
-    const plan = insertBlockPlan({ src }, input.kind);
+    const plan = insertBlockPlan(
+      { src, step: input.snap.step, unit: input.snap.unit },
+      input.kind,
+    );
     const lines: string[] = input.snap.content.split("\n");
     const at: number = plan.insertAfterLine;
     const span: Span = {

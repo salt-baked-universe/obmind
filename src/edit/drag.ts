@@ -178,13 +178,17 @@ export class DragController {
     // 0 = 左键。右键留给菜单（不拦 contextmenu），中键留给画布自己的行为。
     if (e.button !== 0) return;
     const el = e.target as Element;
-    // 链接、折叠圆点各有自己的用途
-    if (el.closest("a") || el.closest("circle")) return;
+    // 链接、折叠圆点、代码复制按钮各有自己的用途
+    if (el.closest("a") || el.closest("circle") || el.closest(".copy-code-button")) return;
 
     const g = this.nodeAt(el);
     if (!g) return;
     const src = this.cb.srcOf(g);
     if (!src) return; // 根节点不可拖
+    // 裸块没有代理行，层级只能靠围栏自己的缩进（0～3 格）—— 拖动必然把它缩到 4 格，
+    // 那一段代码就退化成「缩进代码块」，``` 变成字面量。所以裸块按不动。
+    // 自由块（上面有 `<!-- obmind:block -->`）可以拖：缩进改的是代理行，块本体不动。
+    if (src.blockNode === "bound") return;
 
     // 掐断 pointerdown 的传播，免得某些版本的 d3-zoom 拿它来起手拖画布
     e.stopPropagation();

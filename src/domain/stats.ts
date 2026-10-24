@@ -30,8 +30,13 @@ export function treeStats(tree: IPureNode | null | undefined): TreeStats {
   const stack: { node: IPureNode; level: number }[] = [{ node: tree, level: 1 }];
   while (stack.length > 0) {
     const { node, level } = stack.pop() as { node: IPureNode; level: number };
-    nodes++;
-    if (level > depth) depth = level;
+    // 块（代码 / 引用 / 表格）不是用户写的「节点」：它自己有卡片，但把它算进去
+    // 会让人对着「257 节点」去数屏幕上的 250 张文字卡，永远数不对。
+    const isBlock: boolean = !!(node.payload as { block?: unknown } | undefined)?.block;
+    if (!isBlock) {
+      nodes++;
+      if (level > depth) depth = level;
+    }
     const children = node.children ?? [];
     for (const child of children) stack.push({ node: child, level: level + 1 });
   }

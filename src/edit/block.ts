@@ -3,12 +3,14 @@
  *
  * 纯函数，不碰文件也不碰 DOM —— 「插在哪一行、写成什么样」可以直接跑用例。
  *
- * 两条规则：
- * 1. 插在**节点自己那几行之后、子节点之前**。块的归属是「前面最近的那个节点行」，
- *    所以只有这个位置能让新块挂到用户选中的那个节点上；插到子树末尾会归给最后一个后代。
- * 2. 块的缩进只有两种：正文 / 标题体系里**顶格**（围栏块缩进 4 格就退化成
- *    「缩进代码块」，``` 变字面量）；列表项里缩进到**标记之后**
- *    （否则块会跳出列表项，Obsidian 里就成了列表外面的一段代码）。
+ * 三条规则：
+ * 1. 插在**节点自己那几行之后、子节点之前**。这样块在原文里的位置就紧跟着
+ *    选中的节点，导图上也排在它下面。
+ * 2. 插件插的块**一律带代理行** `<!-- obmind:block -->`：用户不该为了「让块能拖」
+ *    去手写一行注释。有了它，块当场就能像节点一样拖动、换层级。
+ * 3. 代理行与块本体用同一个缩进：列表项里缩到**标记之后**（否则块跳出列表），
+ *    其余缩进一层（成为选中节点的子节点）。围栏最多能缩 3 格，一层的步长
+ *    （2 格）刚好安全；再深的层级交给拖动去改代理行的缩进，块本体永远不动。
  */
 
 import type { SrcRef } from "../types";
@@ -16,9 +18,16 @@ import { colsOfIndent } from "../domain/syntax";
 
 export type BlockKind = "code" | "quote" | "table";
 
+/** 自由块的代理行：它承载缩进与层级，块本体照旧顶格 */
+export const BLOCK_MARK_LINE = "<!-- obmind:block -->";
+
 export interface InsertBlockInput {
   /** 以哪个节点为宿主 */
   src: SrcRef;
+  /** 缩进步长（列数），用来把代理行缩出一层 */
+  step?: number;
+  /** 缩进单位原文（可能是制表符）；空串表示用 step 个空格 */
+  unit?: string;
 }
 
 export interface InsertBlockPlan {
@@ -68,12 +77,21 @@ export function insertBlockPlan(input: InsertBlockInput, kind: BlockKind): Inser
   // 跳过软换行续行与已有块：插在它们之前会把节点自己的行劈开
   const after: number = Math.max(src.line, src.endLine, src.blockEnd ?? src.line);
   const quote: string = quotePrefixOf(src);
-  const indent: string = blockIndent(src);
+  // 列表项里缩到标记之后；其余缩一层。两种都 ≤ 3 格，围栏照旧合法。
+  const listed: string = blockIndent(src);
+  const step: number = input.step && input.step > 0 ? input.step : 2;
+  // 代理行承载层级，可以随便缩；块本体只能缩到「列表项标记之后」或顶格 ——
+  // 围栏缩到 4 格就退化成缩进代码块了，这是唯一不能碰的底线。
+  const anchorIndent: string = listed !== "" ? listed : src.indent + (input.unit || " ".repeat(step));
+
+  const fenceLines: string[] = TEMPLATES[kind].map((line: string) =>
+    line === "" ? quote.replace(/[ \t]+$/, "") : quote + listed + line,
+  );
   return {
     insertAfterLine: after,
-    lines: TEMPLATES[kind].map((line: string) =>
-      line === "" ? quote.replace(/[ \t]+$/, "") : quote + indent + line,
-    ),
-    blockStartLine: after + 1,
+    // 代理行排在最前面：块能不能被拖动、能挂到哪一层，全看这一行的缩进
+    lines: [quote + anchorIndent + BLOCK_MARK_LINE, ...fenceLines],
+    // 光标落在块首行（跳过代理行），用户接着就能写内容
+    blockStartLine: after + 2,
   };
 }

@@ -19,6 +19,8 @@ export interface ObmindSettings {
    * 复制一份内容进插件设置之后必然会和原文件分叉。
    */
   noteTemplate: string;
+  /** 选中节点时，把左侧同一篇笔记的光标 / 滚动位置跟到对应行 */
+  syncNoteLine: boolean;
 }
 
 export const DEFAULT_SETTINGS: ObmindSettings = {
@@ -26,6 +28,7 @@ export const DEFAULT_SETTINGS: ObmindSettings = {
   filterFrontmatter: true,
   navSync: DEFAULT_NAV_SYNC,
   noteTemplate: "",
+  syncNoteLine: true,
 };
 
 export class ObmindSettingTab extends PluginSettingTab {
@@ -49,6 +52,20 @@ export class ObmindSettingTab extends PluginSettingTab {
           this.plugin.settings.filterFrontmatter = value;
           await this.plugin.saveSettings();
           this.plugin.refreshMindmap();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("选中节点同步笔记行")
+      .setDesc(
+        "在导图里选中一个节点时，把同一篇笔记的编辑器光标与滚动位置跳转到它所在的行。" +
+          "多选与框选不跳，避免画面乱窜。",
+      )
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.syncNoteLine);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.syncNoteLine = value;
+          await this.plugin.saveSettings();
         });
       });
 

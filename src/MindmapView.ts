@@ -1,19 +1,21 @@
 import {
+  Component,
   ItemView,
   Menu,
   Notice,
   WorkspaceLeaf,
+  MarkdownRenderer,
   MarkdownView,
   TFile,
   debounce,
   normalizePath,
   setIcon,
 } from "obsidian";
-import type { WorkspaceSplit } from "obsidian";
+import type { Editor, EditorPosition, WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
-import { renderInline } from "./parser";
-import type { DropMode, SrcRef, WriteOp } from "./types";
+import { collectBlockNodes, renderInline } from "./parser";
+import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
 import { resolveTheme, THEME_OPTIONS } from "./theme";
 import type { MindmapTheme, ThemeSpec } from "./theme";
 import { NodePainter } from "./render/painter";
@@ -92,8 +94,9 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["双击 / F2 / 空格", "原地编辑（空格不需要先用鼠标点进画布）"],
   ["Tab / Enter", "新建子级 / 新建同级"],
   ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
-  ["插入块", "在选中节点下面加代码块 / 引用 / 表格，卡片里只占一行"],
-  ["块的位置", "块跟着它上面那一行走（不看缩进），拖动/删除时整块一起搬"],
+  ["插入块", "在选中节点下面加代码块 / 引用 / 表格，按 Obsidian 原生方式渲染，成为独立节点"],
+  ["块的位置", "块是一张独立卡片（只读）：双击不进编辑，选中后可以删除、可以拖到别处"],
+  ["让块能拖", "在块上面加一行 <!-- obmind:block -->（插件插入的块会自动带）"],
   ["Callout", "`> [!note] 标题` 当容器：标题成节点，正文按 `>` 后的缩进挂在它下面"],
   ["↑ ↓", "换选中：在末级节点之间前后走（不落到分支上）"],
   ["← →", "换选中：父级 / 子级（折叠着会自动展开）"],
@@ -409,6 +412,21 @@ export class MindmapView extends ItemView {
   // 上一次成功投影的结果，下次刷新用它做 diff
   private snapshot: Snapshot | null = null;
   private editorHandle: InlineEditorHandle | null = null;
+  /**
+   * 块渲染用的 Obsidian 子组件（语法高亮 / MathJax / mermaid 的注册都挂在它上面）。
+   *
+   * 必须自己持有并 unload：`MarkdownRenderer.render` 会把渲染器当子组件挂进来，
+   * 不释放的话每刷新一次就堆一批，内存和事件监听都会涨。
+   * key = 文件路径|kind|lang|raw —— 与 blockCache 同构，方便一起淘汰。
+   */
+  private readonly blockParts = new Map<string, Component>();
+  /**
+   * 块渲染结果的 HTML 缓存。
+   *
+   * 同一段代码在一次编辑里会被反复解析（打字、折叠、切主题都重新 parse），
+   * 每次都跑一遍 MarkdownRenderer + MathJax 是纯浪费。
+   */
+  private readonly blockCache = new Map<string, string>();
   // 当前笔记检测到的缩进步长（列数）与缩进单位（原文实际用的空白串，可能是制表符）
   private indentStep = 2;
   private indentUnit = "  ";
@@ -427,6 +445,14 @@ export class MindmapView extends ItemView {
   private selectedLines: Set<number> = new Set();
   /** 主选中节点（最后交互的那个）：单节点操作（改字/缩进/删除）作用于它，也是框选/拖动锚点 */
   private primaryLine = -1;
+  /**
+   * 上一次同步过的「文件:行」，避免同一个节点重复滚动。
+   *
+   * 重建（applyTree）之后 `paintSelection` 会被再调一次，选中集没变但 DOM 全新；
+   * 这时候滚一下恰好是对的（用户刚改完这一行），所以判据只按「换行/换文件」，
+   * 不按结构代数。
+   */
+  private revealedKey = "";
   /**
    * 「上一次往 DOM 上刷选中态时的 (结构代数, 选中集合) 」。
    *
@@ -610,6 +636,9 @@ export class MindmapView extends ItemView {
     // 点击节点时会主动 focus，键盘操作才有落点。
     canvas.setAttribute("tabindex", "0");
     canvas.addEventListener("keydown", (e: KeyboardEvent) => this.onCanvasKeyDown(e));
+    // 代码块的「复制」按钮：内容每次重建都会重写 innerHTML，逐个绑监听会全丢，
+    // 所以统一在画布上做事件委托（e.target 一定是按钮本身）。
+    canvas.addEventListener("click", this.onCopyClick, true);
     // 空格进编辑：挂在整个视图上，而不是只挂画布。
     // 画布的 keydown 只在「焦点正好在画布上」才收得到，而点过工具栏、拖过框选、
     // 或者一轮重建之后，焦点经常落在别处 —— 那时按空格毫无反应，用户只会觉得
@@ -1343,7 +1372,10 @@ export class MindmapView extends ItemView {
     const children: readonly IPureNode[] = tree.children ?? [];
     const seen = new Map<string, number>();
     const keys: string[] = children.map((child: IPureNode) => {
-      const base: string = branchKey(child.content ?? "");
+      // 根级的块：content 是 MarkdownRenderer 渲染出来的 HTML，拿它当分支名的话
+      // 同一段代码换个主题/换次渲染就会变，色槽跟着满屏跳。
+      const block = (child.payload as { block?: { kind: string } } | undefined)?.block;
+      const base: string = block ? `\u0000block:${block.kind}` : branchKey(child.content ?? "");
       const n: number = seen.get(base) ?? 0;
       seen.set(base, n + 1);
       // 同名分支（例如两个「其他」）必须分开，否则它们会共用一个颜色
@@ -1456,16 +1488,19 @@ export class MindmapView extends ItemView {
     // 根节点就是文件名本身：改不了、删不了、也无所谓缩进
     const onNode: boolean = src !== null && src.depth > 0;
     const onAny: boolean = src !== null;
+    // 块（代码 / 公式 / 表格 / 引用）是只读叶子：文字不能改、下面不能挂节点。
+    // 唯一说得通的操作是删除 —— 在图里想删掉一段代码是很自然的诉求。
+    const onBlock: boolean = src?.blockNode !== undefined;
 
     const bar = this.nodeBar;
     if (bar) {
-      bar.setEnabled("edit", onNode);
-      bar.setEnabled("child", onAny);
-      bar.setEnabled("sibling", onAny);
-      bar.setEnabled("outdent", onNode);
+      bar.setEnabled("edit", onNode && !onBlock);
+      bar.setEnabled("child", onAny && !onBlock);
+      bar.setEnabled("sibling", onAny && !onBlock);
+      bar.setEnabled("outdent", onNode && !onBlock);
       bar.setEnabled("delete", onNode);
       // 插入块也是「从这一行长出东西」，多选时没有唯一宿主，只能单选
-      bar.setEnabled("block", onAny && this.selectedLines.size === 1);
+      bar.setEnabled("block", onAny && !onBlock && this.selectedLines.size === 1);
       // 「新建笔记」不是置灰而是隐藏：节点已经有双链时它没有任何意义，
       // 留一个灰图标在那儿，用户只会反复点它试为什么点不动（见 canCreateNoteFor）
       bar.setHidden("newNote", !this.canCreateNoteFor(src));
@@ -1495,6 +1530,7 @@ export class MindmapView extends ItemView {
     if (!src) return false;
     if (this.selectedLines.size !== 1) return false;
     if (src.depth === 0) return false;
+    if (src.blockNode) return false;
     if (src.endLine > src.line) return false;
     if (hasWikiLink(src.text)) return false;
     return noteTitleOf(src.text) !== "";
@@ -1526,6 +1562,10 @@ export class MindmapView extends ItemView {
     const src = this.nodeAt(this.selectedLine);
     if (!file || !snap || !src) {
       this.syncToolbar();
+      return;
+    }
+    if (src.blockNode) {
+      new Notice("obmind：块是只读的，不能改层级");
       return;
     }
 
@@ -1790,8 +1830,15 @@ export class MindmapView extends ItemView {
     walk(tree);
     if (!changed) return;
 
-    // 选中态与浮动条由 applyTree 自己在重建结束后挂回去
-    void this.applyTree(tree);
+    // 快照里的树有可能是「patch 通道」留下的那一份：那条路径不重建 DOM，
+    // 所以树里块节点还停在解析期的占位。直接灌进去会让所有代码块变成一行标签。
+    // 这里补一次渲染（缓存命中，成本≈0）再重建。
+    const file = this.targetFile;
+    void (async (): Promise<void> => {
+      if (file) await this.renderBlocks(tree, file);
+      // 选中态与浮动条由 applyTree 自己在重建结束后挂回去
+      await this.applyTree(tree);
+    })();
   }
 
   /**
@@ -2143,14 +2190,15 @@ export class MindmapView extends ItemView {
 
     const prev = this.snapshot;
     const filter: boolean = this.plugin.settings.filterFrontmatter;
+    const parseOpts: { filterFrontmatter: boolean } = { filterFrontmatter: filter };
 
     // 读路径统一走 QueryService（读 → 解析 → 节点坐标 + 缩进检测），一次产出只读快照。
     // 写回之后调用方直接传入刚写完的内容，不再依赖「读回来的东西是新的」，
     // 彻底避开「文件变了但导图不更新」的竞态。
     const doc =
       knownContent === undefined
-        ? await this.query.load(file.path, file.basename, { filterFrontmatter: filter })
-        : this.query.parse(knownContent, file.basename, { filterFrontmatter: filter });
+        ? await this.query.load(file.path, file.basename, parseOpts)
+        : this.query.parse(knownContent, file.basename, parseOpts);
     // 读文件期间用户可能又改了一版、或者切走了笔记：这一轮作废，新请求会接管
     if (this.rt.stale(rev)) return;
 
@@ -2251,8 +2299,10 @@ export class MindmapView extends ItemView {
     // 不接住的话用户折起来的分支每次编辑都会全弹开。
     applyFolds(tree, collectFolds(this.mm?.state.data));
 
-    // 块（代码 / 引用 / 表格）已经在解析层变成节点 content 里的一行了，
-    // 不需要再交给 MarkdownRenderer —— 那是「展开渲染」时代的事
+    // 块节点的 content 必须在这一刻就是**渲染后的真 HTML**：markmap 是按 content
+    // 里的 DOM 量宽高的。缓存命中时几乎零成本，所以每次重建都跑一遍没有负担。
+    await this.renderBlocks(tree, file);
+
     if (this.rt.stale(rev)) return;
 
     const restructure = (): Promise<void> => this.applyTree(tree);
@@ -2502,6 +2552,113 @@ export class MindmapView extends ItemView {
     this.frames.paintNow();
     this.paintSelection();
   }
+
+  /**
+   * 把块节点（代码 / 公式 / 表格 / 引用）交给 Obsidian 自己的 MarkdownRenderer 渲染。
+   *
+   * 为什么不自己画：代码高亮、MathJax、mermaid 全在 Obsidian 内部，走官方渲染器的
+   * 额外好处是观感和笔记里**完全一致** —— 用户不用在两套排版之间切换。
+   *
+   * 必须在 setData **之前** await 完成：markmap 的布局读的是
+   * `foreignObject > div > div` 的 scrollWidth/scrollHeight。先灌占位、事后再替换，
+   * 节点尺寸就和真实内容脱节了（卡片被裁、或者留一大块白）。
+   *
+   * 渲染失败或空块时不开天窗：解析层已经往 content 里放了一个薄标签，留着就行。
+   */
+  private async renderBlocks(tree: IPureNode, file: TFile): Promise<void> {
+    const jobs = collectBlockNodes(tree);
+    if (jobs.length === 0) return;
+
+    const alive = new Set<string>();
+    await Promise.all(
+      jobs.map(async ({ node, block }: { node: IPureNode; block: BlockInfo }) => {
+        // 路径进 key：MarkdownRenderer 会按 sourcePath 解析 ![[图.png]] 和相对链接，
+        // 跨笔记复用同一段代码的渲染结果会把别人的图贴过来。
+        const key = `${file.path}|${block.kind}|${block.lang}|${block.raw}`;
+        alive.add(key);
+
+        const cached: string | undefined = this.blockCache.get(key);
+        if (cached !== undefined) {
+          node.content = cached;
+          return;
+        }
+
+        const holder = document.createElement("div");
+        const part = new Component();
+        // 先 load：渲染器（高亮 / MathJax / mermaid）是作为子组件挂上来的，
+        // 父组件没 load 的话它们不会启动，公式就一直是原始 `$$…$$`。
+        part.load();
+        try {
+          await MarkdownRenderer.render(this.app, block.raw, holder, file.path, part);
+          this.decorateCodeBlocks(holder);
+          const html: string = holder.innerHTML.trim();
+          // 空块（```js``` 里什么都没有）不值得撑一张空白卡片
+          if (html === "") {
+            part.unload();
+            return;
+          }
+          // `markdown-rendered` 是关键：Obsidian 的阅读视图样式（代码底色、语法高亮、
+          // 表格线、引用条、callout、公式排版）全都挂在这个类下面。不加它，块在我们
+          // 手里就只剩「排得下」而已 —— 颜色和底色全丢。
+          const wrapped: string = `<div class="obmind-block-md markdown-rendered">${html}</div>`;
+          node.content = wrapped;
+          if (this.blockCache.size > 300) this.blockCache.clear();
+          this.blockCache.set(key, wrapped);
+          this.blockParts.set(key, part);
+        } catch (err) {
+          part.unload();
+          // 保留解析期的薄标签：整块消失比排得难看糟糕得多
+          console.warn("[obmind] 块渲染失败，保留占位标签", err);
+        }
+      }),
+    );
+
+    // 这一轮没再用到的组件要释放，否则切来切去会堆一串 MathJax 注册
+    for (const [key, part] of Array.from(this.blockParts)) {
+      if (alive.has(key)) continue;
+      part.unload();
+      this.blockParts.delete(key);
+    }
+  }
+
+  /**
+   * 给块里的每个 <pre> 配一个复制按钮。
+   *
+   * `MarkdownRenderer.render` 只产 HTML，复制按钮是阅读视图后处理加的，这里没有。
+   * 按钮元素直接写进字符串（innerHTML 序列化会丢事件监听，所以点击统一用
+   * 画布上的事件委托处理，见 onCopyClick）。
+   */
+  private decorateCodeBlocks(holder: HTMLElement): void {
+    for (const pre of Array.from(holder.querySelectorAll("pre"))) {
+      if (pre.querySelector(":scope > .copy-code-button")) continue;
+      const btn = document.createElement("button");
+      btn.className = "copy-code-button";
+      btn.type = "button";
+      btn.textContent = "复制";
+      pre.appendChild(btn);
+    }
+  }
+
+  /**
+   * 复制按钮的委托处理。
+   *
+   * 为什么不逐个 addEventListener：块内容是字符串，每次重建都会重新 innerHTML，
+   * 之前绑的监听全丢。委托挂在画布上，重建多少次都有效。
+   */
+  private onCopyClick = (e: MouseEvent): void => {
+    const btn = (e.target as Element).closest<HTMLElement>(".copy-code-button");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const pre = btn.closest("pre");
+    const text: string = (pre?.querySelector("code") ?? pre)?.textContent ?? "";
+    void navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = "已复制";
+      window.setTimeout(() => {
+        btn.textContent = "复制";
+      }, 1200);
+    });
+  };
 
   /**
    * 把新树灌进 markmap，并在同一帧内把卡片/连线摆正。
@@ -3305,6 +3462,47 @@ export class MindmapView extends ItemView {
   }
 
   /**
+   * 选中一个节点 → 把左侧那篇笔记滚到它所在的行（设置项 `syncNoteLine`）。
+   *
+   * 三个「不跳」都是刻意留白的：
+   * - 找不到这篇笔记的编辑器（笔记关掉了 / 只有导图标签）：静默放过，
+   *   不为了跳一下去开标签 —— 那会把用户的分屏布局改掉；
+   * - 阅读模式没有可滚动的位置（CM 实例是隐藏的）：调用无害，滚动不生效；
+   * - 同一个行号已经跳过：`paintSelection` 在每次重建后都会走一遍，
+   *   不去重的话「改一个字 → 整篇重排 → 编辑器又被拽回那一行」。
+   *
+   * 光标会跟着移动，但**不抢焦点**：抢了之后方向键就落进编辑器，
+   * 导图的键盘导航当场失效（而选中的第一反应往往就是接着按方向键）。
+   */
+  private revealNoteLine(line: number): void {
+    if (!this.plugin.settings.syncNoteLine) return;
+    if (line < 0) return;
+    const file: TFile | null = this.targetFile;
+    if (!file || file.extension !== "md") return;
+
+    const key: string = `${file.path}:${line}`;
+    if (key === this.revealedKey) return;
+
+    const editor: Editor | null = findEditor(this.app, file);
+    if (!editor) return;
+
+    const last: number = Math.max(0, editor.lineCount() - 1);
+    const at: number = Math.min(Math.max(0, line), last);
+    this.revealedKey = key;
+
+    try {
+      const from: EditorPosition = { line: at, ch: 0 };
+      const to: EditorPosition = { line: at, ch: editor.getLine(at).length };
+      // 第二个参数 true = 居中（默认是「露出来就行」，行贴着底边看着像没跳到位）
+      editor.scrollIntoView({ from, to }, true);
+      editor.setCursor(from);
+    } catch (err) {
+      // 编辑器可能正在切换文件 / 已被回收：跳转失败不该影响导图本身
+      console.warn("[obmind] 同步笔记行号失败", err);
+    }
+  }
+
+  /**
    * 方向键导航：两条轴各管一件事。
    *
    * 上下只走**末端节点**（没有孩子的、或折叠了的）：折叠的子树在屏幕上不存在，
@@ -3482,6 +3680,9 @@ export class MindmapView extends ItemView {
       }
     }
     this.nodeBar?.setVisible(this.selectedLines.size === 1);
+    // 选中 → 笔记跟随（设置项 syncNoteLine）。只在单选时跳：框选一整片
+    // 还把编辑器拽来拽去，等于让人对着滚动的文档猜自己选了什么。
+    if (this.selectedLines.size === 1) this.revealNoteLine(this.primaryLine);
   }
 
   /**
@@ -3718,6 +3919,11 @@ export class MindmapView extends ItemView {
     const snap = this.editSnapshot();
     if (!file || !snap) return;
 
+    const at = this.nodeAt(line);
+    if (at?.blockNode) {
+      new Notice("obmind：块是只读叶子，不能在它下面再插块");
+      return;
+    }
     const out = this.editSvc.insertBlock({ snap, line, kind });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
@@ -3737,6 +3943,11 @@ export class MindmapView extends ItemView {
     const snap = this.editSnapshot();
     if (!file || !snap) return;
 
+    const at = this.nodeAt(line);
+    if (at?.blockNode) {
+      new Notice("obmind：块是只读叶子，不能在它下面建节点");
+      return;
+    }
     const out = this.editSvc.create({ snap, line, mode });
     if (out.kind === "error") {
       new Notice(`obmind：${out.reason}`);
@@ -3794,6 +4005,9 @@ export class MindmapView extends ItemView {
     // 折叠圆点交给 markmap
     if (target.closest("circle")) return;
 
+    // 块里的文字要能双击选词、复制：不接管，也不进编辑态
+    if (target.closest(".obmind-block-md")) return;
+
     const g = target.closest("g.markmap-node") as SVGGElement | null;
     if (!g) return;
 
@@ -3828,7 +4042,16 @@ export class MindmapView extends ItemView {
     // Bug 2 修复：多行合并节点暂不支持拖动（续行写回会错位），请在笔记里调整层级。
     for (const srcLine of srcLines) {
       const dragSrc = this.nodeAt(srcLine);
-      if (dragSrc && dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
+      if (!dragSrc) continue;
+      // 裸块没有代理行，拖动会把围栏缩进到 4 格以上，整段代码变成字面量。
+      // （自由块可以拖，但拖的是代理行 —— 见 frozenIn。）
+      if (dragSrc.blockNode === "bound") {
+        new Notice("obmind：这个块不能拖动 —— 在它上面加一行 <!-- obmind:block --> 就能拖了");
+        return false;
+      }
+      // 自由块天生跨多行（代理行 + 块本体），不能再按「软换行节点」拦一次
+      if (dragSrc.blockNode) continue;
+      if (dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
         new Notice("obmind：多行节点暂不支持拖动，请在笔记里调整层级");
         return false;
       }
@@ -3931,6 +4154,13 @@ export class MindmapView extends ItemView {
     // 根节点没有 src；折叠起来的节点不渲染，也不会有 DOM
     if (!src || data?.state?.depth === 0) return;
 
+    // 块是只读的：它的卡片是 MarkdownRenderer 渲染出来的 HTML，双击进去改字
+    // 等于把一段 HTML 当正文写回笔记。要改就回笔记里改。
+    if (src.blockNode) {
+      new Notice("obmind：块是只读的，请回笔记里改");
+      return;
+    }
+
     // Bug 2 修复：多行合并节点（软换行）在 UI 里只读，请在笔记中编辑，
     // 避免续行被单独写回、把节点拆坏。
     if (src.endLine !== undefined && src.endLine > src.line) {
@@ -3975,12 +4205,7 @@ export class MindmapView extends ItemView {
     if (!isTracing()) return;
     const box = g.querySelector<HTMLElement>("foreignObject > div > div");
     let card = "";
-    if (box) {
-      // 块标签（pill）是我们自己追加的装饰，不属于节点文字，比之前先摘掉
-      const clone = box.cloneNode(true) as HTMLElement;
-      for (const pill of Array.from(clone.querySelectorAll(".obmind-block-pill"))) pill.remove();
-      card = normalizeLabel(clone.textContent ?? "");
-    }
+    if (box) card = normalizeLabel(box.textContent ?? "");
     const editor = normalizeLabel(value);
     const stale: boolean = card !== "" && editor !== "" && card !== editor;
     // traceLog("edit.value", {
@@ -4123,12 +4348,8 @@ export class MindmapView extends ItemView {
       parsed.checked === null
         ? parsed.text
         : `${parsed.checked ? "☑" : "☐"} ${parsed.text}`;
-    // 块那一行不是文字，预览时必须原样留住：只换文字会把 pill 一起抹掉，
-    // 用户编辑一个字就看到「代码块那行凭空消失、提交后又冒出来」。
-    const pills: string = Array.from(box.querySelectorAll(".obmind-block-pill"))
-      .map((el: Element) => el.outerHTML)
-      .join("");
-    const html: string = renderInline(shown) + pills;
+    // 块已经不在宿主卡片里了（它们各自是子节点），这里只换文字
+    const html: string = renderInline(shown);
 
     const prevHtml: string = box.innerHTML;
     const prevW: string = fo.getAttribute("width") ?? "";
@@ -4227,6 +4448,10 @@ export class MindmapView extends ItemView {
     this.rt.dispose();
     this.editorHandle?.close();
     this.editorHandle = null;
+    // 块渲染器（高亮 / MathJax / mermaid）挂在 Component 上，视图关掉必须卸干净
+    for (const part of this.blockParts.values()) part.unload();
+    this.blockParts.clear();
+    this.blockCache.clear();
     this.observer?.disconnect();
     this.observer = null;
     this.resizeObserver?.disconnect();

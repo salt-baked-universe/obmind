@@ -15,12 +15,12 @@ interface RawLine {
   headingLevel: number | null;
   src: SrcRef;
   /**
-   * 依附在这一行上的块（代码 / 公式 / 引用 / 表格），按出现顺序。
+   * 这一行**整体就是**一个块（代码 / 公式 / 引用 / 表格），`text` 只是回退标签。
    *
-   * 注意它**不是**一个独立的 RawLine：块不参与缩进栈，所以既不会算出深度、
-   * 也不会被当成某个节点的孩子 —— 这正是「块吞掉后面紧跟的节点」那个 bug 的根源。
+   * 块走缩进推导拿到自己的深度，但装配时**不写进缩进栈** —— 否则后面紧跟的
+   * 节点会被它收养（「块吞掉下一行」那个老 bug）。它是个叶子，不接孩子。
    */
-  blocks?: BlockInfo[];
+  block?: BlockInfo;
   /**
    * 所属 callout 区域编号（-1 / undefined = 不在 callout 里）。
    *
@@ -231,28 +231,65 @@ function buildVLines(allLines: string[], from: number): VLine[] {
   return out;
 }
 /**
- * 把一个块挂到「它前面最近的那个节点行」上。
+ * 「自由块」的标记行：`<!-- obmind:block -->`。
  *
- * 归属只看**位置顺序**，不看缩进 —— 这是整块方案的地基，理由见 types.ts 里
- * BlockInfo 的注释。文首的块前面没有任何节点，先攒进 rootBlocks，最后挂到根节点。
- *
- * 顺手把这个块的行区间记到节点的 src 上（blockStart/blockEnd）：
- * 移动、删除、算插入位置都要靠它知道「这个节点还占着哪几行」。
+ * 为什么用 HTML 注释而不是自造的围栏：
+ * - 它在任何 Markdown 实现里都不显示，也不占用任何语法 —— 不抢 callout、
+ *   不抢代码围栏、不抢其他插件的 `:::`；
+ * - 没装这个插件的人看到的就是一段普通笔记，不会多出怪字符。
  */
-function attachBlock(
+const BLOCK_MARK = /^[ \t]*<!--\s*obmind:block\s*-->[ \t]*$/;
+
+/**
+ * 把一个块收成**独立节点**（不是挂在宿主卡片里的一行）。
+ *
+ * 为什么块能当节点：块自己不能缩进（围栏缩到第 4 格就退化成缩进代码块），
+ * 所以它没法用缩进表达归属。`<!-- obmind:block -->` 这一行替它承受缩进 ——
+ * 层级、顺序、拖动全看注释行，块本体照旧顶格。没有注释行的裸块，
+ * 只能按围栏自己的缩进（0～3 格）落位，所以不许拖动。
+ *
+ * 节点行（line）= 代理行（有）或围栏行（无），endLine = 块末行：
+ * 删除、选中、算子树的结束行都按这个区间走。
+ */
+function pushBlock(
   raws: RawLine[],
-  rootBlocks: BlockInfo[],
   block: BlockInfo,
+  mark: VLine | null,
+  fenceLine: VLine,
+  allLines: string[],
 ): void {
-  const owner: RawLine | undefined = raws[raws.length - 1];
-  if (!owner) {
-    rootBlocks.push(block);
-    return;
-  }
-  if (!owner.blocks) owner.blocks = [];
-  owner.blocks.push(block);
-  owner.src.blockStart = owner.blocks[0].startLine;
-  owner.src.blockEnd = block.endLine;
+  const anchor: VLine = mark ?? fenceLine;
+  const first: string = anchor.text;
+  const indent: string = (/^[ \t]*/.exec(first) ?? [""])[0];
+  const src: SrcRef = {
+    line: anchor.orig,
+    bodyStart: indent.length,
+    bodyEnd: first.trimEnd().length,
+    full: allLines[anchor.orig] ?? first,
+    marker: "",
+    indent,
+    checked: null,
+    text: block.label ?? block.kind,
+    heading: false,
+    level: null,
+    // 真正的深度在下面的缩进推导里统一算，这里只是占位
+    depth: 0,
+    endLine: block.endLine,
+    // 整块的行区间：删除、选中、算子树的结束行都要用它
+    blockStart: anchor.orig,
+    blockEnd: block.endLine,
+    blockNode: mark ? "free" : "bound",
+    proxyLine: mark ? anchor.orig : undefined,
+  };
+  raws.push({
+    text: src.text,
+    headingLevel: null,
+    src,
+    block,
+    region: anchor.region,
+    calloutRoot: anchor.calloutRoot,
+    promoted: anchor.promoted,
+  });
 }
 
 /**
@@ -448,8 +485,14 @@ export function buildTree(
 
   // 2. 收集有效行（跳过空行与分隔线；代码块 / 公式块整块收成一个节点）
   const raws: RawLine[] = [];
-  /** 文首（第一个节点行之前）出现的块，最后挂到根节点上 —— 比如整篇只有一张架构图 */
-  const rootBlocks: BlockInfo[] = [];
+  /**
+   * 上一个 `<!-- obmind:block -->` 标记行：它是**下一个块的代理节点行**。
+   *
+   * 块自己不能缩进 —— 围栏缩到第 4 格就退化成「缩进代码块」，``` 变成字面量。
+   * 所以它没法用缩进表达归属。这一行注释替它承受缩进：层级、顺序、拖动全看它，
+   * 块本体照旧顶格。注释在任何 Markdown 工具里都不显示，也不占任何原生语法。
+   */
+  let pendingMark: VLine | null = null;
   // 软换行合并：记录上一个「可合并」的列表项，后续续行（同缩进、无标记）并入它。
   let lastListRaw: RawLine | null = null;
 
@@ -467,6 +510,14 @@ export function buildTree(
     const v: VLine = vlines[idx];
     const line: string = v.text;
     if (line.trim() === "") {
+      lastListRaw = null;
+      continue;
+    }
+
+    // 块的上方一行：`<!-- obmind:block -->`。它给下一个块当代理节点行，
+    // 自己不产生节点、也不显示 —— 用户看到的就是一个普通的块。
+    if (BLOCK_MARK.test(line)) {
+      pendingMark = v;
       lastListRaw = null;
       continue;
     }
@@ -495,15 +546,22 @@ export function buildTree(
           ? `代码块${fence.lang ? ` · ${fence.lang}` : ""}${bodyLines ? ` · ${bodyLines} 行` : ""}`
           : `公式${bodyLines ? ` · ${bodyLines} 行` : ""}`;
 
-      attachBlock(raws, rootBlocks, {
-        kind: fence.kind,
-        lang: fence.lang,
-        raw: dedentBlock(rawBlock, fence.indent),
-        startLine: v.orig,
-        endLine: vlines[end].orig,
-        lines: fence.single ? 1 : bodyLines,
-        label,
-      });
+      pushBlock(
+        raws,
+        {
+          kind: fence.kind,
+          lang: fence.lang,
+          raw: dedentBlock(rawBlock, fence.indent),
+          startLine: v.orig,
+          endLine: vlines[end].orig,
+          lines: fence.single ? 1 : bodyLines,
+          label,
+        },
+        pendingMark,
+        v,
+        allLines,
+      );
+      pendingMark = null;
 
       // 块是结构性内容：打断软换行续行（块与正文之间不再并入）
       lastListRaw = null;
@@ -533,16 +591,23 @@ export function buildTree(
       const rows: number = end - idx - 1;
       const label: string = `表格 · ${cols} 列${rows > 0 ? ` · ${rows} 行` : ""}`;
 
-      attachBlock(raws, rootBlocks, {
-        kind: "table",
-        lang: "",
-        // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
-        raw: dedentBlock(rawOf(idx, end), indent),
-        startLine: v.orig,
-        endLine: vlines[end].orig,
-        lines: rows + 1,
-        label,
-      });
+      pushBlock(
+        raws,
+        {
+          kind: "table",
+          lang: "",
+          // 缩进在列表项下面的表格，直接丢给解析器会被当成「缩进代码块」
+          raw: dedentBlock(rawOf(idx, end), indent),
+          startLine: v.orig,
+          endLine: vlines[end].orig,
+          lines: rows + 1,
+          label,
+        },
+        pendingMark,
+        v,
+        allLines,
+      );
+      pendingMark = null;
 
       // 块是结构性内容：打断软换行续行（块与正文之间不再并入）
       lastListRaw = null;
@@ -566,24 +631,35 @@ export function buildTree(
       const indentMatch: RegExpMatchArray | null = /^[ \t]*/.exec(line);
       const indent: string = indentMatch ? indentMatch[0] : "";
       const count: number = end - idx + 1;
-      attachBlock(raws, rootBlocks, {
-        kind: "quote",
-        lang: "",
-        raw: dedentBlock(rawOf(idx, end), indent),
-        startLine: v.orig,
-        endLine: vlines[end].orig,
-        lines: count,
-        label: quoteLabel(
-          indent,
-          vlines.slice(idx, end + 1).map((x: VLine) => x.text),
-          count,
-        ),
-      });
+      pushBlock(
+        raws,
+        {
+          kind: "quote",
+          lang: "",
+          raw: dedentBlock(rawOf(idx, end), indent),
+          startLine: v.orig,
+          endLine: vlines[end].orig,
+          lines: count,
+          label: quoteLabel(
+            indent,
+            vlines.slice(idx, end + 1).map((x: VLine) => x.text),
+            count,
+          ),
+        },
+        pendingMark,
+        v,
+        allLines,
+      );
+      pendingMark = null;
 
       lastListRaw = null;
       idx = end;
       continue;
     }
+
+    // 标记行后面不是块（用户写错了位置）：标记本身不显示，这里就把它的代理身份丢掉，
+    // 免得它去认领下面遥不可及的另一个块。
+    pendingMark = null;
 
     // 引用前缀（可能多层）去掉，只保留正文；同时记住剥掉了多少字符
     let body: string = line;
@@ -774,10 +850,10 @@ export function buildTree(
 
   // 5. 按深度装配成树
   const root: IPureNode = {
-    content: escapeText(rootName) + blockPillsHtml(rootBlocks),
+    content: escapeText(rootName),
     children: [],
     // step / unit 供双向编辑与拖动复用，与解析规则保持一致
-    payload: { step, indentUnit: unit, hasHeadings, blocks: rootBlocks },
+    payload: { step, indentUnit: unit, hasHeadings },
   };
   const stack: IPureNode[] = [root];
 
@@ -787,14 +863,21 @@ export function buildTree(
     let parent: IPureNode | undefined = stack[n.depth - 1];
     for (let d = n.depth - 2; !parent && d >= 0; d--) parent = stack[d];
     const r: RawLine = n.raw;
+
+    // 块是**独立节点**：位置由它的节点行（`<!-- obmind:block -->` 代理行，
+    // 或者围栏行自己）的缩进决定。刻意不写进缩进栈 —— 它是叶子，
+    // 写进去会把后面紧跟的节点收养走（就是「块吞掉下一行」那个老 bug）。
+    if (r.block) {
+      (parent ?? root).children.push(blockNode(r.block, r.src));
+      continue;
+    }
+
     const shown: string =
       r.src.checked === null ? r.src.text : (r.src.checked ? "☑ " : "☐ ") + r.src.text;
     const node: IPureNode = {
-      // 块作为这个节点的**内容**追加在后面（只占一行），不是子节点。
-      // 尺寸必须在 setData 之前定好 —— markmap 是按 content 里的 DOM 量宽高的。
-      content: render(shown) + blockPillsHtml(r.blocks),
+      content: render(shown),
       children: [],
-      payload: { src: r.src, blocks: r.blocks },
+      payload: { src: r.src },
     };
     (parent ?? root).children.push(node);
     stack[n.depth] = node;
@@ -805,28 +888,39 @@ export function buildTree(
 }
 
 /**
- * 块在卡片里占的那一行。
+ * 块节点：一个只读的叶子。
  *
- * 为什么只有一行：一块两百行的代码会把整张图的布局比例彻底打乱，
- * 而 markmap 是按内容尺寸算间距的，代价是全图变稀。块的内容在笔记里，
- * 悬浮提示给出前几行，要看全文就点进笔记。
+ * `content` 只是占位（渲染失败时它就留在卡片上，至少不让块凭空消失）；
+ * 真正的 HTML 由视图层交给 Obsidian 的 MarkdownRenderer 渲染后整个替换掉，
+ * 而且必须赶在 setData 之前完成 —— markmap 是按 content 里的 DOM 量宽高的。
+ *
+ * 源坐标直接用 `pushBlock` 算好的那一份：`line` 是节点行（代理行 / 围栏行），
+ * `endLine` 是块末行，所以删除和选中天然覆盖整个块。
  */
-function blockPillsHtml(blocks: BlockInfo[] | undefined): string {
-  if (!blocks || blocks.length === 0) return "";
-  return blocks
-    .map((b: BlockInfo) => {
-      const label: string = b.label ?? b.kind;
-      const hint: string = b.raw.trim().split("\n").slice(0, 6).join("\n");
-      return `<span class="obmind-block-pill" data-kind="${b.kind}" title="${escapeAttr(
-        hint,
-      )}">${escapeText(label)}</span>`;
-    })
-    .join("");
+function blockNode(b: BlockInfo, src: SrcRef): IPureNode {
+  const label: string = b.label ?? b.kind;
+  return {
+    content: `<span class="obmind-block-pill" data-kind="${b.kind}">${escapeText(label)}</span>`,
+    children: [],
+    payload: { block: b, src },
+  };
 }
 
-/** 属性值转义：换行在 title 里能显示，但要避免引号把属性截断 */
-function escapeAttr(text: string): string {
-  return escapeText(text)
-    .replace(/"/g, "&quot;")
-    .replace(/\n/g, "&#10;");
+/**
+ * 找出树里所有块节点。
+ *
+ * 视图层靠它把这批节点统一交给 MarkdownRenderer 渲染 —— 列表在树里，
+ * 渲染在表现层，各管各的。判定用 `payload.block`：块节点的 content 是渲染结果，
+ * 从内容上认不出来。
+ */
+export function collectBlockNodes(root: IPureNode): Array<{ node: IPureNode; block: BlockInfo }> {
+  const out: Array<{ node: IPureNode; block: BlockInfo }> = [];
+  const walk = (n: IPureNode): void => {
+    const block = n.payload?.block as BlockInfo | undefined;
+    if (block && typeof block.raw === "string") out.push({ node: n, block });
+    for (const c of n.children ?? []) walk(c);
+  };
+  walk(root);
+  return out;
 }
+

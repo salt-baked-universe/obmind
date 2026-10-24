@@ -99,9 +99,27 @@ export interface PlanInput {
 
 function srcOf(node: IPureNode | undefined): SrcRef | null {
   if (!node) return null;
-  const payload = node.payload as { src?: SrcRef } | undefined;
+  const payload = node.payload as { src?: SrcRef; block?: unknown } | undefined;
+  // 块节点**有** src（选中、删除、算子树的结束行都要用），但它绝不能走原地改字：
+  // 它的 content 是 MarkdownRenderer 渲染出来的 HTML，直接换 innerHTML 不会重跑
+  // 渲染器 —— mermaid、公式、代码高亮全丢。所以从「结构比较」的角度它等于没有源坐标。
+  if (payload?.block) return null;
   const src = payload?.src;
   return src && typeof src.line === "number" ? src : null;
+}
+
+/** 块节点的判据与内容指纹（`kind|lang|raw`） */
+function blockOf(node: IPureNode | undefined): string | null {
+  const block = (node?.payload as { block?: { kind?: string; lang?: string; raw?: string } })
+    ?.block;
+  if (!block || typeof block.raw !== "string") return null;
+  return `${block.kind ?? ""}|${block.lang ?? ""}|${block.raw}`;
+}
+
+/** 只为了在日志里报个行号：块节点也算 */
+function lineOf(node: IPureNode | undefined): number | undefined {
+  const src = (node?.payload as { src?: SrcRef } | undefined)?.src;
+  return typeof src?.line === "number" ? src.line : undefined;
 }
 
 /**
@@ -131,9 +149,22 @@ export function planProjection(input: PlanInput): Projection {
   const walk = (a: IPureNode, b: IPureNode): void => {
     if (why !== null) return;
 
-    if (a.content !== b.content) {
+    // 块的「内容」是 raw，不是渲染后的 HTML：上一棵树里存的是 MarkdownRenderer
+    // 的产出，刚解析出来的新树里还只是占位标签 —— 直接比 content 会永远不等，
+    // 结果是「随便打个字」都触发全量重建。
+    const ab: string | null = blockOf(a);
+    const bb: string | null = blockOf(b);
+    if (ab !== null || bb !== null) {
+      if (ab === null || bb === null || ab !== bb) {
+        // 同一位置从块变成普通节点（或块内容改了）：只能重建 —— 块的 HTML
+        // 必须由渲染器重新产出，patch 通道塞不回一个 mermaid 图。
+        why = "noSrc";
+        at = lineOf(b) ?? lineOf(a);
+        return;
+      }
+    } else if (a.content !== b.content) {
       const src = srcOf(b);
-      // 根节点（文件名）与块节点（代码 / 公式）不参与原地改字
+      // 根节点（文件名）不参与原地改字
       if (!src || src.depth === 0) {
         why = "noSrc";
         at = src?.line ?? srcOf(a)?.line;
@@ -224,11 +255,18 @@ export function relabelTree(dst: IPureNode, src: IPureNode): Map<number, number>
       ok = false;
       return;
     }
-    const ap = a.payload as { src?: SrcRef } | undefined;
-    const bp = b.payload as { src?: SrcRef } | undefined;
+    const ap = a.payload as { src?: SrcRef; block?: { startLine: number; endLine: number } }
+      | undefined;
+    const bp = b.payload as { src?: SrcRef; block?: { startLine: number; endLine: number } }
+      | undefined;
     if (ap && bp?.src) {
       if (ap.src && ap.src.line !== bp.src.line) moved.set(ap.src.line, bp.src.line);
       ap.src = bp.src;
+      // payload.block 里也存了行号（当初为了「块节点自带一份区间」）。只换 src
+      // 会让它停在旧行号上，下一个读它的人就会算错位置。
+      if (ap.block && bp.block) {
+        ap.block = { ...ap.block, startLine: bp.block.startLine, endLine: bp.block.endLine };
+      }
     }
     for (let i = 0; i < ac.length && ok; i++) walk(ac[i], bc[i]);
   };

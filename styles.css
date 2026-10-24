@@ -531,40 +531,6 @@
   text-decoration-thickness: 2px;
 }
 
-/* 代码块 / 公式块：由 Obsidian 的 MarkdownRenderer 渲染成真正的 HTML 再塞进卡片。
-   markmap 只给 pre 设了 margin:0，没有任何折行约束 —— 长行会把
-   .markmap-foreign > div > div（inline-block）撑到上限后直接溢出卡片。
-   强制折行后测量出的宽度才是可预期的。 */
-.obmind-canvas .markmap-foreign pre {
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--code-background, rgba(127, 127, 127, 0.12));
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  text-align: left;
-  font-family: var(--font-monospace, ui-monospace, monospace);
-  font-size: 12px;
-  line-height: 1.5;
-  /* 必须写死上限。
-     markmap 的 maxWidth 是设在 svg 上的 --markmap-max-width，只约束那层 div
-     的可用宽度，pre 的 max-content（不折行的整行宽）才是决定 inline-block
-     实际宽度的那一项 —— 一行 110 字符的代码能把节点撑到 700 以上。
-     320 是「卡片主题 380 上限 - 内边距」留出来的余量。 */
-  max-width: 320px;
-}
-
-.obmind-canvas .markmap-foreign pre > code {
-  display: block;
-  padding: 0;
-  background: none;
-  color: inherit;
-  font-family: inherit;
-  font-size: inherit;
-  line-height: inherit;
-  white-space: inherit;
-}
-
 /* 公式块：MathJax 的 CHTML 输出是普通 HTML，能在 foreignObject 里正常排版。
    字号收一档——公式按 em 计算，按正文 14px 渲染会比节点文字大一圈。 */
 .obmind-canvas .markmap-foreign .math,
@@ -623,14 +589,110 @@
   text-align: center;
 }
 
-/* 块（代码 / 引用 / 表格 / 公式）在卡片里只占一行。
-   为什么只有一行：一张两百行的代码卡会把整张图的布局比例拉垮 ——
-   markmap 是按内容尺寸算节点间距的，块越大全图越稀。
-   全文在笔记里，悬停给出前几行（title 属性）。
-   块不是节点：它挂在宿主节点上，选中、拖动的都是宿主本身。 */
-.obmind-canvas .obmind-block-pill {
+/* 块节点（代码 / 公式 / 表格 / 引用）。
+   它是**独立的子节点卡片**，内容交给 Obsidian 自己的 MarkdownRenderer 渲染，
+   并且套了 `.markdown-rendered` —— 代码底色、语法高亮、表格线、引用条、
+   callout、公式排版全部沿用阅读视图那一套，观感和笔记里一致。
+
+   这里只改三件阅读视图做不到的事：
+   1. 宽度：卡片在 SVG 里，阅读视图的版心宽度会把块压得很窄；
+   2. 折行：卡片没有横向滚动（滚轮被画布缩放抢走），长行必须折；
+   3. 复制按钮：阅读视图里它靠 hover 显示，卡片里得常驻。 */
+.obmind-canvas .obmind-block-md {
   display: block;
-  margin-top: 4px;
+  width: fit-content;
+  max-width: 620px;
+  font-size: 13.5px;
+  line-height: var(--line-height-normal, 1.5);
+  text-align: left;
+  cursor: default;
+}
+
+.obmind-canvas .obmind-block-md > :first-child {
+  margin-top: 0;
+}
+.obmind-canvas .obmind-block-md > :last-child {
+  margin-bottom: 0;
+}
+
+/* 块卡片放宽：代码一行 80 列是常态，380px 的普通卡片根本放不下。
+   markmap 的宽度上限写在 svg 的 --markmap-max-width 上、作用于 .markmap-foreign > div，
+   没法按节点区分 —— 只能用 :has() 单独把带块的那张放松（Chromium 114 支持）。
+   max-content 按内容撑开（短代码不留大片空白），max-width 封顶折行。
+   注意不能写 width:auto —— auto 会让内部 fit-content 塌成最窄宽度，
+   一整段代码被压成一根竖条（实测 foW 只有 26px）。 */
+.obmind-canvas .markmap-foreign > div:has(.obmind-block-md) {
+  width: max-content !important;
+  max-width: 640px;
+}
+
+/* 长行折行而不是裁掉：卡片在 SVG 里拿不到横向滚动。 */
+.obmind-canvas .obmind-block-md pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
+  max-width: 620px;
+  box-sizing: border-box;
+  margin: 0;
+}
+
+.obmind-canvas .obmind-block-md pre > code {
+  white-space: inherit;
+  overflow-wrap: inherit;
+  padding: 0;
+  background: none;
+}
+
+/* 复制按钮：阅读视图里是 hover 才淡入，卡片里常驻。
+   放在 pre 右上角，绝对定位不参与块宽度计算。 */
+.obmind-canvas .obmind-block-md .copy-code-button {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: 11px;
+  line-height: 1.6;
+  opacity: 0.72;
+  cursor: pointer;
+  z-index: 1;
+}
+
+.obmind-canvas .obmind-block-md .copy-code-button:hover {
+  opacity: 1;
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+/* 块里的表格 / 引用 / 列表默认已由 .markdown-rendered 接管，
+   这里只封一下宽度，免得宽表格把卡片顶出边框。 */
+.obmind-canvas .obmind-block-md table {
+  width: max-content;
+  max-width: 620px;
+}
+
+/* mermaid / 内嵌图 / 内嵌笔记：跟着卡片宽度收缩，别把图撑出边框 */
+.obmind-canvas .obmind-block-md svg,
+.obmind-canvas .obmind-block-md img,
+.obmind-canvas .obmind-block-md .internal-embed {
+  max-width: 100%;
+  height: auto;
+}
+
+/* 块菜单 / 编辑按钮不是卡片里的东西，留着只会误点 */
+.obmind-canvas .obmind-block-md .edit-block-button {
+  display: none;
+}
+
+/* 回退：渲染失败或空块时，解析层留下的那一行标签。
+   宁可排得难看，也不能让块凭空消失。 */
+.obmind-canvas .obmind-block-pill {
+  display: inline-block;
   padding: 1px 7px 2px;
   border-radius: 5px;
   border-left: 2px solid var(--interactive-accent, #4a7dff);
@@ -641,8 +703,8 @@
   line-height: 1.55;
   letter-spacing: 0.2px;
   white-space: nowrap;
-  cursor: default;
 }
+
 .obmind-canvas .obmind-block-pill[data-kind="quote"] {
   border-left-color: var(--color-purple, #a05fbf);
 }

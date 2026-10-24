@@ -63,6 +63,8 @@ export type CreateResult =
  * 而块归「前一个节点」，于是那块内容就改挂到新节点上了。
  */
 export function subtreeEndOf(src: SrcRef, nodes: readonly SrcRef[]): number {
+  // 块是叶子：它的「子树」就是它自己那几行，下面缩进更深的正文属于别人
+  if (src.blockNode) return Math.max(src.line, src.blockEnd ?? src.line);
   let end: number = Math.max(src.line, src.blockEnd ?? src.line);
   for (const n of nodes) {
     if (n.line <= src.line) continue;
