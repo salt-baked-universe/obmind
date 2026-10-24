@@ -8301,6 +8301,50 @@ function planCreate(input) {
   };
 }
 
+// src/edit/paste.ts
+var PASTE_MAX_NODES = 200;
+function cleanLine(line) {
+  let s = line.trim();
+  s = s.replace(/^>\s?/, "");
+  s = s.replace(/^(?:[-*+•]|\d{1,9}[.)])\s+/, "");
+  s = s.replace(/^#{1,6}\s+/, "");
+  return s.trim();
+}
+function planPaste(input) {
+  var _a;
+  const { src, nodes, step, unit } = input;
+  const mode = (_a = input.mode) != null ? _a : "child";
+  if (src.blockNode)
+    return { ok: false, reason: "\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5F80\u91CC\u7C98\u8282\u70B9" };
+  const cleaned = input.text.split(/\r\n|\r|\n/).map(cleanLine);
+  const texts = cleaned.filter((t) => t !== "");
+  const skipped = cleaned.length - texts.length;
+  if (texts.length === 0) {
+    return { ok: false, reason: "\u526A\u8D34\u677F\u91CC\u6CA1\u6709\u53EF\u4EE5\u5F53\u8282\u70B9\u5185\u5BB9\u7684\u6587\u5B57" };
+  }
+  const dropped2 = Math.max(0, texts.length - PASTE_MAX_NODES);
+  const use = texts.slice(0, PASTE_MAX_NODES);
+  const first = planCreate({ src, nodes, step, unit, mode, placeholder: use[0] });
+  if (!first.ok)
+    return { ok: false, reason: first.reason };
+  const head = first.plan.line;
+  const prefix = head.slice(0, head.length - use[0].length);
+  const lines2 = [head];
+  for (const text of use.slice(1))
+    lines2.push(prefix + text);
+  return {
+    ok: true,
+    plan: {
+      insertAfterLine: first.plan.insertAfterLine,
+      lines: lines2,
+      // 第一行落在 insertAfterLine + 1（planCreate 就是这么算的）
+      focusLine: first.plan.focusLine,
+      skipped,
+      dropped: dropped2
+    }
+  };
+}
+
 // src/app/EditService.ts
 var none2 = (reason) => ({ kind: "none", reason });
 var error = (reason) => ({ kind: "error", reason });
@@ -8425,6 +8469,50 @@ var EditService = class {
       checkText: (_a = lines2[at]) != null ? _a : ""
     };
     return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
+  }
+  /**
+   * 粘贴：把剪贴板文本变成一组子节点。
+   *
+   * 和 create 共用同一条写路径（一次 span 插入多行），区别只在「文本从哪来」。
+   * 剪贴板的读取是 IO，留在视图层；这里拿到的是已经读好的字符串 ——
+   * 于是「多行文本该切成几个节点、缩进怎么加」全是纯函数，用例能直接断言。
+   */
+  paste(input) {
+    var _a;
+    const src = this.nodeAt(input.snap, input.line);
+    if (!src)
+      return error("\u627E\u4E0D\u5230\u8981\u7C98\u8D34\u5230\u7684\u8282\u70B9");
+    if (src.blockNode)
+      return error("\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5F80\u91CC\u7C98\u8282\u70B9");
+    const plan = planPaste({
+      text: input.text,
+      src,
+      nodes: input.snap.nodes,
+      step: input.snap.step,
+      unit: input.snap.unit
+    });
+    if (!plan.ok)
+      return error(plan.reason);
+    const at = plan.plan.insertAfterLine;
+    const lines2 = input.snap.content.split("\n");
+    const span = {
+      // start === end：插在 at 这一行之后
+      start: at + 1,
+      end: at + 1,
+      lines: plan.plan.lines,
+      checkLine: at,
+      checkText: (_a = lines2[at]) != null ? _a : ""
+    };
+    let notice;
+    if (plan.plan.dropped > 0) {
+      notice = `\u526A\u8D34\u677F\u592A\u957F\uFF0C\u53EA\u7C98\u4E86\u524D ${plan.plan.lines.length} \u884C\uFF08\u4E22\u6389 ${plan.plan.dropped} \u884C\uFF09`;
+    }
+    return {
+      kind: "write",
+      op: { kind: "span", span },
+      focusLine: plan.plan.focusLine,
+      notice
+    };
   }
   /**
    * 拖动改层级。
@@ -9239,6 +9327,96 @@ var ViewRuntime = class {
   }
 };
 
+// src/app/actions.ts
+var pick = (s) => s.primary >= 0;
+var writable = (s) => s.primary >= 0 && !s.onBlock;
+var ACTIONS = [
+  // 撤销 / 重做：只在画布持有焦点时接管，否则会和编辑器里的撤销打架
+  { id: "undo", keys: ["mod+z"], scopes: ["canvas"] },
+  { id: "redo", keys: ["mod+shift+z", "mod+y"], scopes: ["canvas"] },
+  // 结构操作
+  { id: "newChild", keys: ["tab"], scopes: ["canvas"], when: writable },
+  { id: "newSibling", keys: ["enter"], scopes: ["canvas"], when: writable },
+  { id: "outdent", keys: ["shift+tab"], scopes: ["canvas"], when: pick },
+  { id: "remove", keys: ["delete", "backspace"], scopes: ["canvas"], when: pick },
+  // 改字：F2 在画布上，空格是视图级兜底（焦点跑到 body 时也要能改）
+  { id: "edit", keys: ["f2", "space"], scopes: ["canvas", "view"], when: writable },
+  // 方向键只换选中，不产生写入，多选时也能用
+  { id: "navUp", keys: ["up"], scopes: ["canvas"] },
+  { id: "navDown", keys: ["down"], scopes: ["canvas"] },
+  { id: "navLeft", keys: ["left"], scopes: ["canvas"] },
+  { id: "navRight", keys: ["right"], scopes: ["canvas"] },
+  // Esc 两层都要：焦点常在别处
+  { id: "escape", keys: ["esc"], scopes: ["canvas", "view"] },
+  // Ctrl+N 只在视图层：画布层的 Ctrl+N 留给 Obsidian 自己（新建笔记）
+  { id: "newNote", keys: ["mod+n"], scopes: ["view"], when: pick },
+  /**
+   * 粘贴 = 新建子节点 + 用剪贴板文本填充。
+   *
+   * 和 `newSibling` 的区别不只是键位：它**不自动进编辑框**，因为内容已经是
+   * 用户想要的文字（XMind 里粘贴完就是成品主题，再弹一个全选的输入框只会挡路）。
+   */
+  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable }
+];
+function keyOf(e) {
+  const parts = [];
+  if (e.ctrlKey || e.metaKey)
+    parts.push("mod");
+  if (e.altKey)
+    parts.push("alt");
+  if (e.shiftKey)
+    parts.push("shift");
+  let key = e.key;
+  if (key === " " || e.code === "Space")
+    key = "space";
+  else if (key === "Escape")
+    key = "esc";
+  else if (key === "ArrowUp")
+    key = "up";
+  else if (key === "ArrowDown")
+    key = "down";
+  else if (key === "ArrowLeft")
+    key = "left";
+  else if (key === "ArrowRight")
+    key = "right";
+  else
+    key = key.toLowerCase();
+  parts.push(key);
+  return parts.join("+");
+}
+function matchAction(e, scope, state) {
+  if (state.phase !== "idle")
+    return null;
+  const key = keyOf(e);
+  for (const a of ACTIONS) {
+    if (!a.scopes.includes(scope))
+      continue;
+    if (!a.keys.includes(key))
+      continue;
+    if (a.when && !a.when(state))
+      continue;
+    return a.id;
+  }
+  return null;
+}
+
+// src/io/clipboard.ts
+var systemClipboard = {
+  async readText() {
+    try {
+      return await navigator.clipboard.readText();
+    } catch (e) {
+      return "";
+    }
+  },
+  async writeText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+    }
+  }
+};
+
 // src/app/plan.ts
 function srcOf(node) {
   if (!node)
@@ -9558,6 +9736,7 @@ var HELP_ROWS = [
   ["\u53CC\u51FB / F2 / \u7A7A\u683C", "\u539F\u5730\u7F16\u8F91\uFF08\u7A7A\u683C\u4E0D\u9700\u8981\u5148\u7528\u9F20\u6807\u70B9\u8FDB\u753B\u5E03\uFF09"],
   ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
   ["Ctrl/\u2318+N", "\u6309\u8282\u70B9\u6587\u5B57\u65B0\u5EFA\u4E00\u7BC7\u7B14\u8BB0\uFF0C\u8282\u70B9\u53D8\u6210\u6307\u5411\u5B83\u7684\u53CC\u94FE\uFF08\u53EF\u5957\u6A21\u677F\uFF09"],
+  ["Ctrl/\u2318+V", "\u628A\u526A\u8D34\u677F\u5185\u5BB9\u7C98\u6210\u9009\u4E2D\u8282\u70B9\u7684\u5B50\u8282\u70B9\uFF08\u591A\u884C = \u591A\u4E2A\u540C\u7EA7\u5B50\u8282\u70B9\uFF0C\u7C98\u5B8C\u4E0D\u8FDB\u7F16\u8F91\u6846\uFF09"],
   ["\u63D2\u5165\u5757", "\u5728\u9009\u4E2D\u8282\u70B9\u4E0B\u9762\u52A0\u4EE3\u7801\u5757 / \u5F15\u7528 / \u8868\u683C\uFF0C\u6309 Obsidian \u539F\u751F\u65B9\u5F0F\u6E32\u67D3\uFF0C\u6210\u4E3A\u72EC\u7ACB\u8282\u70B9"],
   ["\u63D2\u5165\u4EE3\u7801\u5757", "\u83DC\u5355\u91CC\u76F4\u63A5\u7ED9\u300C\u4EE3\u7801\u5757 \xB7 \u4E0A\u6B21\u7528\u7684\u8BED\u8A00\u300D\uFF0C\u6362\u8BED\u8A00\u8D70\u300C\u4EE3\u7801\u5757\uFF08\u6362\u8BED\u8A00\uFF09\u2026\u300D\uFF08\u53EF\u81EA\u5DF1\u6572\uFF09"],
   ["\u5757\u7684\u4F4D\u7F6E", "\u5757\u662F\u4E00\u5F20\u72EC\u7ACB\u5361\u7247\uFF08\u53EA\u8BFB\uFF09\uFF1A\u53CC\u51FB\u4E0D\u8FDB\u7F16\u8F91\uFF0C\u9009\u4E2D\u540E\u53EF\u4EE5\u5220\u9664\u3001\u53EF\u4EE5\u62D6\u5230\u522B\u5904"],
@@ -9748,6 +9927,14 @@ var MindmapView = class extends import_obsidian4.ItemView {
     this.indentUnit = "  ";
     // 新建同级节点后，等重建完成再把编辑框落到新行上
     this.pendingEditLine = -1;
+    /**
+     * 剪贴板端口（IO）。
+     *
+     * 单独一行字段而不是到处调 `navigator.clipboard`：读剪贴板可能被宿主拒绝、
+     * 而且是异步的，把它挡在一个接口后面，动作层就只剩「拿到字符串之后怎么办」。
+     * 探针 / 用例可以把这里换成内存实现，不必真去申请权限。
+     */
+    this.clipboard = systemClipboard;
     /**
      * 下一次投影是否保留当前缩放/位置（不重新适配）。
      *
@@ -10841,13 +11028,13 @@ var MindmapView = class extends import_obsidian4.ItemView {
    * 否则深色主题导出来的 SVG 是「浅色文字 + 透明底」，丢进白底阅读器就没了。
    */
   exportBackground() {
-    const pick = (el) => {
+    const pick2 = (el) => {
       if (!el)
         return "";
       const c = getComputedStyle(el).backgroundColor;
       return isOpaqueColor(c) ? c : "";
     };
-    return pick(this.canvasEl) || pick(this.containerEl.querySelector(".view-content")) || pick(document.body) || "#ffffff";
+    return pick2(this.canvasEl) || pick2(this.containerEl.querySelector(".view-content")) || pick2(document.body) || "#ffffff";
   }
   /**
    * 全部折叠 / 全部展开。
@@ -12370,104 +12557,133 @@ var MindmapView = class extends import_obsidian4.ItemView {
   /**
    * 画布上的键盘操作。
    *
-   * 两道闸门：
-   * - 事件目标必须是画布本身。编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
-   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」。
+   * 现在只剩三道闸门，具体键位全部在 `app/actions.ts` 的 ACTIONS 表里：
+   * - 事件目标必须是画布本身：编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
+   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」；
+   * - 相位必须是 idle —— 由 matchAction 统一挡（编辑中 / 拖动中 / 重建中都不接）。
+   *
+   * 把「哪个键做什么」搬出去的理由：同一张表还要服务视图层兜底（焦点跑到 body 时）、
+   * 以后的工具栏按钮和命令面板；写在 if 链里就只能服务一个入口，而且两条链的
+   * 判据迟早会不一致（画布那条以前就没看相位，重建中按 Tab 会用旧快照建节点）。
    */
   onCanvasKeyDown(e) {
     if (e.target !== this.canvasEl)
       return;
     if (e.isComposing)
       return;
-    if (e.ctrlKey || e.metaKey) {
-      const key = e.key.toLowerCase();
-      if (key === "z" || key === "y") {
-        e.preventDefault();
-        e.stopPropagation();
-        void this.stepHistory(key === "y" || e.shiftKey ? "redo" : "undo");
-        return;
-      }
-    }
-    if (e.key === "Tab") {
+    const id2 = matchAction(e, "canvas", this.actionState());
+    if (!id2)
+      return;
+    if (id2 !== "escape") {
       e.preventDefault();
       e.stopPropagation();
-      if (e.shiftKey)
-        this.outdentSelected();
-      else
+    }
+    this.runAction(id2);
+  }
+  /**
+   * 动作状态快照。
+   *
+   * 每次按键现算，不缓存：相位和选中集合都是「这一刻」的事，缓存旧值比不判更糟。
+   * `onBlock` 必须现查节点 —— 块是只读叶子，所有写入类动作都靠它让路。
+   */
+  actionState() {
+    const line = this.primaryLine;
+    const at = line >= 0 ? this.nodeAt(line) : null;
+    return {
+      phase: this.rt.phase,
+      primary: line,
+      selectionSize: this.selectedLines.size,
+      onBlock: (at == null ? void 0 : at.blockNode) !== void 0,
+      hasFile: this.targetFile !== null
+    };
+  }
+  /**
+   * 动作 id → 真正干活。
+   *
+   * 这是「加一个新操作的第二处」：ACTIONS 里加一行键位，这里加一个 case。
+   * 相位 / 块 / 有没有选中这些前置条件不在每个 case 里重判 —— 已经由
+   * `matchAction` 的 `when` 挡过一遍，这里只回答「能做之后怎么做」。
+   */
+  runAction(id2) {
+    switch (id2) {
+      case "undo":
+        void this.stepHistory("undo");
+        return;
+      case "redo":
+        void this.stepHistory("redo");
+        return;
+      case "newChild":
         this.createNode("child");
-      return;
-    }
-    if (e.key === "Enter") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.createNode("sibling");
-      return;
-    }
-    if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.moveSelection(e.key);
-      return;
-    }
-    if (e.key === "Escape") {
-      if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
-        this.helpPanel.addClass("is-hidden");
+        return;
+      case "newSibling":
+        this.createNode("sibling");
+        return;
+      case "outdent":
+        this.outdentSelected();
+        return;
+      case "remove":
+        this.removeNode();
+        return;
+      case "edit": {
+        const line = this.primaryLine;
+        if (line < 0)
+          return;
+        const g = this.findNodeByLine(line);
+        if (g)
+          this.startEdit(g);
         return;
       }
-      this.applySelection([], -1, false);
-      return;
-    }
-    if (e.key === "Delete" || e.key === "Backspace") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.removeNode();
-      return;
-    }
-    if (e.key === "F2") {
-      e.preventDefault();
-      const line = this.selectedLine;
-      if (line < 0)
+      case "escape": {
+        if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+          this.helpPanel.addClass("is-hidden");
+          return;
+        }
+        this.applySelection([], -1, false);
         return;
-      const g = this.findNodeByLine(line);
-      if (g)
-        this.startEdit(g);
+      }
+      case "navUp":
+        this.moveSelection("ArrowUp");
+        return;
+      case "navDown":
+        this.moveSelection("ArrowDown");
+        return;
+      case "navLeft":
+        this.moveSelection("ArrowLeft");
+        return;
+      case "navRight":
+        this.moveSelection("ArrowRight");
+        return;
+      case "newNote":
+        void this.createNoteForSelected();
+        return;
+      case "paste":
+        void this.pasteIntoSelected();
+        return;
     }
   }
   /**
-   * 视图内的单键 / 组合键：空格进编辑、Ctrl+N 建笔记。
+   * 视图内的兜底按键（焦点不在画布上时）。
    *
-   * 为什么挂在视图根节点上而不是画布上：画布的 keydown 要求 `target === canvas`，
-   * 而焦点很容易不在那儿 —— 点过工具栏图标、点过面包屑、一轮重建之后焦点落到
-   * body，这些时候按空格本意都是「改这个节点的字」，收不到就是「按了没反应」。
+   * 为什么还要第二层：画布的 keydown 要求 `target === canvas`，而焦点很容易不在那儿 ——
+   * 点过工具栏图标、点过面包屑、一轮重建之后焦点落到 body，这些时候按空格本意都是
+   * 「改这个节点的字」，收不到就是「按了没反应」。
    *
-   * 三种情况必须让路，否则空格会变成破坏性按键：
-   * - 编辑框 / 任何输入控件里的空格是打字；
-   * - 按钮（含 .clickable-icon）上的空格是「按下这个按钮」的无障碍语义，
-   *   抢过来等于「焦点在删除按钮上按空格，反而开始编辑」；
-   * - 组字中（中文输入法）的按键不是指令。
+   * 这一层必须先让路给输入控件：编辑框 / 按钮里的空格是打字或「按下按钮」的
+   * 无障碍语义，抢过来就是 bug。键位仍然查同一张表（scope = "view"）。
    */
   onViewKeyDown(e) {
     if (e.defaultPrevented || e.isComposing)
       return;
     if (isTypingTarget(e.target))
       return;
-    if (this.rt.phase !== "idle")
+    const id2 = matchAction(e, "view", this.actionState());
+    if (!id2)
       return;
-    if (this.tryNewNoteHotkey(e))
-      return;
-    const mod = e.ctrlKey || e.metaKey;
-    if (e.code !== "Space" && e.key !== " ")
-      return;
-    if (mod || e.altKey || e.shiftKey)
-      return;
-    const line = this.primaryLine;
-    if (line < 0)
-      return;
-    const g = this.findNodeByLine(line);
-    if (!g)
+    if (id2 === "escape")
       return;
     e.preventDefault();
-    this.startEdit(g);
+    e.stopPropagation();
+    this.runAction(id2);
   }
   /**
    * Ctrl/⌘ + N：给选中节点建笔记。
@@ -12629,6 +12845,59 @@ var MindmapView = class extends import_obsidian4.ItemView {
       return;
     if (out.focusLine !== void 0) {
       this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+  /**
+   * Ctrl+V：把剪贴板内容粘成选中节点的子节点。
+   *
+   * 与新建的区别是**不自动进编辑框** —— 内容已经是用户想要的，再弹一个全选的
+   * 输入框只会让人多按一次 Esc。粘完把选中落在第一个新节点上，想接着加就在它
+   * 下面按 Tab。
+   */
+  async pasteIntoSelected() {
+    const line = this.primaryLine;
+    if (line < 0)
+      return;
+    await this.pasteAt(line);
+  }
+  /**
+   * 把剪贴板内容粘到 `line` 这个节点下面。
+   *
+   * 读剪贴板是这条链上唯一的 await IO，回来时世界可能已经变了，所以有两个复查点：
+   * 1. 读完先看相位与行号 —— 期间用户可能切了节点、进了编辑、或触发了一轮重建；
+   * 2. 写入仍走 runWrite，与所有其它写路径共用锚点校验（行号漂了就失败，不会写错）。
+   */
+  async pasteAt(line) {
+    const file = this.targetFile;
+    if (!file) {
+      new import_obsidian4.Notice("obmind\uFF1A\u6CA1\u6709\u6253\u5F00\u7684\u7B14\u8BB0");
+      return;
+    }
+    if (this.rt.phase !== "idle")
+      return;
+    const text = await this.clipboard.readText();
+    if (!text.trim()) {
+      new import_obsidian4.Notice("obmind\uFF1A\u526A\u8D34\u677F\u662F\u7A7A\u7684\uFF08\u6216\u6CA1\u6709\u8BFB\u53D6\u526A\u8D34\u677F\u7684\u6743\u9650\uFF09");
+      return;
+    }
+    if (this.rt.phase !== "idle" || this.primaryLine !== line)
+      return;
+    const snap = this.editSnapshot();
+    if (!snap)
+      return;
+    const out = this.editSvc.paste({ snap, line, text });
+    if (out.kind === "error") {
+      new import_obsidian4.Notice(`obmind\uFF1A${out.reason}`);
+      return;
+    }
+    if (out.kind === "none")
+      return;
+    if (out.notice)
+      new import_obsidian4.Notice(`obmind\uFF1A${out.notice}`);
+    if (out.focusLine !== void 0) {
+      this.pendingEditLine = -1;
       this.selectedLine = out.focusLine;
     }
     void this.applyPlan(file, out.op);

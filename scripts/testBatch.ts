@@ -11,6 +11,9 @@ import { insertBlockPlan } from "../src/edit/block";
 import { EditService } from "../src/app/EditService";
 import { planProjection, relabelTree } from "../src/app/plan";
 import { nodeBarPosition } from "../src/ui/nodeBarPosition";
+import { PASTE_MAX_NODES } from "../src/edit/paste";
+import { ACTIONS, keyOf, matchAction } from "../src/app/actions";
+import type { ActionState, KeyLike } from "../src/app/actions";
 import { formatStats, treeStats } from "../src/domain/stats";
 import {
   firstChildRef,
@@ -1092,6 +1095,134 @@ console.log("\n=== T27: 块的只读语义（plan / 编辑 / 统计都不能把�
 
   // 5. 统计不把块算成节点（用户数的是一张张文字卡）
   assert(treeStats(mk("父\n```js\nrun()\n```")).nodes === 2, "统计里不含块");
+}
+
+console.log("\n=== T28: 粘贴 = 把剪贴板文本变成一组子节点 ===");
+{
+  const content = "父\n  子";
+  const { nodes, step, unit } = parse(content);
+  const snap = { content, nodes, step, unit };
+  const svc = new EditService();
+  const linesOf = (op: WriteOp): string[] => (op.kind === "span" ? op.span.lines : []);
+
+  // 1. 单行 → 一个子节点，缩进比父深一层
+  const one = svc.paste({ snap, line: 0, text: "新内容" });
+  assert(one.kind === "write", "单行粘贴要产生写入");
+  if (one.kind === "write") {
+    assert(one.op.kind === "span" && one.op.span.start === one.op.span.end, "粘贴是纯插入，不替换任何行");
+    assert(linesOf(one.op).join("|") === "  新内容", `子节点缩进一层：${JSON.stringify(linesOf(one.op))}`);
+    // 父节点整棵子树到第 1 行（「子」），所以插在 1 之后、选中第 2 行
+    assert(one.focusLine === 2, "粘完选中第一个新节点");
+
+    // 闭环：把写入结果拼回去重新解析 —— 缩进算错会在这里露出来
+    if (one.op.kind === "span") {
+      const arr: string[] = content.split("\n");
+      arr.splice(one.op.span.start, one.op.span.end - one.op.span.start, ...one.op.span.lines);
+      const added = parse(arr.join("\n")).nodes.find((n) => n.line === 2)!;
+      assert(added.depth === 2 && added.text === "新内容", `解析回来是「父」的子节点：depth=${added.depth}`);
+    }
+  }
+
+  // 2. 多行 → 多个同级子节点；空行跳过；列表标记剥掉（目标位置会补自己的）
+  const many = svc.paste({ snap, line: 0, text: "- 甲\n- 乙\n\n- 丙" });
+  assert(many.kind === "write", "多行粘贴要产生写入");
+  if (many.kind === "write") {
+    assert(linesOf(many.op).join("|") === "  甲|  乙|  丙", `多行 = 多个同级：${JSON.stringify(linesOf(many.op))}`);
+  }
+
+  // 3. 有序标记 / 标题 / 引用前缀都要剥掉：它们属于「源文档的结构」
+  const dirty = svc.paste({ snap, line: 0, text: "## 标题\n1. 第一步\n> 引用来的话" });
+  assert(dirty.kind === "write", "带结构标记的文本也能粘");
+  if (dirty.kind === "write") {
+    assert(linesOf(dirty.op).join("|") === "  标题|  第一步|  引用来的话", `结构标记被剥掉：${JSON.stringify(linesOf(dirty.op))}`);
+  }
+
+  // 4. 粘到更深的节点下面，缩进跟着那一层走
+  const deep = svc.paste({ snap, line: 1, text: "孙" });
+  assert(deep.kind === "write", "可以粘到任意节点下面");
+  if (deep.kind === "write") {
+    assert(linesOf(deep.op)[0] === "    孙", `缩进按目标节点算：${JSON.stringify(linesOf(deep.op))}`);
+  }
+
+  // 5. callout 里粘贴：每一行都要带 `> `，否则会跳出容器
+  const co = "> [!note] 标题\n> 正文";
+  const coParsed = parse(co);
+  const coSvc = new EditService();
+  const coOut = coSvc.paste({ snap: { content: co, ...coParsed }, line: 0, text: "甲\n乙" });
+  assert(coOut.kind === "write", "callout 里能粘贴");
+  if (coOut.kind === "write") {
+    assert(linesOf(coOut.op).join("|") === "> 甲|> 乙", `callout 内保留引用前缀：${JSON.stringify(linesOf(coOut.op))}`);
+  }
+
+  // 6. 上限与空内容
+  const bulk = Array.from({ length: PASTE_MAX_NODES + 5 }, (_v, i) => `第 ${i + 1} 行`).join("\n");
+  const big = svc.paste({ snap, line: 0, text: bulk });
+  assert(big.kind === "write" && big.notice !== undefined, "超长粘贴会提示只粘了多少");
+  if (big.kind === "write") assert(linesOf(big.op).length === PASTE_MAX_NODES, `最多 ${PASTE_MAX_NODES} 行`);
+  assert(svc.paste({ snap, line: 0, text: "   \n\n  " }).kind === "error", "空剪贴板是 error");
+  assert(svc.paste({ snap, line: 0, text: "x" }).kind === "write", "正常文本不受影响");
+
+  // 7. 块是只读叶子
+  const blockContent = "父\n```js\nrun()\n```";
+  const bp = parse(blockContent);
+  const bk = bp.nodes.find((n) => n.blockNode !== undefined)!;
+  assert(
+    svc.paste({ snap: { content: blockContent, ...bp }, line: bk.line, text: "x" }).kind === "error",
+    "块里不能粘节点",
+  );
+}
+
+console.log("\n=== T29: 动作表（键位 / 相位 / 块 的判定都在纯函数里） ===");
+{
+  const base: ActionState = { phase: "idle", primary: 3, selectionSize: 1, onBlock: false, hasFile: true };
+  const k = (key: string, mods: Partial<KeyLike> = {}): KeyLike => ({
+    key,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    shiftKey: false,
+    ...mods,
+  });
+
+  assert(matchAction(k("v", { ctrlKey: true }), "canvas", base) === "paste", "Ctrl+V → 粘贴");
+  assert(matchAction(k("v", { metaKey: true }), "view", base) === "paste", "⌘+V 也认（归一化）");
+  assert(matchAction(k("v", { ctrlKey: true }), "canvas", { ...base, phase: "editing" }) === null, "编辑中不接管粘贴");
+  assert(
+    matchAction(k("v", { ctrlKey: true }), "canvas", { ...base, onBlock: true }) === null,
+    "块上不粘贴（只读叶子）",
+  );
+  assert(matchAction(k("v", { ctrlKey: true }), "canvas", { ...base, primary: -1 }) === null, "没选中不粘贴");
+  assert(matchAction(k("v", { ctrlKey: true }), "canvas", { ...base, phase: "dragging" }) === null, "拖动中不粘贴");
+
+  assert(matchAction(k("Tab"), "canvas", base) === "newChild", "Tab 建子级");
+  assert(matchAction(k("Tab", { shiftKey: true }), "canvas", base) === "outdent", "Shift+Tab 提升（不和 Tab 撞）");
+  assert(matchAction(k(" ", { code: "Space" }), "view", base) === "edit", "空格在视图层兜底");
+  assert(matchAction(k("F2"), "canvas", base) === "edit", "F2 在画布层");
+  assert(matchAction(k("Z", { ctrlKey: true, shiftKey: true }), "canvas", base) === "redo", "Ctrl+Shift+Z 重做");
+  assert(matchAction(k("y", { ctrlKey: true }), "canvas", base) === "redo", "Ctrl+Y 也能重做");
+  assert(matchAction(k("n", { ctrlKey: true }), "canvas", base) === null, "画布层不抢 Ctrl+N");
+  assert(matchAction(k("n", { ctrlKey: true }), "view", base) === "newNote", "视图层接 Ctrl+N");
+
+  // keyOf 的归一化边界
+  assert(keyOf(k(" ")) === "space", "空格归一化");
+  assert(keyOf(k("Escape")) === "esc", "Escape 归一化");
+  assert(keyOf(k("ArrowUp")) === "up", "方向键归一化");
+  assert(keyOf(k("v", { ctrlKey: true, metaKey: true })) === "mod+v", "Ctrl 与 ⌘ 都归成 mod");
+
+  // 同一层不能有两条动作抢同一个键（以后加操作时最容易被破坏的约束）
+  const dup: string[] = [];
+  for (const scope of ["canvas", "view"] as const) {
+    const seen = new Map<string, string>();
+    for (const a of ACTIONS) {
+      if (!a.scopes.includes(scope)) continue;
+      for (const key of a.keys) {
+        const prev: string | undefined = seen.get(key);
+        if (prev !== undefined) dup.push(`${scope}:${key}(${prev}/${a.id})`);
+        else seen.set(key, a.id);
+      }
+    }
+  }
+  assert(dup.length === 0, `同一层的键位不重复${dup.length ? "：" + dup.join(", ") : ""}`);
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

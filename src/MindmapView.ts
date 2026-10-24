@@ -71,6 +71,10 @@ import { NodeBar } from "./ui/nodeBar";
 import { isTypingTarget } from "./ui/keyGuard";
 import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
+import { matchAction } from "./app/actions";
+import type { ActionId, ActionState } from "./app/actions";
+import { systemClipboard } from "./io/clipboard";
+import type { ClipboardPort } from "./io/clipboard";
 import { planProjection, relabelTree } from "./app/plan";
 import {
   buildSvgText,
@@ -95,6 +99,7 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["双击 / F2 / 空格", "原地编辑（空格不需要先用鼠标点进画布）"],
   ["Tab / Enter", "新建子级 / 新建同级"],
   ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
+  ["Ctrl/⌘+V", "把剪贴板内容粘成选中节点的子节点（多行 = 多个同级子节点，粘完不进编辑框）"],
   ["插入块", "在选中节点下面加代码块 / 引用 / 表格，按 Obsidian 原生方式渲染，成为独立节点"],
   ["插入代码块", "菜单里直接给「代码块 · 上次用的语言」，换语言走「代码块（换语言）…」（可自己敲）"],
   ["块的位置", "块是一张独立卡片（只读）：双击不进编辑，选中后可以删除、可以拖到别处"],
@@ -434,6 +439,14 @@ export class MindmapView extends ItemView {
   private indentUnit = "  ";
   // 新建同级节点后，等重建完成再把编辑框落到新行上
   private pendingEditLine = -1;
+  /**
+   * 剪贴板端口（IO）。
+   *
+   * 单独一行字段而不是到处调 `navigator.clipboard`：读剪贴板可能被宿主拒绝、
+   * 而且是异步的，把它挡在一个接口后面，动作层就只剩「拿到字符串之后怎么办」。
+   * 探针 / 用例可以把这里换成内存实现，不必真去申请权限。
+   */
+  private readonly clipboard: ClipboardPort = systemClipboard;
   /**
    * 下一次投影是否保留当前缩放/位置（不重新适配）。
    *
@@ -3708,118 +3721,134 @@ export class MindmapView extends ItemView {
   /**
    * 画布上的键盘操作。
    *
-   * 两道闸门：
-   * - 事件目标必须是画布本身。编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
-   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」。
+   * 现在只剩三道闸门，具体键位全部在 `app/actions.ts` 的 ACTIONS 表里：
+   * - 事件目标必须是画布本身：编辑框也在画布内部，它的 Tab / Enter 不能被我截走；
+   * - 输入法组字期间（e.isComposing）一律放行，否则中文拼音的回车会被当成「新建」；
+   * - 相位必须是 idle —— 由 matchAction 统一挡（编辑中 / 拖动中 / 重建中都不接）。
+   *
+   * 把「哪个键做什么」搬出去的理由：同一张表还要服务视图层兜底（焦点跑到 body 时）、
+   * 以后的工具栏按钮和命令面板；写在 if 链里就只能服务一个入口，而且两条链的
+   * 判据迟早会不一致（画布那条以前就没看相位，重建中按 Tab 会用旧快照建节点）。
    */
   private onCanvasKeyDown(e: KeyboardEvent): void {
     if (e.target !== this.canvasEl) return;
     if (e.isComposing) return;
 
-    // 撤销 / 重做：与编辑器保持一致的手感（Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y）。
-    // 只在画布自身持有焦点时生效 —— 否则会和编辑器里的撤销打架。
-    if (e.ctrlKey || e.metaKey) {
-      const key: string = e.key.toLowerCase();
-      if (key === "z" || key === "y") {
-        e.preventDefault();
-        e.stopPropagation();
-        void this.stepHistory(key === "y" || e.shiftKey ? "redo" : "undo");
+    const id: ActionId | null = matchAction(e, "canvas", this.actionState());
+    if (!id) return;
+    // Esc 不拦默认：它在 Obsidian 里还有「退全屏 / 关面板」的意思，抢了就是 bug
+    if (id !== "escape") {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    this.runAction(id);
+  }
+
+  /**
+   * 动作状态快照。
+   *
+   * 每次按键现算，不缓存：相位和选中集合都是「这一刻」的事，缓存旧值比不判更糟。
+   * `onBlock` 必须现查节点 —— 块是只读叶子，所有写入类动作都靠它让路。
+   */
+  private actionState(): ActionState {
+    const line: number = this.primaryLine;
+    const at = line >= 0 ? this.nodeAt(line) : null;
+    return {
+      phase: this.rt.phase,
+      primary: line,
+      selectionSize: this.selectedLines.size,
+      onBlock: at?.blockNode !== undefined,
+      hasFile: this.targetFile !== null,
+    };
+  }
+
+  /**
+   * 动作 id → 真正干活。
+   *
+   * 这是「加一个新操作的第二处」：ACTIONS 里加一行键位，这里加一个 case。
+   * 相位 / 块 / 有没有选中这些前置条件不在每个 case 里重判 —— 已经由
+   * `matchAction` 的 `when` 挡过一遍，这里只回答「能做之后怎么做」。
+   */
+  private runAction(id: ActionId): void {
+    switch (id) {
+      case "undo":
+        void this.stepHistory("undo");
+        return;
+      case "redo":
+        void this.stepHistory("redo");
+        return;
+      case "newChild":
+        this.createNode("child");
+        return;
+      case "newSibling":
+        this.createNode("sibling");
+        return;
+      case "outdent":
+        this.outdentSelected();
+        return;
+      case "remove":
+        this.removeNode();
+        return;
+      case "edit": {
+        const line: number = this.primaryLine;
+        if (line < 0) return;
+        const g = this.findNodeByLine(line);
+        if (g) this.startEdit(g);
         return;
       }
-    }
-
-    if (e.key === "Tab") {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.shiftKey) this.outdentSelected();
-      else this.createNode("child");
-      return;
-    }
-
-    if (e.key === "Enter") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.createNode("sibling");
-      return;
-    }
-
-    // 方向键换选中：上/下 = 文档顺序前一个/后一个，左 = 父，右 = 长子。
-    // 用的是「看得见的节点」序列，折叠起来的子树不参与 —— 否则选中会跑到
-    // 一个没有 DOM 的行上，屏幕上就是「框突然没了」。
-    if (
-      e.key === "ArrowUp" ||
-      e.key === "ArrowDown" ||
-      e.key === "ArrowLeft" ||
-      e.key === "ArrowRight"
-    ) {
-      e.preventDefault();
-      e.stopPropagation();
-      this.moveSelection(e.key);
-      return;
-    }
-
-    if (e.key === "Escape") {
-      // 帮助面板开着时，Esc 先收面板（它盖住了画布，先关它更符合直觉）
-      if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
-        this.helpPanel.addClass("is-hidden");
+      case "escape": {
+        // 帮助面板盖在画布上，先收它更符合直觉
+        if (this.helpPanel && !this.helpPanel.hasClass("is-hidden")) {
+          this.helpPanel.addClass("is-hidden");
+          return;
+        }
+        this.applySelection([], -1, false);
         return;
       }
-      this.applySelection([], -1, false);
-      return;
-    }
-
-    // Delete / Backspace：删掉选中节点（含整棵子树）。
-    // 没有撤销栈兜底场景是「笔记没开在编辑器里」，所以在提示里写清怎么撤回。
-    if (e.key === "Delete" || e.key === "Backspace") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.removeNode();
-      return;
-    }
-
-    // F2：等价于双击，键盘流也能改字
-    if (e.key === "F2") {
-      e.preventDefault();
-      const line: number = this.selectedLine;
-      if (line < 0) return;
-      const g = this.findNodeByLine(line);
-      if (g) this.startEdit(g);
+      case "navUp":
+        this.moveSelection("ArrowUp");
+        return;
+      case "navDown":
+        this.moveSelection("ArrowDown");
+        return;
+      case "navLeft":
+        this.moveSelection("ArrowLeft");
+        return;
+      case "navRight":
+        this.moveSelection("ArrowRight");
+        return;
+      case "newNote":
+        void this.createNoteForSelected();
+        return;
+      case "paste":
+        void this.pasteIntoSelected();
+        return;
     }
   }
 
   /**
-   * 视图内的单键 / 组合键：空格进编辑、Ctrl+N 建笔记。
+   * 视图内的兜底按键（焦点不在画布上时）。
    *
-   * 为什么挂在视图根节点上而不是画布上：画布的 keydown 要求 `target === canvas`，
-   * 而焦点很容易不在那儿 —— 点过工具栏图标、点过面包屑、一轮重建之后焦点落到
-   * body，这些时候按空格本意都是「改这个节点的字」，收不到就是「按了没反应」。
+   * 为什么还要第二层：画布的 keydown 要求 `target === canvas`，而焦点很容易不在那儿 ——
+   * 点过工具栏图标、点过面包屑、一轮重建之后焦点落到 body，这些时候按空格本意都是
+   * 「改这个节点的字」，收不到就是「按了没反应」。
    *
-   * 三种情况必须让路，否则空格会变成破坏性按键：
-   * - 编辑框 / 任何输入控件里的空格是打字；
-   * - 按钮（含 .clickable-icon）上的空格是「按下这个按钮」的无障碍语义，
-   *   抢过来等于「焦点在删除按钮上按空格，反而开始编辑」；
-   * - 组字中（中文输入法）的按键不是指令。
+   * 这一层必须先让路给输入控件：编辑框 / 按钮里的空格是打字或「按下按钮」的
+   * 无障碍语义，抢过来就是 bug。键位仍然查同一张表（scope = "view"）。
    */
   private onViewKeyDown(e: KeyboardEvent): void {
     if (e.defaultPrevented || e.isComposing) return;
     if (isTypingTarget(e.target)) return;
-    // 编辑中 / 重建中（g 马上要换掉）都不接：这时候的行号随时会失效
-    if (this.rt.phase !== "idle") return;
 
-    if (this.tryNewNoteHotkey(e)) return;
+    const id: ActionId | null = matchAction(e, "view", this.actionState());
+    if (!id) return;
+    // Esc 的兜底在 onGlobalKeyDown：那里刻意不拦默认、也不阻断冒泡
+    if (id === "escape") return;
 
-    const mod: boolean = e.ctrlKey || e.metaKey;
-    if (e.code !== "Space" && e.key !== " ") return;
-    if (mod || e.altKey || e.shiftKey) return;
-
-    const line: number = this.primaryLine;
-    if (line < 0) return;
-    const g = this.findNodeByLine(line);
-    if (!g) return;
-
-    // 必须拦默认：否则空格会把侧栏/页面往下滚一格，编辑框跟着跳
     e.preventDefault();
-    this.startEdit(g);
+    // 空格必须拦默认：否则会把页面 / 侧栏往下滚一格，编辑框跟着跳
+    e.stopPropagation();
+    this.runAction(id);
   }
 
   /**
@@ -3985,6 +4014,61 @@ export class MindmapView extends ItemView {
 
     if (out.focusLine !== undefined) {
       this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+
+  /**
+   * Ctrl+V：把剪贴板内容粘成选中节点的子节点。
+   *
+   * 与新建的区别是**不自动进编辑框** —— 内容已经是用户想要的，再弹一个全选的
+   * 输入框只会让人多按一次 Esc。粘完把选中落在第一个新节点上，想接着加就在它
+   * 下面按 Tab。
+   */
+  private async pasteIntoSelected(): Promise<void> {
+    const line: number = this.primaryLine;
+    if (line < 0) return;
+    await this.pasteAt(line);
+  }
+
+  /**
+   * 把剪贴板内容粘到 `line` 这个节点下面。
+   *
+   * 读剪贴板是这条链上唯一的 await IO，回来时世界可能已经变了，所以有两个复查点：
+   * 1. 读完先看相位与行号 —— 期间用户可能切了节点、进了编辑、或触发了一轮重建；
+   * 2. 写入仍走 runWrite，与所有其它写路径共用锚点校验（行号漂了就失败，不会写错）。
+   */
+  private async pasteAt(line: number): Promise<void> {
+    const file = this.targetFile;
+    if (!file) {
+      new Notice("obmind：没有打开的笔记");
+      return;
+    }
+    if (this.rt.phase !== "idle") return;
+
+    const text: string = await this.clipboard.readText();
+    if (!text.trim()) {
+      new Notice("obmind：剪贴板是空的（或没有读取剪贴板的权限）");
+      return;
+    }
+    // 读的过程中可能已经切走：宁可什么都不做，也不要粘到「现在选中的那一行」上
+    if (this.rt.phase !== "idle" || this.primaryLine !== line) return;
+
+    const snap = this.editSnapshot();
+    if (!snap) return;
+
+    const out = this.editSvc.paste({ snap, line, text });
+    if (out.kind === "error") {
+      new Notice(`obmind：${out.reason}`);
+      return;
+    }
+    if (out.kind === "none") return;
+
+    if (out.notice) new Notice(`obmind：${out.notice}`);
+    if (out.focusLine !== undefined) {
+      // 粘贴后选中第一个新节点，但**不**打开编辑框
+      this.pendingEditLine = -1;
       this.selectedLine = out.focusLine;
     }
     void this.applyPlan(file, out.op);

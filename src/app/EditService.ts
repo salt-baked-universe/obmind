@@ -20,6 +20,7 @@
 
 import type { DropMode, EditorAction, SrcRef, Span, WriteOp } from "../types";
 import { planCreate, subtreeEndOf, type CreateMode } from "../edit/create";
+import { planPaste } from "../edit/paste";
 import { insertBlockPlan, type BlockKind } from "../edit/block";
 import { indentBy, parseEditorValue, rewriteNode } from "../edit/text";
 import { moveNode, moveNodes, blockRange } from "../edit/move";
@@ -39,7 +40,13 @@ export interface EditSnapshot {
 /** 用例的输出：写什么、写完之后把光标落到哪 */
 export type EditOutcome =
   /** 需要写入 */
-  | { kind: "write"; op: WriteOp; focusLine?: number }
+  | {
+      kind: "write";
+      op: WriteOp;
+      focusLine?: number;
+      /** 写完之后要单独告诉用户的一句话（例如「剪贴板太长，只粘了 200 行」） */
+      notice?: string;
+    }
   /** 无需写入，且不是错误（内容没变、空文本、主动取消） */
   | { kind: "none"; reason: string }
   /** 做不了，要提示用户（层级到顶、找不到节点、移动不合法） */
@@ -81,6 +88,14 @@ export interface CreateInput {
   /** 以哪一行节点为基准 */
   line: number;
   mode: CreateMode;
+}
+
+export interface PasteInput {
+  snap: EditSnapshot;
+  /** 粘到哪个节点下面（宿主行号） */
+  line: number;
+  /** 剪贴板纯文本。读取（IO）在视图层完成，这里只认字符串 */
+  text: string;
 }
 
 export interface MoveInput {
@@ -239,6 +254,50 @@ export class EditService {
       checkText: lines[at] ?? "",
     };
     return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
+  }
+
+  /**
+   * 粘贴：把剪贴板文本变成一组子节点。
+   *
+   * 和 create 共用同一条写路径（一次 span 插入多行），区别只在「文本从哪来」。
+   * 剪贴板的读取是 IO，留在视图层；这里拿到的是已经读好的字符串 ——
+   * 于是「多行文本该切成几个节点、缩进怎么加」全是纯函数，用例能直接断言。
+   */
+  paste(input: PasteInput): EditOutcome {
+    const src = this.nodeAt(input.snap, input.line);
+    if (!src) return error("找不到要粘贴到的节点");
+    if (src.blockNode) return error("块是只读叶子，不能往里粘节点");
+
+    const plan = planPaste({
+      text: input.text,
+      src,
+      nodes: input.snap.nodes,
+      step: input.snap.step,
+      unit: input.snap.unit,
+    });
+    if (!plan.ok) return error(plan.reason);
+
+    const at: number = plan.plan.insertAfterLine;
+    const lines: string[] = input.snap.content.split("\n");
+    const span: Span = {
+      // start === end：插在 at 这一行之后
+      start: at + 1,
+      end: at + 1,
+      lines: plan.plan.lines,
+      checkLine: at,
+      checkText: lines[at] ?? "",
+    };
+
+    let notice: string | undefined;
+    if (plan.plan.dropped > 0) {
+      notice = `剪贴板太长，只粘了前 ${plan.plan.lines.length} 行（丢掉 ${plan.plan.dropped} 行）`;
+    }
+    return {
+      kind: "write",
+      op: { kind: "span", span },
+      focusLine: plan.plan.focusLine,
+      notice,
+    };
   }
 
   /**

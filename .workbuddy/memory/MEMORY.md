@@ -81,6 +81,9 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 54. **钉住 = 锁「这张图」不锁导航**：点双链/面包屑/Alt+单击，笔记照开、导图不动。唯一分叉 `navigate(file)`：钉住→`openFileOnly`，否则→`openDoc`。map-only + 钉住点链接 = 什么都不发生。
 55. 「节点 → 新笔记」（`app/notePlan.ts` 纯函数）：名字清 `# ^ [ ]` 与 Windows 非法字符；文件夹复用 `getConfig("newFileLocation"/"newFileFolderPath")`；同名复用；**先建文件后改节点**；带行内样式用别名 `[[名|**原文**]]`；跳前清选中集。Ctrl+N 挂 **document 捕获阶段**且只在 `containerEl.contains(target)` 时接管。
 
+56. **键位只有一张表**（`app/actions.ts`）：`ACTIONS` = id + 归一化 keys(`mod/alt/shift`) + scopes(`canvas`/`view`) + `when(ActionState)`；`matchAction` 统一挡 `phase!=="idle"`（编辑/拖动/重建都不接），视图只剩 `runAction(id)` 的 switch。加操作 = 表里一行 + 一个 case。两条键盘链判据必须同源，否则「重建中在画布按 Tab」会拿旧快照建节点。
+57. **IO 走端口**：`io/clipboard.ts` 的 `ClipboardPort`（readText 失败返空串不抛）+ `memoryClipboard` 给用例。Ctrl+V → `edit/paste.ts` `planPaste`：一行一个同级子节点，**不按源缩进还原层级**（tabs/空格/伪缩进猜错会写出结构错的笔记）；剥一层 `>`/列表标记/`#`（属于源文档结构，`> x` 留着会变成块节点）；第一行交 `planCreate` 再切前缀复用（缩进规则只有一份）；上限 200 行；粘完**不进编辑框**，选中第一个新节点；读完剪贴板要复查 `phase` 与 `primaryLine` 是否还是当初那一行。
+
 ## 构建与验证
 
 - 链路：`npx tsc -noEmit -skipLibCheck` → `npm test`（esbuild + Node，`scripts/testBatch.ts`，T1–T27）→ `node esbuild.config.mjs production`（Windows 沙箱可能 EBUSY）→ `node tmp/smoke.cjs` → 部署到 `D:/BJRepository/2. 知识星球/.obsidian/plugins/obmind` 比 sha1。
