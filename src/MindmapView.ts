@@ -14,6 +14,8 @@ import {
 import type { Editor, EditorPosition, WorkspaceSplit } from "obsidian";
 import { Markmap } from "markmap-view";
 import type { INode, IPureNode } from "markmap-common";
+import type { ID3SVGElement } from "markmap-view";
+import type { ZoomBehavior } from "d3";
 import { collectBlockNodes, renderInline } from "./parser";
 import type { BlockInfo, DropMode, SrcRef, WriteOp } from "./types";
 import { resolveTheme, THEME_OPTIONS } from "./theme";
@@ -22,14 +24,9 @@ import { NodePainter } from "./render/painter";
 import { measureLayoutLag, translateOf } from "./render/geometry";
 import { BranchColors, branchKey, branchPathOf, hash32 } from "./render/colors";
 import { FrameScheduler } from "./render/frame";
-import {
-  traceBindSvg,
-  isTracing,
-  traceElapsed,
-  traceLog,
-  traceLogEvery,
-  traceSince,
-} from "./render/trace";
+import { traceBindSvg, isTracing, traceSince } from "./render/trace";
+import { hideElement, isHidden, setOpacity, setStyleProperty, showElement } from "./render/domStyle";
+import { setRenderedHtml } from "./render/html";
 import { waitStableSize } from "./render/viewport";
 import { WheelGesture, normalizeWheelPin } from "./render/wheel";
 import type { WheelIntent } from "./render/wheel";
@@ -689,8 +686,8 @@ export class MindmapView extends ItemView {
     const svg = canvas.createSvg("svg");
     // markmap 基础样式挂在 .markmap 上（文字色/字体变量），需手动补类
     svg.classList.add("markmap");
-    svg.style.width = "100%";
-    svg.style.height = "100%";
+    setStyleProperty(svg, "width", "100%");
+    setStyleProperty(svg, "height", "100%");
     this.svgEl = svg;
     // 探针要一个具体的 svg 才能逐帧采样（frames 档）
     traceBindSvg(svg);
@@ -869,8 +866,19 @@ export class MindmapView extends ItemView {
   private attachSettleHook(mm: Markmap): void {
     // 折叠圆点走的是 markmap 自己的 handleClick → this.toggleNode，
     // 命中实例属性，所以包这一层两条入口都能拦住。
-    const origToggle = mm.toggleNode.bind(mm);
-    const patchedToggle = async (node: never, recursive?: boolean): Promise<void> => {
+    //
+    // 这几个方法的类型在 markmap 的 d.ts 里是可选/重载形态，直接 `.bind()` 会退化成
+    // any（目录审查的 no-unsafe-* 会拦）。这里显式声明一次签名，后面全部走 `api.*`。
+    type ToggleNodeFn = (node: INode, recursive?: boolean) => Promise<void>;
+    type RenderDataFn = (target?: INode) => Promise<void>;
+    type TransitionFn = (sel: unknown) => unknown;
+    const api = mm as unknown as {
+      toggleNode: ToggleNodeFn;
+      renderData: RenderDataFn;
+      transition?: TransitionFn;
+    };
+    const origToggle: ToggleNodeFn = api.toggleNode.bind(mm) as ToggleNodeFn;
+    const patchedToggle = async (node: INode, recursive?: boolean): Promise<void> => {
       this.toggleIntent = true;
       // 用户出手了，收尾窗口立刻作废：否则待会儿那次防抖重排会把折叠动画中途掐断
       this.settleUntil = 0;
@@ -880,9 +888,9 @@ export class MindmapView extends ItemView {
         this.toggleIntent = false;
       }
     };
-    (mm as unknown as { toggleNode: typeof patchedToggle }).toggleNode = patchedToggle;
+    api.toggleNode = patchedToggle;
 
-    const origRender = mm.renderData.bind(mm);
+    const origRender: RenderDataFn = api.renderData.bind(mm) as RenderDataFn;
     const patchedRender = async (target?: INode): Promise<void> => {
       // **每一次** renderData 都要留痕。
       //
@@ -893,7 +901,7 @@ export class MindmapView extends ItemView {
       // 判据：看到一批 transform 写入，就在它之前找 `render.enter`；找不到 → 那次写入
       // 来自**更早创建的那条过渡**（去 `tr.create` 里按 dur 与 n 对号）。
       if (isTracing()) {
-        const t = target as (INode & { state?: { path?: string } }) | undefined;
+        const t = target;
         // traceLog("render.enter", {
         //   dur: mm.options.duration,
         //   phase: this.rt.phase,
@@ -949,7 +957,7 @@ export class MindmapView extends ItemView {
       // 但能把「重排后卡片尺寸变了」的那一个节点补正。
       this.frames.requestAll();
     };
-    (mm as unknown as { renderData: typeof patchedRender }).renderData = patchedRender;
+    api.renderData = patchedRender;
 
     // 再包一层 `transition(sel)`：markmap 里**所有**会写 transform / 半径 / 位置的地方
     // 都经过它（`renderData` 里 10 处，`fit`/`ensureVisible` 也走它）。
@@ -957,10 +965,9 @@ export class MindmapView extends ItemView {
     // 才能在日志里解释「这批 transform 是谁写的」——尤其是那些**创建得很早、
     // 落地得很晚**的过渡（它们的写入发生在 creation + duration 之后，
     // 现场会表现为「重建结束 260ms 后整树又动一下，却没有 render.enter」）。
-    const withTransition = mm as unknown as { transition?: (sel: unknown) => unknown };
-    const origTransition = withTransition.transition?.bind(mm);
-    if (typeof origTransition === "function") {
-      withTransition.transition = function tracedTransition(sel: unknown): unknown {
+    const origTransition: TransitionFn | undefined = api.transition?.bind(mm) as TransitionFn | undefined;
+    if (origTransition) {
+      api.transition = function tracedTransition(sel: unknown): unknown {
         if (isTracing()) {
           const sized = sel as { size?: () => number };
           // traceLog("tr.create", {
@@ -1093,7 +1100,7 @@ export class MindmapView extends ItemView {
           // duration 0 的重建本该瞬间到位，可过渡仍然异步到下一帧 —— 那一帧画出来
           // 就是「新建节点时整排兄弟卡片没字」。这里当场抹掉，赶在绘制之前。
           if (this.inFadeGuard() && target.style.opacity !== "") {
-            target.style.opacity = "";
+            setOpacity(target, "");
             guardStrips++;
             continue;
           }
@@ -1858,7 +1865,7 @@ export class MindmapView extends ItemView {
       const kids: IPureNode[] = node.children ?? [];
       if (kids.length === 0) return;
       const folded: boolean =
-        typeof node.payload?.fold === "number" && (node.payload.fold as number) > 0;
+        typeof node.payload?.fold === "number" && node.payload.fold > 0;
       if (folded !== fold) {
         node.payload = { ...node.payload, fold: fold ? 1 : 0 };
         changed = true;
@@ -2175,7 +2182,7 @@ export class MindmapView extends ItemView {
 
   /** 当前画布的缩放比例。d3-zoom 把 transform 存在 svg 节点的 __zoom 上 */
   private zoomScale(): number {
-    const el = this.svgEl as (SVGSVGElement & { __zoom?: { k?: number } }) | null;
+    const el: (SVGSVGElement & { __zoom?: { k?: number } }) | null = this.svgEl;
     const z = el?.__zoom;
     return z && typeof z.k === "number" ? z.k : Number.NaN;
   }
@@ -2195,11 +2202,11 @@ export class MindmapView extends ItemView {
   private applyZoomFilter(): void {
     const mm = this.mm;
     if (!mm) return;
-    mm.zoom.filter((event: any): boolean => {
+    mm.zoom.filter((event: Event): boolean => {
       if (event.type === "wheel") return false;
       if (event.type === "touchstart" || event.type === "touchmove") return true;
       // 仅右键（button 2）拖拽平移
-      return event.button === 2;
+      return (event as MouseEvent).button === 2;
     });
   }
 
@@ -2255,7 +2262,10 @@ export class MindmapView extends ItemView {
         const at: [number, number] = this.wheelAt ?? this.svgCenter();
         this.wheelZoom = 1;
         this.wheelAt = null;
-        this.applyZoom((sel) => sel.call(this.zoomBehavior().scaleBy, factor, at, null));
+        this.applyZoom((sel) => {
+          const zoom = this.zoomBehavior();
+          if (zoom) sel.call(() => zoom.scaleBy(sel, factor, at));
+        });
       }
       if (this.wheelPanX !== 0 || this.wheelPanY !== 0) {
         const dx: number = this.wheelPanX;
@@ -2263,7 +2273,10 @@ export class MindmapView extends ItemView {
         this.wheelPanX = 0;
         this.wheelPanY = 0;
         // translateBy 的 x/y 是**内容坐标**（内部会乘 k），所以先按当前比例换成内容位移
-        this.applyZoom((sel) => sel.call(this.zoomBehavior().translateBy, dx / k, dy / k, null));
+        this.applyZoom((sel) => {
+          const zoom = this.zoomBehavior();
+          if (zoom) sel.call(() => zoom.translateBy(sel, dx / k, dy / k));
+        });
       }
     });
   }
@@ -2275,14 +2288,14 @@ export class MindmapView extends ItemView {
    * 由 markmap 实例提供，我们只负责算「该缩多少、该移多少」。类型上用最小形状，
    * 因为 d3 的类型包没装，markmap 那边只能退化成 any。
    */
-  private zoomBehavior(): any {
+  private zoomBehavior(): ZoomBehavior<SVGElement, INode> | undefined {
     return this.mm?.zoom;
   }
 
-  private applyZoom(op: (sel: { call: (fn: unknown, ...args: unknown[]) => void }) => void): void {
+  private applyZoom(op: (sel: ID3SVGElement) => void): void {
     const mm = this.mm;
     if (!mm) return;
-    op(mm.svg as unknown as { call: (fn: unknown, ...args: unknown[]) => void });
+    op(mm.svg);
   }
 
   /** 指针在 svg 用户坐标系里的位置（d3 的 pointer 算法，兼容 viewBox 与 CSS 缩放） */
@@ -2578,7 +2591,7 @@ export class MindmapView extends ItemView {
     // 内容已经一样就别再赋值：innerHTML 赋值会把内部 DOM 全部重建一遍，
     // 视觉上就是文字闪一下（「提交即预览」已经把新文字画上去了，这里多数时候是同值）。
     const changed: boolean = box.innerHTML !== content;
-    if (changed) box.innerHTML = content;
+    if (changed) setRenderedHtml(box, content);
     // changed=false 是正常路径（预览已经铺过），日志里出现大量 true 说明预览没接上
     // traceLog("patch.apply", { line, changed });
 
@@ -3267,7 +3280,7 @@ export class MindmapView extends ItemView {
     const target = e.target as Element;
 
     // 1) 行内链接（双链 / 外链）
-    const link = target.closest("a") as HTMLAnchorElement | null;
+    const link = target.closest<HTMLAnchorElement>("a");
     if (link) {
       e.preventDefault();
       e.stopPropagation();
@@ -3292,7 +3305,7 @@ export class MindmapView extends ItemView {
     // 2) 折叠圆点交给 markmap 自己处理，避免折叠与跳转冲突
     if (target.closest("circle")) return;
 
-    const g = target.closest("g.markmap-node") as SVGGElement | null;
+    const g = target.closest<SVGGElement>("g.markmap-node");
     // 3) 点在空白处 = 取消选中，浮动条跟着收起。
     // 这是关掉浮动条最自然的手势；之前这里直接 return，于是「一旦选中就再也
     // 关不掉」—— 只能去点另一个节点，浮动条永远挂在某个卡片下面。
@@ -3464,10 +3477,9 @@ export class MindmapView extends ItemView {
     const parent = anchor?.parent ?? null;
     if (parent) {
       // children 是运行时的内部数组，类型声明里没公开；拿不到就插到 0
-      const split = parent as WorkspaceSplit;
-      const kids = (split as unknown as { children?: unknown[] }).children;
+      const kids = (parent as unknown as { children?: unknown[] }).children;
       const at: number = Array.isArray(kids) ? kids.length : 0;
-      return this.app.workspace.createLeafInParent(split, at);
+      return this.app.workspace.createLeafInParent(parent, at);
     }
     return this.app.workspace.getLeaf("tab");
   }
@@ -3707,7 +3719,7 @@ export class MindmapView extends ItemView {
     }
 
     const refs: SrcRef[] = visibleLeafRefs(
-      this.mm?.state.data as unknown as NavNode | undefined,
+      this.mm?.state.data as unknown as NavNode | undefined, // eslint-disable-line @typescript-eslint/no-unnecessary-type-assertion -- markmap 的 state.data 是 IPureNode，与导航用的 NavNode 形状不同，必须显式过桥
     );
     const next: SrcRef | null = stepVisible(refs, cur, key === "ArrowDown" ? 1 : -1);
     if (next) this.selectByLine(next.line);
@@ -4282,7 +4294,7 @@ export class MindmapView extends ItemView {
     // 块里的文字要能双击选词、复制：不接管，也不进编辑态
     if (target.closest(".obmind-block-md")) return;
 
-    const g = target.closest("g.markmap-node") as SVGGElement | null;
+    const g = target.closest<SVGGElement>("g.markmap-node");
     if (!g) return;
 
     e.preventDefault();
@@ -4629,7 +4641,7 @@ export class MindmapView extends ItemView {
     const prevW: string = fo.getAttribute("width") ?? "";
     const prevH: string = fo.getAttribute("height") ?? "";
 
-    if (prevHtml !== html) box.innerHTML = html;
+    if (prevHtml !== html) setRenderedHtml(box, html);
 
     // 卡片尺寸要同步长出来：只换文字不改 foreignObject 宽高的话，会先出现一帧
     // 「新文字溢出旧卡片」，等 markmap 自己重排（100ms 防抖）才回正。
@@ -4649,7 +4661,7 @@ export class MindmapView extends ItemView {
 
     return (): void => {
       if (!fo.isConnected || !box.isConnected) return;
-      box.innerHTML = prevHtml;
+      setRenderedHtml(box, prevHtml);
       if (prevW) fo.setAttribute("width", prevW);
       if (prevH) fo.setAttribute("height", prevH);
       // 退回旧尺寸也要把卡片画回去，否则写盘失败时留下同样一张「文字溢出」的卡片

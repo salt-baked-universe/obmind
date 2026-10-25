@@ -121,9 +121,10 @@ export default class MindmapPlugin extends Plugin {
   }
 
   onunload(): void {
-    // 不清理的话，重载插件后旧视图仍挂在 leaf 上，
-    // 持有 markmap 实例与 MutationObserver，既泄漏又会让类型注册不清爽。
-    this.app.workspace.detachLeavesOfType(MINDMAP_VIEW_TYPE);
+    // 刻意**不**在这里 detachLeavesOfType：
+    // 那会把叶子退回默认位置，用户把导图拖到别处、重载插件后就复位了
+    // （目录审查明确把这条列为错误）。视图本身由 Obsidian 负责回收，
+    // 我们只需要保证自己的监听器都走 registerEvent / registerDomEvent。
   }
 
   /**
@@ -224,7 +225,7 @@ export default class MindmapPlugin extends Plugin {
       view.setTargetFile(activeFile instanceof TFile ? activeFile : null);
       void view.refresh();
     }
-    workspace.revealLeaf(leaf);
+    void workspace.revealLeaf(leaf);
   }
 
   /** 让所有已打开的思维导图视图重新渲染（主题/过滤设置变更时调用） */
@@ -256,7 +257,10 @@ export default class MindmapPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // loadData() 的返回类型是 any（读的是 data.json）；先落到 unknown 再断言，
+    // 免得整个 Object.assign 变成不安全赋值（目录审查会拦）。
+    const saved: Partial<ObmindSettings> | null = (await this.loadData()) as Partial<ObmindSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved ?? {});
   }
 
   async saveSettings() {

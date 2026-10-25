@@ -45,8 +45,8 @@
  */
 
 import type { SrcRef } from "../types";
+import { hideElement, setDisplay, setUserSelect, showElement } from "../render/domStyle";
 import type { DropMode } from "./move";
-import { traceLog } from "../render/trace";
 
 /** 超过这个位移才算拖拽，否则当成普通点击 */
 const DRAG_THRESHOLD = 5;
@@ -202,8 +202,7 @@ export class DragController {
 
     // 按下就锁选区：否则拖出 5px 阈值之前，浏览器已经开始选文字了，
     // 松手时页面上留着一片蓝色高亮。单击（没拖动）也会在 reset 里立刻恢复。
-    document.body.style.userSelect = "none";
-    document.body.style.webkitUserSelect = "none";
+    setUserSelect(document.body, "none");
 
     // 整棵子树 = 根 + 所有 path 以「根路径.」开头的节点。
     // 用 path 而不是几何范围：markmap 的 g 是扁平的，path 是唯一可靠的父子依据，
@@ -261,7 +260,7 @@ export class DragController {
       this.beginDrag();
       // 拖拽期间别顺手选中卡片文字（pointerdown 不能 preventDefault，
       // 那会掐掉后续的 click/dblclick，双击编辑就废了）
-      document.body.style.userSelect = "none";
+      setUserSelect(document.body, "none");
     }
 
     e.preventDefault();
@@ -316,7 +315,7 @@ export class DragController {
   // -------------------------------------------------------------------------
 
   private nodeAt(el: Element): SVGGElement | null {
-    return el.closest("g.markmap-node") as SVGGElement | null;
+    return el.closest<SVGGElement>("g.markmap-node");
   }
 
   /** 进入拖动态：整块标记 + 摘掉各块根对外那几根旧线 + 提到最上层 */
@@ -337,7 +336,7 @@ export class DragController {
       // 没有线也要登记：这个节点可能是刚新建的（图层还没画出来），
       // 一旦有人在这期间绘制，就会给它补出一根按旧位置算的线。
       if (ext) {
-        ext.style.display = "none";
+        hideElement(ext);
         links.push(ext);
       }
     }
@@ -445,7 +444,7 @@ export class DragController {
   private restoreOuterLinks(links: SVGPathElement[]): void {
     for (const link of links) {
       if (!link.isConnected) continue;
-      link.style.removeProperty("display");
+      showElement(link);
     }
   }
 
@@ -510,15 +509,15 @@ export class DragController {
     if (!box || !line) return;
 
     if (!this.target) {
-      box.style.display = "none";
-      line.style.display = "none";
+      hideElement(box);
+      hideElement(line);
       return;
     }
 
     const r = this.cardBoxOf(this.target.g);
     if (!r) {
-      box.style.display = "none";
-      line.style.display = "none";
+      hideElement(box);
+      hideElement(line);
       return;
     }
     const base = this.container.getBoundingClientRect();
@@ -527,16 +526,16 @@ export class DragController {
 
     if (this.target.mode === "child") {
       // 描边框正好压在卡片外沿：box 从外扩 2px 起算，与 2px 的 border 严丝合缝
-      box.style.display = "block";
+      setDisplay(box, "block");
       box.style.left = `${left - 2}px`;
       box.style.top = `${top - 2}px`;
       box.style.width = `${r.width + 4}px`;
       box.style.height = `${r.height + 4}px`;
-      line.style.display = "none";
+      hideElement(line);
     } else {
       // 前后插入：横线贴在卡片上下沿的外侧（落在兄弟间的空隙里，读起来就是"插在这"）
-      box.style.display = "none";
-      line.style.display = "block";
+      hideElement(box);
+      setDisplay(line, "block");
       line.style.left = `${left}px`;
       line.style.width = `${r.width}px`;
       line.style.top = `${this.target.mode === "before" ? top - 4 : top + r.height + 1}px`;
@@ -561,8 +560,7 @@ export class DragController {
       this.cb.onShift(roots, false);
       this.restoreOuterLinks(this.outerLinks);
     }
-    document.body.style.userSelect = "";
-    document.body.style.webkitUserSelect = "";
+    setUserSelect(document.body, "");
     this.origin = null;
     this.originSrc = null;
     this.active = false;
@@ -571,8 +569,8 @@ export class DragController {
     this.rootEls = [];
     this.candidates = [];
     this.outerLinks = [];
-    if (this.box) this.box.style.display = "none";
-    if (this.line) this.line.style.display = "none";
+    if (this.box) hideElement(this.box);
+    if (this.line) hideElement(this.line);
   }
 }
 

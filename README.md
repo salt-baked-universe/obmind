@@ -1,17 +1,89 @@
-# obmind
+# Outline mindmap
 
-Turn the current note's headings and indentation into an interactive, XMind-style mindmap — and edit the note by dragging nodes around.
+Turn the headings and indentation of the current note into an interactive, XMind-style mind map — and edit the note by dragging nodes around.
 
 把当前笔记的大纲（文件名当根、标题层级与缩进当分支）画成一张可交互的思维导图；改导图就是改笔记，拖动节点就是调整层级。
 
-<!-- 截图位：把截图放进 images/ 后取消下面两行的注释 -->
-<!-- ![obmind 思维导图视图](./images/screenshot.png) -->
+<!-- Screenshots: drop files into images/ and uncomment the lines below -->
+<!-- ![Outline mindmap view](./images/screenshot.png) -->
 
-## 它解决什么问题
+## Why
+
+An outline you can only read line by line is hard to reason about. This plugin draws the structure, and keeps it **two-way**: renaming, adding, deleting, and dragging nodes in the map writes back to the same Markdown note. There is no separate map file to keep in sync.
+
+## Features
+
+- **Live map of the active note** — opens in the right sidebar and follows the note you are editing.
+- **The map is the note** — rename, add child/sibling, outdent, delete and drag-to-reparent all write back to the Markdown source. Anchor lines are verified before writing; a mismatch aborts instead of corrupting the file.
+- **Drag to restructure** — drop a node onto another to re-parent it; multi-select and drag a whole subtree. No ghost lines left behind.
+- **Blocks are nodes too** — code fences, math, tables and quotes hang under the nearest heading as read-only pills; callouts become containers.
+- **Note from node** — `Ctrl+N` creates a note, links it with a `[[wikilink]]` and jumps there, optionally from a template (`{{title}}`, `{{date}}`, `{{time}}`, `{{from}}`).
+- **Breadcrumb + pin** — walk into linked notes from the map, or pin the map so notes keep opening normally while the map stays put.
+- **Five themes** — classic, business, dark, candy, minimal, plus follow-appearance.
+- **SVG export** — exports the whole map (not just the viewport) with styles inlined, so it looks the same anywhere.
+- **Wheel that fits the device** — a mouse wheel zooms notch by notch, a trackpad two-finger gesture pans and pinch zooms; the decision is made per gesture rather than assumed from a pixel constant.
+- **No network, no telemetry** — the plugin makes no requests and only reads/writes notes in the current vault.
+
+## Install
+
+Search for `Outline mindmap` in **Settings → Community plugins → Browse** once it is listed.
+
+Before that, use [BRAT](https://github.com/TfTHacker/obsidian42-brat) and add this repository.
+
+Manual install: copy `main.js`, `manifest.json` and `styles.css` into `<vault>/.obsidian/plugins/obmind-map/`, restart Obsidian, then enable the plugin.
+
+## Usage
+
+1. Open a note that has headings or an indented outline.
+2. Click the network icon in the left ribbon, or run "打开当前笔记思维导图" from the command palette.
+3. The map opens in the right sidebar.
+
+## Keyboard and mouse
+
+| Action | Result |
+| --- | --- |
+| Click a node | Select it |
+| Double-click / `F2` / `Space` | Edit in place (text starts fully selected) |
+| `Enter` / `Tab` (canvas) | New sibling / child |
+| `Enter` (editor) | Commit and exit |
+| `Ctrl+Enter` (editor) | Commit and create a sibling |
+| `Shift+Tab` | Outdent one level |
+| `Delete` / `Backspace` | Delete the node and its subtree |
+| `↑` `↓` | Move the selection along the document order (leaf nodes) |
+| `←` `→` | Jump to parent / first child |
+| `Ctrl+N` | Create a note for the selected node and link it |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
+| `Esc` | Clear the selection |
+| `Alt`+click | Open the note with the same name |
+| Right-drag | Pan the canvas |
+| Wheel | Zoom (mouse) or pan (trackpad) |
+
+## Compatibility
+
+- Obsidian `1.7.2` or newer.
+- Desktop first: the plugin loads on mobile but the gestures are designed for a desktop.
+
+## License
+
+[GNU General Public License v3.0](./LICENSE) (SPDX: `GPL-3.0-or-later`)
+
+Copyright (C) 2026 郭源潮
+
+Distributed forks must stay open source under the same license. For closed-source commercial use, contact the author for a separate grant.
+
+The bundled dependencies (`obsidian` typings, `markmap`, `d3`) are MIT/ISC and compatible with GPL-3.0; their notices are kept in the banner of `main.js`.
+
+---
+
+## 中文说明
+
+把 obmind（插件 id：`obmind-map`）的完整说明放在这里，方便中文用户直接看。
+
+### 它解决什么问题
 
 Obsidian 里写了一堆缩进大纲或标题层级，翻回原文只能一行行读。obmind 把这些结构直接画成图，而且**双向**：图上改字、拖节点、增删分支，落盘改的是同一份 Markdown 原文——不是另存一份导图文件。
 
-## 特性
+### 特性
 
 - **就地可视化**：右侧边栏打开，跟随当前笔记；笔记改动自动重绘。
 - **图即笔记**：改字、建子级/同级、提升层级、删除、拖动重排全部写回原文，先校验锚点行再写，写错就报错不落盘（宁可不写，也不错位）。
@@ -25,15 +97,15 @@ Obsidian 里写了一堆缩进大纲或标题层级，翻回原文只能一行�
 - **撤销 / 重做**：整篇快照式撤销栈，`Ctrl+Z` / `Ctrl+Shift+Z`。
 - **无网络、无遥测**：插件不发起任何网络请求，只读写当前库里的笔记。
 
-## 安装
+### 安装
 
-上架后可在 **设置 → 第三方插件 → 浏览** 里搜索 `obmind` 安装。
+上架后可在 **设置 → 第三方插件 → 浏览** 里搜索 `Outline mindmap` 安装。
 
 未上架前用 [BRAT](https://github.com/TfTHacker/obsidian42-brat)：添加本仓库地址即可。
 
 手动安装：把 `main.js`、`manifest.json`、`styles.css` 放进 `<库>/.obsidian/plugins/obmind-map/`，重启 Obsidian 后在第三方插件里启用。
 
-## 用法
+### 用法
 
 1. 打开一篇有层级的笔记。
 2. 点左侧栏的网络图标，或命令面板执行「obmind：打开当前笔记思维导图」。
@@ -71,26 +143,26 @@ Obsidian 里写了一堆缩进大纲或标题层级，翻回原文只能一行�
 | 右键拖动 | 平移画布 |
 | 滚轮 | 缩放 |
 
-## 设置
+### 设置
 
 - **过滤笔记属性**：生成导图时跳过笔记顶部的 YAML frontmatter。
 - **面包屑与笔记视图联动**：四档，决定点双链/回退时笔记窗口怎么跟随。
 - **新建笔记模板**：从节点建笔记时套用的模板笔记路径；留空则新建空白笔记。支持 `{{title}}`、`{{date}}`、`{{time}}`、`{{from}}`，日期可带格式如 `{{date:YYYY年MM月DD日}}`。新建笔记放在哪里跟随 Obsidian 自己的「新建笔记的存放位置」。
 
-## 命令
+### 命令
 
 打开当前笔记思维导图、切换思维导图主题、折叠全部、展开全部、缩放到适合窗口、重新读取并重绘、为选中节点新建笔记并双链，另有两支诊断命令（记录/保存闪烁日志）用于反馈问题。
 
-## 兼容性
+### 兼容性
 
-- 最低 Obsidian 版本：`1.4.0`
+- 最低 Obsidian 版本：`1.7.2`
 - 桌面端优先。移动端可加载，但手势按桌面设计，未做触屏优化。
 
-## 反馈
+### 反馈
 
 有问题请开 issue，尽量附上：Obsidian 版本、插件版本、复现步骤。若能复现渲染问题，可执行命令「obmind：诊断：开始/停止闪烁日志」，复现一次后用「保存闪烁日志到库根目录」把日志一起贴上来。
 
-## 开发
+### 开发
 
 ```bash
 npm install
@@ -100,15 +172,4 @@ npm run build   # tsc 类型检查 + esbuild 打包 production
 
 `main.js` 是构建产物，随 release 一起发布。
 
-## License
-
-[GNU General Public License v3.0](./LICENSE)（SPDX：`GPL-3.0-or-later`）
-
-Copyright (C) 2026 郭源潮
-
-这是一份**传染性（copyleft）**协议：你可以自由使用、修改、分发本项目；但只要分发修改后的版本，
-**该版本必须以 GPL-3.0 开源并提供完整源码** —— 不能拿 obmind 的代码做成闭源插件或闭源产品。
-希望闭源商用需另行取得作者授权。
-
-依赖兼容性：`obsidian` 类型声明（MIT）与 markmap 系列（MIT）均与 GPL-3.0 兼容，打包进 `main.js` 无冲突。
-
+> 授权条款见上方 License 一节（中英双语只需一份）。

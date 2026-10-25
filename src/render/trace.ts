@@ -27,6 +27,8 @@
  */
 
 /** 记录档位：off 不记；events 只记关键事件；frames 额外逐帧采样视觉状态 */
+import { Notice } from "obsidian";
+
 export type TraceLevel = "off" | "events" | "frames";
 
 const STORAGE_KEY = "obmind:trace";
@@ -422,6 +424,17 @@ declare global {
  * 幂等：视图可能开好几个（分屏），插件重载时也不能重复定义。
  * `metaOf` 做成回调而不是快照，这样「当前是哪篇笔记」总是最新的。
  */
+/**
+ * 探针自己的回执通道。
+ *
+ * 原来这里是 `console.info`，但目录审查禁止插件往控制台输出
+ * （obsidianmd/rule-custom-message，且不允许用 eslint-disable 绕过）。
+ * 改成 Notice：同样只在用户主动调用 API 时弹一次，装在 Obsidian 里反而更显眼。
+ */
+function emit(msg: string): void {
+  new Notice(msg);
+}
+
 export function installTraceConsole(metaOfFn: () => Record<string, string>): void {
   metaOf = metaOfFn;
   // **不幂等**：插件重载会重新执行整个 bundle，此时 window 上留着的是**旧模块**
@@ -430,25 +443,25 @@ export function installTraceConsole(metaOfFn: () => Record<string, string>): voi
   const api: TraceConsole = {
     on: () => {
       setTraceLevel("events");
-      console.info("[obmind] 开始记录事件日志。复现一次闪烁，然后 obmindTrace.text() 或 .save()");
+      emit("[obmind] 开始记录事件日志。复现一次闪烁，然后 obmindTrace.text() 或 .save()");
     },
     frames: () => {
       setTraceLevel("frames");
-      console.info("[obmind] 开始记录事件 + 逐帧快照。注意：逐帧采样本身会让动画略慢");
+      emit("[obmind] 开始记录事件 + 逐帧快照。注意：逐帧采样本身会让动画略慢");
     },
     off: () => {
       setTraceLevel("off");
-      console.info("[obmind] 已停止记录");
+      emit("[obmind] 已停止记录");
     },
     clear: () => {
       traceClear();
-      console.info("[obmind] 日志已清空");
+      emit("[obmind] 日志已清空");
     },
     text: () => traceText(),
     stats: () => traceStats(),
     save: async () => {
       const path: string = await saveTraceToVault();
-      console.info(`[obmind] 日志已保存：${path}`);
+      emit(`[obmind] 日志已保存：${path}`);
       return path;
     },
     state: () => `level=${level} lines=${lines.length} frame=${frameNo}`,

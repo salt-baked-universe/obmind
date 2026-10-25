@@ -15,6 +15,7 @@
  */
 
 import type { SrcRef } from "../types";
+import { hideElement, setDisplay, setUserSelect } from "../render/domStyle";
 
 /** 超过这个位移才算框选，否则当成普通点击（交给 click 去取消选中） */
 const BOX_THRESHOLD = 5;
@@ -92,8 +93,7 @@ export class BoxSelectController {
 
     // 按下就锁选区：拖动期间不该出现浏览器选文字的蓝条。
     // 没拖动（纯点击）会在 reset 里立刻恢复，并放行 click 去取消选中。
-    document.body.style.userSelect = "none";
-    document.body.style.webkitUserSelect = "none";
+    setUserSelect(document.body, "none");
   };
 
   private onPointerMove = (e: PointerEvent): void => {
@@ -134,9 +134,8 @@ export class BoxSelectController {
   private reset(): void {
     this.armed = false;
     this.active = false;
-    document.body.style.userSelect = "";
-    document.body.style.webkitUserSelect = "";
-    if (this.box) this.box.style.display = "none";
+    setUserSelect(document.body, "");
+    if (this.box) hideElement(this.box);
   }
 
   /** 节点卡片的外框（屏幕坐标），与 DragController 同款判定 */
@@ -187,7 +186,7 @@ export class BoxSelectController {
     const top = Math.min(this.startY, this.endY) - base.top;
     const width = Math.abs(this.endX - this.startX);
     const height = Math.abs(this.endY - this.startY);
-    box.style.display = "block";
+    setDisplay(box, "block");
     box.style.left = `${left}px`;
     box.style.top = `${top}px`;
     box.style.width = `${width}px`;

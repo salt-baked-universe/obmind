@@ -1,6 +1,6 @@
 {
   "name": "obmind",
-  "version": "1.18.19",
+  "version": "1.18.20",
   "description": "Turn the current note's headings and indentation into an interactive, XMind-style mindmap that edits the note back.",
   "main": "main.js",
   "scripts": {
@@ -22,9 +22,12 @@
     "obsidian": "^1.4.0"
   },
   "devDependencies": {
-    "builtin-modules": "^3.3.0",
+    "@types/d3": "^7.4.3",
     "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
     "esbuild": "^0.20.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-obsidianmd": "^0.4.2",
     "typescript": "^5.4.0"
   }
 }

@@ -16,7 +16,7 @@
 
 import type { ThemeSpec } from "../theme";
 import type { NodePainter } from "./painter";
-import { isTracing, traceLog, traceLogEvery } from "./trace";
+import { isTracing } from "./trace";
 
 export interface FrameSource {
   svg: () => SVGSVGElement | null;

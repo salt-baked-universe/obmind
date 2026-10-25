@@ -726,6 +726,20 @@
   white-space: pre-wrap;
   overflow-wrap: break-word;
   overflow-y: hidden;
+  /* 下面这些原本写在 inlineText.ts 里逐条 style.xxx = ...；
+     它们是**固定**的排版前提（不随节点/主题变），放样式表更合适，
+     也符合目录审查「静态样式别写内联」的要求。动态那几个
+     （字号、颜色、宽高、transform）仍然按节点算，留在 TS 里。 */
+  position: absolute;
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+  border: none;
+  outline: none;
+  overflow: hidden;
+  resize: none;
+  transform-origin: 0 0;
+  z-index: 20;
   box-shadow: 0 0 0 2px var(--interactive-accent, #4a7dff);
   caret-color: var(--interactive-accent, #4a7dff);
 }

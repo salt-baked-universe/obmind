@@ -12,8 +12,9 @@
  */
 
 import type { EditorAction } from "../types";
+import { setStyleProperty, setVisibility } from "../render/domStyle";
 import type { ThemeSpec } from "../theme";
-import { isTracing, traceLogEvery } from "../render/trace";
+import { isTracing } from "../render/trace";
 
 export type { EditorAction } from "../types";
 
@@ -85,16 +86,10 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
   ta.style.fontStyle = cs.fontStyle;
   ta.style.lineHeight = cs.lineHeight;
   ta.style.letterSpacing = cs.letterSpacing;
-  ta.style.boxSizing = "border-box";
-  ta.style.padding = "0";
-  ta.style.border = "none";
-  ta.style.outline = "none";
-  ta.style.overflow = "hidden";
-  ta.style.resize = "none";
+  // 排版类固定样式（box-sizing / border / outline / overflow / resize /
+  // position / transform-origin / z-index）统一由 styles.css 的
+  // `.obmind-inline-editor` 提供；这里只写「按节点算出来的」那些。
   ta.style.color = fo.style.color || spec.nodeText;
-  ta.style.position = "absolute";
-  ta.style.transformOrigin = "0 0";
-  ta.style.zIndex = "20";
 
   // 底色取卡片填充，视觉上就是「直接在卡片里改字」；
   // 极简主题卡片是透明的，退回画布底色，否则会和背后的原文重影。
@@ -154,7 +149,7 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
     ta.style.transform = `scale(${scale})`;
 
     // 高度按内容自适应，但不小于原来的卡片高度，避免一打开就矮一截
-    ta.style.height = "1px";
+    setStyleProperty(ta, "height", "1px");
     const needed: number = Math.max(rawH + pad.y * 2, ta.scrollHeight);
     ta.style.height = `${needed}px`;
 
@@ -296,7 +291,7 @@ export function openInlineEditor(options: InlineEditorOptions): InlineEditorHand
   svg?.addEventListener("wheel", reposition, true);
   window.addEventListener("resize", reposition);
 
-  fo.style.visibility = "hidden";
+  setVisibility(fo, "hidden");
   place();
   // preventScroll：编辑框就在视口里，focus 时再滚一下会把画布带偏一格
   ta.focus({ preventScroll: true });

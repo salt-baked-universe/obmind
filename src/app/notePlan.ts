@@ -13,7 +13,7 @@
  */
 
 /** 这行正文里是否已经有双链（有就不再提供「新建笔记」入口） */
-const WIKILINK_RE = /\[\[[^\[\]]+\]\]/;
+const WIKILINK_RE = /\[\[[^[\]]+\]\]/;
 
 export function hasWikiLink(text: string): boolean {
   return WIKILINK_RE.test(text);

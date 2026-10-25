@@ -28,9 +28,10 @@ import {
   parentPathOf,
   readNodeBox,
 } from "./geometry";
+import { hideElement, isHidden, setStyleProperty, showElement } from "./domStyle";
 import type { NodeBox } from "./geometry";
 import { branchPathOf, hash32 } from "./colors";
-import { isTracing, traceLog, traceLogEvery } from "./trace";
+import { isTracing } from "./trace";
 
 /**
  * 分支 → 色板槽位。
@@ -556,7 +557,8 @@ export class NodePainter {
     shadow.setAttribute("fill", spec.dark ? "rgba(0,0,0,0.45)" : "rgba(15,23,42,0.10)");
     shadow.setAttribute("rx", rx);
     // 有没有阴影是主题决定的；用 display 开关，opacity 留给淡入淡出（syncFade）
-    shadow.style.display = spec.card ? "" : "none";
+    if (spec.card) showElement(shadow);
+    else hideElement(shadow);
 
     // 文字色写在 foreignObject 上，节点内容继承（这个不会被 markmap 冲掉）
     box.fo.style.color = style.fg;
@@ -659,8 +661,8 @@ export class NodePainter {
         // 写内联样式而不是只靠 styles.css：SVG 元素的 transform-origin 默认是
         // 0 0（不是 CSS 那套 50% 50%），样式表一旦没匹配上，位置就会错得很离谱；
         // 内联样式优先级最高，主题改不动它。
-        circle.style.setProperty("transform-box", "fill-box");
-        circle.style.setProperty("transform-origin", "center");
+        setStyleProperty(circle, "transform-box", "fill-box");
+        setStyleProperty(circle, "transform-origin", "center");
       }
     }
     if (!circle) return;
@@ -671,16 +673,16 @@ export class NodePainter {
     //
     // 这里直接读 style.display 而不是缓存一个布尔：缓存会和 reset() 之后
     // 重新拿到的旧 DOM 对不上（实测过，隐藏了就再也不会显回来）。
-    const hidden: boolean = circle.style.display === "none";
+    const hidden: boolean = isHidden(circle);
     if (!box.hasChildren) {
       if (!hidden) {
-        circle.style.display = "none";
+        hideElement(circle);
         this.writes++;
       }
       return;
     }
     if (hidden) {
-      circle.style.display = "";
+      showElement(circle);
       this.writes++;
     }
 
@@ -714,8 +716,8 @@ export class NodePainter {
     // 它是隐藏的**，既不写 d、也不更新缓存 —— 松手重建之后几何变了，d 自然会
     // 重算；判据消失后下面那句「保证可见」也会把它接回来，不需要谁记得还。
     if (this.shiftedRoots.has(box.g)) {
-      if (link.style.display !== "none") {
-        link.style.display = "none";
+      if (!isHidden(link)) {
+        hideElement(link);
         this.writes++;
       }
       return false;
@@ -726,7 +728,7 @@ export class NodePainter {
     // 我们的绘制又只写 d / stroke、从不碰 display，于是这根线永久消失。
     // 所以凡是我们画过的线，都保证它是可见的（读一次 style.display 比写一次便宜）。
     if (link.style.display !== "") {
-      link.style.removeProperty("display");
+      showElement(link);
       this.writes++;
     }
 
@@ -800,7 +802,7 @@ export class NodePainter {
       // 被摘掉的线：只有拖动会写 display:none，正常应该在重建的 paintAll 里还原。
       // 偏差计算看不出它（d 可能还是对的），所以必须单独数 —— 「线不见了」
       // 和「线歪了」是两种完全不同的 bug。
-      if (link.style.display === "none") {
+      if (isHidden(link)) {
         report.hidden++;
         continue;
       }

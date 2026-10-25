@@ -98,7 +98,7 @@ export function planCreate(input: CreateInput): CreateResult {
   // callout 的标题行（`> [!NOTE] xxx`）：它不是列表项，`mark` 会算出 `[!NOTE] `，
   // 照搬会凭空造出一个新 callout；而它的「同级」必须落到引用**外面**，
   // 因为 callout 里面任何一行都是它的后代。
-  const calloutHead: boolean = /^[ 	]*>[ 	]?\[!/.test(src.full);
+  const calloutHead: boolean = /^[ \t]*>[ \t]?\[!/.test(src.full);
 
   if (mode === "sibling") {
     const quote: string = calloutHead ? "" : quoteOf(src);

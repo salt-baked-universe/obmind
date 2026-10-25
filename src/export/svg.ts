@@ -15,6 +15,8 @@
  * 能在 Node 里穷举边界；DOM 那部分只能靠浏览器验证。
  */
 
+import { setOpacity, setVisibility } from "../render/domStyle";
+
 /** markmap `state.rect` 的形状：内容包围盒（未应用 zoom 的坐标系） */
 export interface ContentRect {
   x1: number;
@@ -265,12 +267,12 @@ export function buildSvgText(
   // visibility 是编辑框留下的（它把原文藏起来，好让输入框盖在上面）——
   // 导出的是「这张图」，不是「这一刻的屏幕」，原文得还回来。
   for (const fo of Array.from(clone.querySelectorAll<SVGForeignObjectElement>("foreignObject"))) {
-    fo.style.opacity = "";
-    fo.style.visibility = "";
+    setOpacity(fo, "");
+    setVisibility(fo, "");
     if (fo.getAttribute("style") === "") fo.removeAttribute("style");
   }
   for (const deco of Array.from(clone.querySelectorAll<SVGElement>('[class^="obmind-node"]'))) {
-    deco.style.opacity = "";
+    setOpacity(deco, "");
     if (deco.getAttribute("style") === "") deco.removeAttribute("style");
   }
 
