@@ -1,11 +1,11 @@
-# Outline mindmap
+# Weaver Mindmap
 
 Turn the headings and indentation of the current note into an interactive, XMind-style mind map — and edit the note by dragging nodes around.
 
 把当前笔记的大纲（文件名当根、标题层级与缩进当分支）画成一张可交互的思维导图；改导图就是改笔记，拖动节点就是调整层级。
 
 <!-- Screenshots: drop files into images/ and uncomment the lines below -->
-<!-- ![Outline mindmap view](./images/screenshot.png) -->
+<!-- ![Weaver Mindmap view](./images/screenshot.png) -->
 
 ## Why
 
@@ -26,7 +26,7 @@ An outline you can only read line by line is hard to reason about. This plugin d
 
 ## Install
 
-Search for `Outline mindmap` in **Settings → Community plugins → Browse** once it is listed.
+Search for `Weaver Mindmap` in **Settings → Community plugins → Browse** once it is listed.
 
 Before that, use [BRAT](https://github.com/TfTHacker/obsidian42-brat) and add this repository.
 
@@ -99,7 +99,7 @@ Obsidian 里写了一堆缩进大纲或标题层级，翻回原文只能一行�
 
 ### 安装
 
-上架后可在 **设置 → 第三方插件 → 浏览** 里搜索 `Outline mindmap` 安装。
+上架后可在 **设置 → 第三方插件 → 浏览** 里搜索 `Weaver Mindmap` 安装。
 
 未上架前用 [BRAT](https://github.com/TfTHacker/obsidian42-brat)：添加本仓库地址即可。
 

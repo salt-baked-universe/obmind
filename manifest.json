@@ -1,7 +1,7 @@
 {
   "id": "obmind-map",
-  "name": "Outline mindmap",
-  "version": "1.18.20",
+  "name": "Weaver Mindmap",
+  "version": "1.18.21",
   "minAppVersion": "1.7.2",
   "description": "Turn the current note's headings and indentation into an interactive, XMind-style mindmap that edits the note back.",
   "author": "郭源潮",
