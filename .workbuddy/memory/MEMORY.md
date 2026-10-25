@@ -99,4 +99,6 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 - 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。目录读默认分支 HEAD 的 manifest，安装取 Release 的 `main.js`/`manifest.json`/`styles.css`，tag 严格等于版本号（无 `v`）。
 - **GitHub 账号 `salt-baked-universe`**（`manifest.authorUrl` 已填）。`origin` = `https://github.com/salt-baked-universe/obmind.git`，但**仓库在 GitHub 上还没建**（该账号 0 个公开仓库）。本地 `git push` 会卡在 Git Credential Manager 的 GUI 授权框（`credential.helper=helper-selector`，非交互环境 90s 超时），**推送必须用户自己在终端/VS Code 做**。
 - **id = `obmind-map`，显示名 `obmind mindmap`**。原来的 `obmind` 已被 **MindBraid**（`soren-ac`，做同样的事）占用，提交时报 `An entry with this ID already exists`。id 发布后永久不可改；插件目录名必须等于 id（测试库已 mv 成 `plugins/obmind-map`）。
+- **仓库已建并推送**：`salt-baked-universe/obmind`（public）。`origin` 已配好。**本地能提交，但推不上去** —— 非 tty 环境拿不到 GCM 登录态（`could not read Username ... terminal prompts disabled`），push 与建 release 由用户在 VS Code / 自己终端完成。
+- **Release 资产的 manifest 会随版本固化**：只改仓库里的 id 不够，旧 release 里的 `manifest.json` 还带老 id，必须 bump 版本 + 重发资产。
 - 发布附件备在 `tmp/release-<版本>/`（三个文件 + `release-notes.md`），`tmp/` 已 ignore。
