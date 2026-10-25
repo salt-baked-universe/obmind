@@ -31,7 +31,7 @@ Obsidian 里写了一堆缩进大纲或标题层级，翻回原文只能一行�
 
 未上架前用 [BRAT](https://github.com/TfTHacker/obsidian42-brat)：添加本仓库地址即可。
 
-手动安装：把 `main.js`、`manifest.json`、`styles.css` 放进 `<库>/.obsidian/plugins/obmind/`，重启 Obsidian 后在第三方插件里启用。
+手动安装：把 `main.js`、`manifest.json`、`styles.css` 放进 `<库>/.obsidian/plugins/obmind-map/`，重启 Obsidian 后在第三方插件里启用。
 
 ## 用法
 

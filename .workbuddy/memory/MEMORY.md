@@ -96,4 +96,6 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 ## 发布
 
 - 授权 **GPL-3.0-or-later**（二开必须同样开源）。`LICENSE` 用 gnu.org 全文；`src/main.ts` 顶部三段式；**`esbuild.config.mjs` banner 必须带 GPL 声明 + 第三方版权**（markmap MIT / d3 ISC / @babel/runtime MIT）—— 上架后用户只拿得到 `main.js`。
-- 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。tag 严格等于版本号（无 `v`）。仓库仍**无 git remote**，`authorUrl` 待补。
+- 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。目录读默认分支 HEAD 的 manifest，安装取 Release 的 `main.js`/`manifest.json`/`styles.css`，tag 严格等于版本号（无 `v`）。
+- **GitHub 账号 `salt-baked-universe`**（`manifest.authorUrl` 已填）。`origin` = `https://github.com/salt-baked-universe/obmind.git`，但**仓库在 GitHub 上还没建**（该账号 0 个公开仓库）。本地 `git push` 会卡在 Git Credential Manager 的 GUI 授权框（`credential.helper=helper-selector`，非交互环境 90s 超时），**推送必须用户自己在终端/VS Code 做**。
+- 发布附件备在 `tmp/release-<版本>/`（三个文件 + `release-notes.md`），`tmp/` 已 ignore。

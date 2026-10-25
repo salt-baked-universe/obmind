@@ -11,7 +11,7 @@ if not defined BASE (
   exit /b 1
 )
 
-set "DST=%BASE%\.obsidian\plugins\obmind"
+set "DST=%BASE%\.obsidian\plugins\obmind-map"
 if not exist "%DST%" mkdir "%DST%"
 
 copy /Y "%SRC%\manifest.json" "%DST%" >nul && echo [ok] manifest.json
