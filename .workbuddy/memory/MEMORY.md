@@ -1,12 +1,12 @@
 # obmind 项目约定
 
-Obsidian 插件：笔记 → XMind 风格思维导图。当前 **1.18.13**（`manifest.json` / `package.json` / `versions.json` 三处同步）。
+Obsidian 插件：笔记 → XMind 风格思维导图。当前 **1.18.16**（`manifest.json` / `package.json` / `versions.json` 三处同步）。
 
-> 详细推导、实测数据、探针记录见同目录 **`MARKMAP-NOTES.md`**（不自动注入，需要查证时再读）。
+> 详细推导/实测数据见同目录 **`MARKMAP-NOTES.md`**（不自动注入，需要查证时再读）。
 
 ## 分层（单向向下，`domain` 不 import obsidian、不碰 DOM）
 
-L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、nav、stats）→ L2 `render/`（painter、frame、colors、viewport、geometry、trace）+ `ui/`（toolbar、nodeBar、nodeBarPosition、keyGuard）+ `export/svg.ts` → L3 `edit/`（writer＝`applyOp` 唯一写出口、move、create、block、text、inlineText、drag、boxSelect）→ L4 `app/`（runtime、EditService/QueryService、NavStack/NavPolicy、History 快照上限 40、notePlan、plan）→ L5 `MindmapView`（事件翻译 + 投影 + 面板 + 分发；`parser.ts` 只是组装层）
+L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、nav、stats）→ L2 `render/`（painter、frame、colors、viewport、geometry、wheel）+ `ui/` + `export/` → L3 `edit/`（writer＝`applyOp` 唯一写出口、move、create、block、text、inlineText、drag、boxSelect、paste）→ L4 `app/`（runtime、EditService/QueryService、NavStack/NavPolicy、History 快照上限 40、notePlan、plan、actions）→ L5 `MindmapView`（事件翻译 + 投影 + 面板 + 分发；`parser.ts` 只是组装层）。IO 走 `io/`。
 
 ## markmap 硬约束
 
@@ -32,11 +32,11 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 ## 解析（domain/syntax）
 
 19. 两套层级：标题（`#`）与缩进。`indentOfCols(cols+step, unit)`；制表符按 4 列。深度用**缩进栈**推导（非 `floor`）；`detectIndent` 取「整除最多行且覆盖 ≥85% 缩进行的最小候选」，否则 GCD。
-20. **块（围栏/公式/表格/普通引用）是宿主的独立只读子节点**（1.18.13 定版）。围栏最多缩 0–3 格（第 4 格退化成缩进代码块）→ 用 `<!-- obmind:block -->` **代理行**承受缩进、块本体顶格；注释任何工具都不显示、不抢原生/第三方语法。两档 `blockNode`：`bound`（裸块，层级由围栏缩进定，**不可拖**）/ `free`（有代理行，层级由代理行定，可拖）。一个 `RawLine` 就是一个块（`RawLine.block` 非数组）；`src.line` = 代理行或围栏行；`blockEnd` / `proxyLine`。块拿深度但**不写缩进栈**（叶子，否则吞掉后续节点）。
+20. **块（围栏/公式/表格/普通引用）是宿主的独立只读子节点**：`RawLine.block`（单个），`src.line` = 代理行（free）或围栏行（bound），`blockStart/blockEnd` 记行区间，`proxyLine` 记代理行。块在缩进推导里拿深度但**不写缩进栈**（否则吞掉后面紧跟的节点）。`<!-- obmind:block -->` 是代理行：围栏最多缩 0–3 格，块自己扛不了缩进 —— 这条是整套设计的地基。归属看顺序，不看缩进。细节见 `MARKMAP-NOTES.md`。
 21. **callout 是容器**：`> [!note] 标题` 自成节点，正文剥一层 `>` 当虚拟行继续分层；无标题用正文首行顶上（`promoted` 层级上移一层）。`v.orig/v.off` 换回原文坐标。
 22. 回写先校验锚点行原文，宁可失败不能错位；跨多行加 `Span.checkEnd`。`applyOp` 顺带返回新全文，别再读文件。
 23. 回写/移动保留引用前缀（`quoteOf`/`markOf`/`splitLine`）；进出 callout 用 `rebaseQuote` 换整块前缀。callout 标题的「同级」在引用外、`mark` 不沿用 `[!note] `；其子级不能再缩进。
-24. 插入块插在**宿主行之后**。**围栏类块（代码/公式）一律顶格**，代理行单独缩进一层 —— 早先让围栏对齐「列表内容列」，浅层没事，深列表（11 层 tab）算出 42 列而内容列在 46，既不在列表项里又超过 3 格 → Obsidian 当缩进代码块，` ```python ` 原样露出来（1.18.14 修）。引用 / 表格不是围栏，仍对齐列表内容列，留在列表项里更整齐。callout 内每行带 `>`。新建节点插在子树末尾（`subtreeEndOf`，块的子树＝自身到 `blockEnd`）。`insertBlock` 自带代理行与语言（`sanitizeLang` 只留 `[A-Za-z0-9#+._-]`，记住上次语言存 localStorage `obmind:code-lang`，选择器是 `ui/codeLang.ts` 的 `FuzzySuggestModal`，清单外可自敲）；拖裸块由 `moveNode` 自动补代理行升级 free（`frozenIn` 只冻块体）。
+24. 插入块插在**宿主行之后**。**围栏类块（代码/公式）一律顶格**，缩进全由代理行承担 —— 旧版对齐到列表内容列，11 层 tab 的提纲算成 42 列，既不在列表项里又超 3 格，Obsidian 当缩进代码块、` ```python ` 原样露出；引用/表格不是围栏，仍对齐列表内容列。callout 内每行带 `>`。`insertBlock` 自带代理行 + `insertBlockAt`（弹语言选择框前先抓行号，失焦会清选中集）；拖裸块由 `moveNode` 自动补代理行升级 free（`frozenIn` 只冻块体）。语言用 `ui/codeLang.ts` 的 FuzzySuggestModal，50 个常用 + 可自敲，上次的存 localStorage。
 25. GFM 表格要「头行含 `|` + 分隔行 + 分隔行自身含 `|`」；列表下缩进表格先 dedent。
 
 ## 交互
@@ -66,13 +66,13 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 45. **重绘成本 = 写进 DOM 的属性数**（冷启 197 节点 4954 写 / 9ms）。验收：缓存命中 writes=0，改一字 <30。**`reset()` 不能清 `entries`**（markmap 复用同 g），单条失效交给 `entryOf` 核对 `cached.g===box.g && card.isConnected`。
 46. `paintMoved` 对尺寸变了的节点也要补 `applySize/applyCircle`。
 47. `paintSelection` 用 `(structureGen, 选中集合)` 早退（`structureGen` 在 `applyTree`/`reflowNow` +1）；`prune()` 不能按数量相等短路。
-48. 导出 SVG：① 清最外层 g 的 zoom transform，viewBox 用 `mm.state.rect`；② `getComputedStyle` 字体/色/底/边框内联到克隆体；③ 补背景；④ `stripHidden` 删 `display:none`（必须在 `inlineForeignStyles` **之后**），收放点 `<circle>` 单独删。验收用 `<img src="data:image/svg+xml,…">`。
+48. 导出 SVG：清最外层 g 的 transform、viewBox 用 `mm.state.rect`；`getComputedStyle` 内联字体/色/底/边框；补背景；`stripHidden` 删 `display:none`（必须在 `inlineForeignStyles` **之后**），收放点 `<circle>` 单独删。验收用 `<img src="data:image/svg+xml,…">`。
 
 ## 块卡片
 
-49. 块内容由 `MarkdownRenderer.render` 产 HTML，**必须包 `<div class="obmind-block-md markdown-rendered">`** —— 代码底色、高亮 token、表格线、引用条、公式全挂 `.markdown-rendered` 下。渲染必须在 `setData` **之前** await 完（markmap 读 `foreignObject > div > div` 的 scrollWidth/Height）。缓存 key=`file.path|kind|lang|raw`，`Component` 按轮释放。
-50. 复制按钮是**阅读视图后处理**加的，渲染器不给：`decorateCodeBlocks` 给每个 `<pre>` 追加 `<button class="copy-code-button">`，点击走**画布事件委托**（捕获阶段；字符串化会丢监听）。`width:auto` 让内部 fit-content 塌成 26px → 用 `width: max-content; max-width: 640px`；逐节点区分只能靠 `:has(.obmind-block-md)`（`--markmap-max-width` 无法逐节点设）。`pre` 强制 `pre-wrap + overflow-wrap:anywhere`。
-51. 块只读全链路：`startEdit` / 双击（`.obmind-block-md` 内 return，让文字可选）/ 新建 / 插块 / 提层 / 拖动 / 浮动条（只剩删除）/ 新建笔记；纯函数层 `EditService.commit|create|insertBlock`、`moveNode` 的 `child` 模式全拦。`plan` 层 `srcOf()` 对块返 `null` → 块**绝不走 patch 通道**（换 innerHTML 不重跑渲染器），改块即整树重建；比较用 `kind|lang|raw` 指纹。
+49. 块内容由 `MarkdownRenderer.render` 产 HTML，**必须包 `<div class="obmind-block-md markdown-rendered">`** —— 代码底色、高亮、表格线、引用条、公式全挂 `.markdown-rendered` 下。渲染必须在 `setData` **之前** await 完（markmap 读 `foreignObject > div > div` 的 scrollWidth/Height）。缓存 key=`file.path|kind|lang|raw`。
+50. 复制按钮是**阅读视图后处理**加的，渲染器不给：`decorateCodeBlocks` 给每个 `<pre>` 补 `<button class="copy-code-button">`，点击走**画布事件委托**（字符串化会丢监听）。宽度只能 `:has(.obmind-block-md)` + `width:max-content; max-width:640px`（`width:auto` 会让内部 fit-content 塌成 26px；`--markmap-max-width` 无法逐节点设）。`pre` 强制 `pre-wrap`。
+51. 块只读全链路：`startEdit` / 双击（`.obmind-block-md` 内 return，让文字可选）/ 新建 / 插块 / 提层 / 拖动 / 浮动条（只剩删除）/ 新建笔记；纯函数层 `EditService.commit|create|insertBlock`、`moveNode` 的 `child` 模式全拦。`plan` 层 `srcOf()` 对块返 `null` → 块**绝不走 patch 通道**（换 innerHTML 不重跑渲染器），改块即整树重建。
 
 ## 导航
 
@@ -82,7 +82,9 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 55. 「节点 → 新笔记」（`app/notePlan.ts` 纯函数）：名字清 `# ^ [ ]` 与 Windows 非法字符；文件夹复用 `getConfig("newFileLocation"/"newFileFolderPath")`；同名复用；**先建文件后改节点**；带行内样式用别名 `[[名|**原文**]]`；跳前清选中集。Ctrl+N 挂 **document 捕获阶段**且只在 `containerEl.contains(target)` 时接管。
 
 56. **键位只有一张表**（`app/actions.ts`）：`ACTIONS` = id + 归一化 keys(`mod/alt/shift`) + scopes(`canvas`/`view`) + `when(ActionState)`；`matchAction` 统一挡 `phase!=="idle"`（编辑/拖动/重建都不接），视图只剩 `runAction(id)` 的 switch。加操作 = 表里一行 + 一个 case。两条键盘链判据必须同源，否则「重建中在画布按 Tab」会拿旧快照建节点。
-57. **IO 走端口**：`io/clipboard.ts` 的 `ClipboardPort`（readText 失败返空串不抛）+ `memoryClipboard` 给用例。Ctrl+V → `edit/paste.ts` `planPaste`：一行一个同级子节点，**不按源缩进还原层级**（tabs/空格/伪缩进猜错会写出结构错的笔记）；剥一层 `>`/列表标记/`#`（属于源文档结构，`> x` 留着会变成块节点）；第一行交 `planCreate` 再切前缀复用（缩进规则只有一份）；上限 200 行；粘完**不进编辑框**，选中第一个新节点；读完剪贴板要复查 `phase` 与 `primaryLine` 是否还是当初那一行。
+57. **IO 走端口**：`io/clipboard.ts` 的 `ClipboardPort`（读失败返空串，不抛）+ `memoryClipboard`。Ctrl+V → `edit/paste.ts` `planPaste`：一行一个同级子节点、**不按源缩进还原层级**（猜错会写出结构错的笔记）、剥一层 `>`/列表标记/`#`、第一行交 `planCreate` 再切前缀复用、上限 200、粘完不进编辑框。读完剪贴板必须复查 `phase` 与 `primaryLine`。
+
+58. **滚轮只有一个入口**（1.18.16）：`applyZoomFilter` 对 wheel 返 `false` + `buildOptions` 的 `pan:false`。理由：d3 的 `wheeled` 会 `stopImmediatePropagation()`（放行 = 画布上的 wheel 永远收不到），markmap 的 `handlePan` 又抢同一个 `wheel`。判定在 `render/wheel.ts`：`ctrlKey`/`Shift` 特判，**整格**（100/120 倍数 + 无 deltaX + 像素模式）才算鼠标→缩放，其余一律平移；手势内只允许 zoom→pan。攒到下一帧一次 `scaleBy(f, 锚点, null)` / `translateBy(dx/k, dy/k, null)`（锚点用 `getScreenCTM().inverse()`；translateBy 入参是内容坐标，不除 k 在 k=1 时看不出来）。键盘兜底 `mod+= / - / 0`。
 
 ## 构建与验证
 

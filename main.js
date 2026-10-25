@@ -6779,6 +6779,88 @@ async function waitStableSize(opts) {
   return big(last) ? last : null;
 }
 
+// src/render/wheel.ts
+var NOTCH_PX = 100;
+var LINE_PX = 16;
+var PAGE_RATIO = 0.9;
+var GESTURE_GAP = 260;
+var NOTCH_GAIN = 2e-3;
+var PINCH_GAIN = 0.02;
+var FACTOR_MIN = 0.5;
+var FACTOR_MAX = 2;
+function toPixels(delta, mode, viewport) {
+  if (mode === 1)
+    return delta * LINE_PX;
+  if (mode === 2)
+    return delta * viewport * PAGE_RATIO;
+  return delta;
+}
+function looksLikeNotch(dx, dy, mode) {
+  if (mode !== 0)
+    return true;
+  const onGrid = (v2) => {
+    const a = Math.abs(v2);
+    if (a === 0)
+      return true;
+    if (a < 50)
+      return false;
+    if (Math.round(a) !== a)
+      return false;
+    return a % NOTCH_PX === 0 || a % 120 === 0;
+  };
+  return onGrid(dx) && onGrid(dy);
+}
+var WheelGesture = class {
+  constructor() {
+    this.mode = null;
+    this.last = -Infinity;
+  }
+  reset() {
+    this.mode = null;
+    this.last = -Infinity;
+  }
+  /** 当前手势被判成了什么（null = 还没有手势） */
+  get current() {
+    return this.mode;
+  }
+  /**
+   * 这一帧该干什么。返回 null 表示这个事件没有位移（纯占位事件），别拦它。
+   *
+   * @param viewport 视口高度，只用于把「页」换算成像素
+   */
+  classify(e, viewport) {
+    const dx = toPixels(e.deltaX, e.deltaMode, viewport);
+    const dy = toPixels(e.deltaY, e.deltaMode, viewport);
+    if (dx === 0 && dy === 0)
+      return null;
+    if (e.ctrlKey) {
+      this.mode = "zoom";
+      this.last = e.timeStamp;
+      return { kind: "zoom", factor: clampFactor(Math.pow(2, -dy * PINCH_GAIN)) };
+    }
+    if (e.shiftKey) {
+      this.mode = "pan";
+      this.last = e.timeStamp;
+      const d = dx !== 0 ? dx : dy;
+      return { kind: "pan", dx: -d, dy: 0 };
+    }
+    const fresh = this.mode === null || e.timeStamp - this.last > GESTURE_GAP;
+    const notch = looksLikeNotch(dx, dy, e.deltaMode);
+    if (fresh || this.mode === "zoom" && !notch)
+      this.mode = notch ? "zoom" : "pan";
+    this.last = e.timeStamp;
+    if (this.mode === "zoom") {
+      return { kind: "zoom", factor: clampFactor(Math.pow(2, -dy * NOTCH_GAIN)) };
+    }
+    return { kind: "pan", dx: -dx, dy: -dy };
+  }
+};
+function clampFactor(f) {
+  if (!Number.isFinite(f))
+    return 1;
+  return Math.min(FACTOR_MAX, Math.max(FACTOR_MIN, f));
+}
+
 // src/edit/folds.ts
 function isFolded(node) {
   var _a;
@@ -9356,7 +9438,17 @@ var ACTIONS = [
    * 和 `newSibling` 的区别不只是键位：它**不自动进编辑框**，因为内容已经是
    * 用户想要的文字（XMind 里粘贴完就是成品主题，再弹一个全选的输入框只会挡路）。
    */
-  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable }
+  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable },
+  /**
+   * 缩放与归位。三个键位都按**物理键位**注册：Shift+= 送来的 key 是 `+`、
+   * Shift+- 是 `_`，但用户按的是同一个键，不该因为按住 Shift 就变成另一个动作
+   * （见 keyOf 里按 `code` 归一化那一段）。所以 `mod+=` 与 `mod+shift+=` 都要列。
+   *
+   * 不挂在 `when: pick` 上：没选中节点也该能缩放，这是纯视口操作。
+   */
+  { id: "zoomIn", keys: ["mod+=", "mod+shift+="], scopes: ["canvas", "view"] },
+  { id: "zoomOut", keys: ["mod+-", "mod+shift+-"], scopes: ["canvas", "view"] },
+  { id: "zoomFit", keys: ["mod+0"], scopes: ["canvas", "view"] }
 ];
 function keyOf(e) {
   const parts = [];
@@ -9379,6 +9471,16 @@ function keyOf(e) {
     key = "left";
   else if (key === "ArrowRight")
     key = "right";
+  else if (e.code === "Equal")
+    key = "=";
+  else if (e.code === "Minus")
+    key = "-";
+  else if (e.code === "NumpadAdd")
+    key = "=";
+  else if (e.code === "NumpadSubtract")
+    key = "-";
+  else if (e.code === "Digit0" || e.code === "Numpad0")
+    key = "0";
   else
     key = key.toLowerCase();
   parts.push(key);
@@ -9747,6 +9849,11 @@ var HELP_ROWS = [
   ["Shift+Tab", "\u63D0\u5347\u4E00\u7EA7"],
   ["Delete", "\u5220\u9664\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9\uFF08\u53EA\u5728\u6CA1\u5728\u7F16\u8F91\u65F6\u751F\u6548\uFF09"],
   ["\u62D6\u52A8\u8282\u70B9", "\u6309\u4F4F\u5DE6\u952E\u62D6\u5230\u522B\u7684\u5361\u7247\u4E0A\u6539\u53D8\u7236\u5B50\u5173\u7CFB"],
+  ["\u9F20\u6807\u6EDA\u8F6E", "\u4EE5\u6307\u9488\u4E3A\u4E2D\u5FC3\u7F29\u653E\uFF08\u4E00\u683C\u4E00\u683C\u7684\u6EDA\u6CD5\uFF09"],
+  ["\u89E6\u6478\u677F\u53CC\u6307", "\u5E73\u79FB\u753B\u5E03\uFF1A\u56FE\u8DDF\u7740\u624B\u6307\u8D70\uFF08\u8FDE\u7EED\u3001\u5E26\u6A2A\u5411\u5206\u91CF\u7684\u4E00\u5F8B\u6309\u5E73\u79FB\u7B97\uFF09"],
+  ["\u89E6\u6478\u677F\u634F\u5408", "\u7F29\u653E\uFF1B\u9A71\u52A8\u6CA1\u5408\u6210\u634F\u5408\u5C31\u7528 Ctrl+\u6EDA\u8F6E"],
+  ["Ctrl/\u2318 + = / - / 0", "\u653E\u5927 / \u7F29\u5C0F / \u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3"],
+  ["\u53F3\u952E\u62D6\u52A8 / Shift+\u6EDA\u8F6E", "\u5E73\u79FB\u753B\u5E03\uFF08\u89E6\u6478\u677F\uFF1A\u53CC\u6307\u6309\u4E0B\u518D\u62D6\uFF09"],
   ["Ctrl/\u2318+\u5355\u51FB", "\u52A0\u9009 / \u51CF\u9009\uFF08\u70B9\u5728\u5DF2\u9009\u8282\u70B9\u4E0A\u5C31\u628A\u5B83\u53BB\u6389\uFF09"],
   ["Shift+\u5355\u51FB", "\u9009\u4E2D\u540C\u7EA7\u533A\u95F4\uFF1A\u5148\u70B9\u9996\uFF0C\u518D Shift \u70B9\u5C3E"],
   ["Alt+\u5355\u51FB", "\u6309\u8282\u70B9\u6587\u5B57\u6253\u5F00\u540C\u540D\u7B14\u8BB0"],
@@ -9990,6 +10097,22 @@ var MindmapView = class extends import_obsidian4.ItemView {
     this.rightDragMoved = false;
     this.rightDownX = 0;
     this.rightDownY = 0;
+    /** 滚轮 / 触摸板的手势判定（见 render/wheel.ts：两件设备的语义完全不同） */
+    this.wheelGesture = new WheelGesture();
+    /**
+     * 这一帧攒下的滚轮位移。
+     *
+     * 触摸板一次滑动能发上百个 wheel 事件，每个都直接改 transform 就是上百次
+     * `g.attr("transform")` + 上百次区域重绘。攒到下一帧一次应用，
+     * 数学上等价（平移相加、同一点缩放相乘），但每秒只重绘 60 次。
+     */
+    this.wheelQueued = false;
+    this.wheelPanX = 0;
+    this.wheelPanY = 0;
+    /** 累计缩放倍数，1 表示这一帧没有缩放请求 */
+    this.wheelZoom = 1;
+    /** 缩放的锚点（画布坐标；捏合时手指在哪就以哪为中心） */
+    this.wheelAt = null;
     /**
      * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
      *
@@ -10204,14 +10327,9 @@ var MindmapView = class extends import_obsidian4.ItemView {
       srcOf: (g) => this.srcOf(g),
       onSelect: (lines2, additive) => this.applySelection(lines2, -1, additive)
     });
-    this.registerDomEvent(
-      canvas,
-      "wheel",
-      () => {
-        this.userView = true;
-      },
-      { capture: true, passive: true }
-    );
+    this.registerDomEvent(canvas, "wheel", (e) => this.onWheel(e), {
+      passive: false
+    });
     this.renderBreadcrumb();
     this.registerDomEvent(document, "keydown", (e) => this.onGlobalKeyDown(e));
     this.registerDomEvent(
@@ -11235,7 +11353,11 @@ var MindmapView = class extends import_obsidian4.ItemView {
       // 既是「收放点抖动」的来源，也是「收起后回到默认缩放级别」的原因。
       // 现在改成只在我们认为该适配的时机手动调 fit（见 fitInstant / 适配按钮）。
       autoFit: false,
-      fitRatio: 0.94
+      fitRatio: 0.94,
+      // 滚轮平移也关掉：markmap 会在 svg 上额外绑一个 `wheel`（handlePan），
+      // 而 d3 的缩放处理里有一句 stopImmediatePropagation —— 两套同时存在时
+      // 谁生效取决于构造顺序，等于一个薛定谔的滚轮。现在唯一的入口是 onWheel。
+      pan: false
     };
   }
   /**
@@ -11345,8 +11467,15 @@ var MindmapView = class extends import_obsidian4.ItemView {
   }
   /**
    * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
-   * 右键(2)拖拽平移画布；滚轮缩放、触屏平移保持。
-   * setOptions 不会重建 zoom 行为对象，故创建后设一次即可。
+   * 右键(2)拖拽平移画布，触屏捏合保持。
+   *
+   * **`wheel` 一律返回 false** —— 滚轮不再交给 d3。两个理由：
+   * 1. d3 的 `wheeled` 只认「滚多少就缩放多少」，它没有「这次的滚轮是鼠标还是
+   *    触摸板」这个概念（markmap 用 UA 猜：Mac 一个样、Windows 另一个样，
+   *    而同一台 Windows 笔记本上鼠标和触摸板是混着用的）；
+   * 2. 更要紧的是它调用 `stopImmediatePropagation()` —— 只要放行，画布上
+   *    挂的 wheel 监听就再也收不到事件。
+   * 现在 wheel 的语义判定在 `render/wheel.ts`，d3 只负责把算好的 transform 落地。
    */
   applyZoomFilter() {
     const mm = this.mm;
@@ -11354,11 +11483,121 @@ var MindmapView = class extends import_obsidian4.ItemView {
       return;
     mm.zoom.filter((event) => {
       if (event.type === "wheel")
-        return true;
+        return false;
       if (event.type === "touchstart" || event.type === "touchmove")
         return true;
       return event.button === 2;
     });
+  }
+  // -------------------------------------------------------------------------
+  // 视口：滚轮 / 触摸板 / 缩放键
+  // -------------------------------------------------------------------------
+  /**
+   * 滚轮入口。
+   *
+   * 三种设备行为，全部由 `WheelGesture` 判定（判据与理由都在那个文件里）：
+   * - **鼠标滚轮**（一格一格）→ 以指针为中心缩放，和以前一样；
+   * - **触摸板双指滑动**（连续、零碎、常有横向分量）→ 平移，图跟着手指走；
+   * - **捏合 / Ctrl+滚轮**（`ctrlKey` 的 wheel）→ 缩放。
+   *
+   * 位移攒到下一帧统一应用：触摸板一次滑动能发上百个事件，每个都改一次
+   * transform 就是上百次重绘。攒起来数学上等价（平移相加、同一点缩放相乘）。
+   */
+  onWheel(e) {
+    var _a;
+    if (!this.mm)
+      return;
+    const viewport = ((_a = this.canvasEl) == null ? void 0 : _a.clientHeight) || window.innerHeight;
+    const intent = this.wheelGesture.classify(e, viewport);
+    if (!intent)
+      return;
+    e.preventDefault();
+    this.userView = true;
+    if (intent.kind === "pan") {
+      this.wheelPanX += intent.dx;
+      this.wheelPanY += intent.dy;
+    } else {
+      this.wheelZoom *= intent.factor;
+      this.wheelAt = this.pointerInSvg(e);
+    }
+    this.flushWheelSoon();
+  }
+  /** 把这一帧攒下的位移交给 d3-zoom 落地（一帧最多一次） */
+  flushWheelSoon() {
+    if (this.wheelQueued)
+      return;
+    this.wheelQueued = true;
+    window.requestAnimationFrame(() => {
+      var _a;
+      this.wheelQueued = false;
+      const zoom = this.zoomScale();
+      const k = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+      if (this.wheelZoom !== 1) {
+        const factor = this.wheelZoom;
+        const at = (_a = this.wheelAt) != null ? _a : this.svgCenter();
+        this.wheelZoom = 1;
+        this.wheelAt = null;
+        this.applyZoom((sel) => sel.call(this.zoomBehavior().scaleBy, factor, at, null));
+      }
+      if (this.wheelPanX !== 0 || this.wheelPanY !== 0) {
+        const dx = this.wheelPanX;
+        const dy = this.wheelPanY;
+        this.wheelPanX = 0;
+        this.wheelPanY = 0;
+        this.applyZoom((sel) => sel.call(this.zoomBehavior().translateBy, dx / k, dy / k, null));
+      }
+    });
+  }
+  /**
+   * 把 svg 的 d3 selection 与 zoom 行为一起拿出来用。
+   *
+   * 这里不 import d3：transform 的玩法（`zoom.scaleBy` / `zoom.translateBy`）
+   * 由 markmap 实例提供，我们只负责算「该缩多少、该移多少」。类型上用最小形状，
+   * 因为 d3 的类型包没装，markmap 那边只能退化成 any。
+   */
+  zoomBehavior() {
+    var _a;
+    return (_a = this.mm) == null ? void 0 : _a.zoom;
+  }
+  applyZoom(op) {
+    const mm = this.mm;
+    if (!mm)
+      return;
+    op(mm.svg);
+  }
+  /** 指针在 svg 用户坐标系里的位置（d3 的 pointer 算法，兼容 viewBox 与 CSS 缩放） */
+  pointerInSvg(e) {
+    const svg = this.svgEl;
+    if (!svg)
+      return [0, 0];
+    try {
+      const p = svg.createSVGPoint();
+      p.x = e.clientX;
+      p.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (ctm) {
+        const q2 = p.matrixTransform(ctm.inverse());
+        return [q2.x, q2.y];
+      }
+    } catch (e2) {
+    }
+    const r = svg.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  /** 视口中心（svg 用户坐标），给没有指针位置的缩放当锚点 */
+  svgCenter() {
+    const svg = this.svgEl;
+    if (!svg)
+      return [0, 0];
+    const r = svg.getBoundingClientRect();
+    return this.pointerInSvg({ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
+  }
+  /** 以画布中心为锚点缩放（键盘缩放走这条） */
+  zoomBy(factor) {
+    this.wheelZoom *= factor;
+    this.wheelAt = null;
+    this.userView = true;
+    this.flushWheelSoon();
   }
   nextFrame() {
     return new Promise((resolve) => {
@@ -12658,6 +12897,15 @@ var MindmapView = class extends import_obsidian4.ItemView {
         return;
       case "paste":
         void this.pasteIntoSelected();
+        return;
+      case "zoomIn":
+        this.zoomBy(1.2);
+        return;
+      case "zoomOut":
+        this.zoomBy(1 / 1.2);
+        return;
+      case "zoomFit":
+        this.fitView();
         return;
     }
   }

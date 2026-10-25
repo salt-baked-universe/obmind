@@ -31,6 +31,8 @@ import {
   traceSince,
 } from "./render/trace";
 import { waitStableSize } from "./render/viewport";
+import { WheelGesture } from "./render/wheel";
+import type { WheelIntent } from "./render/wheel";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { firstChildRef, stepVisible, visibleLeafRefs } from "./domain/nav";
 import type { NavNode } from "./domain/nav";
@@ -110,6 +112,11 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["Shift+Tab", "提升一级"],
   ["Delete", "删除节点及其全部子节点（只在没在编辑时生效）"],
   ["拖动节点", "按住左键拖到别的卡片上改变父子关系"],
+  ["鼠标滚轮", "以指针为中心缩放（一格一格的滚法）"],
+  ["触摸板双指", "平移画布：图跟着手指走（连续、带横向分量的一律按平移算）"],
+  ["触摸板捏合", "缩放；驱动没合成捏合就用 Ctrl+滚轮"],
+  ["Ctrl/⌘ + = / - / 0", "放大 / 缩小 / 缩放到适合窗口"],
+  ["右键拖动 / Shift+滚轮", "平移画布（触摸板：双指按下再拖）"],
   ["Ctrl/⌘+单击", "加选 / 减选（点在已选节点上就把它去掉）"],
   ["Shift+单击", "选中同级区间：先点首，再 Shift 点尾"],
   ["Alt+单击", "按节点文字打开同名笔记"],
@@ -503,6 +510,23 @@ export class MindmapView extends ItemView {
   private rightDownX = 0;
   private rightDownY = 0;
 
+  /** 滚轮 / 触摸板的手势判定（见 render/wheel.ts：两件设备的语义完全不同） */
+  private wheelGesture = new WheelGesture();
+  /**
+   * 这一帧攒下的滚轮位移。
+   *
+   * 触摸板一次滑动能发上百个 wheel 事件，每个都直接改 transform 就是上百次
+   * `g.attr("transform")` + 上百次区域重绘。攒到下一帧一次应用，
+   * 数学上等价（平移相加、同一点缩放相乘），但每秒只重绘 60 次。
+   */
+  private wheelQueued = false;
+  private wheelPanX = 0;
+  private wheelPanY = 0;
+  /** 累计缩放倍数，1 表示这一帧没有缩放请求 */
+  private wheelZoom = 1;
+  /** 缩放的锚点（画布坐标；捏合时手指在哪就以哪为中心） */
+  private wheelAt: [number, number] | null = null;
+
   /**
    * 兼容旧调用：单值选中 = 只选一个。写入会同步 selectedLines（赋 -1 即清空集合）。
    */
@@ -760,17 +784,15 @@ export class MindmapView extends ItemView {
         this.applySelection(lines, -1, additive),
     });
 
-    // 用户滚轮缩放过之后，就不要再跟着容器尺寸自动适配了 ——
-    // 他已经把视角调到自己想要的位置，我们再去 fit 一次等于把它抢走。
-    // 用捕获阶段：d3-zoom 在 svg 上会 preventDefault，但事件仍会走到这里。
-    this.registerDomEvent(
-      canvas,
-      "wheel",
-      () => {
-        this.userView = true;
-      },
-      { capture: true, passive: true },
-    );
+    // 滚轮 / 触摸板：自己接管，交给 render/wheel.ts 判定「这是鼠标还是双指滑动」。
+    // d3 的 zoom 过滤器已经不再收 wheel（见 applyZoomFilter），所以这里是唯一入口。
+    //
+    // `passive: false` 是硬要求：不 preventDefault 的话，触摸板的惯性滚动会穿到
+    // 底下的编辑区 —— 图没动，笔记先滚走一屏。它同时承担「用户动过视口」的记账
+    // （滚过之后就别再跟着容器尺寸自动适配了，否则一调窗口就把视角抢走）。
+    this.registerDomEvent(canvas, "wheel", (e: WheelEvent) => this.onWheel(e), {
+      passive: false,
+    });
 
     // 初始没有导航，先置成隐藏，免得空容器占位
     this.renderBreadcrumb();
@@ -2027,6 +2049,10 @@ export class MindmapView extends ItemView {
       // 现在改成只在我们认为该适配的时机手动调 fit（见 fitInstant / 适配按钮）。
       autoFit: false,
       fitRatio: 0.94,
+      // 滚轮平移也关掉：markmap 会在 svg 上额外绑一个 `wheel`（handlePan），
+      // 而 d3 的缩放处理里有一句 stopImmediatePropagation —— 两套同时存在时
+      // 谁生效取决于构造顺序，等于一个薛定谔的滚轮。现在唯一的入口是 onWheel。
+      pan: false,
     };
   }
 
@@ -2155,18 +2181,140 @@ export class MindmapView extends ItemView {
 
   /**
    * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
-   * 右键(2)拖拽平移画布；滚轮缩放、触屏平移保持。
-   * setOptions 不会重建 zoom 行为对象，故创建后设一次即可。
+   * 右键(2)拖拽平移画布，触屏捏合保持。
+   *
+   * **`wheel` 一律返回 false** —— 滚轮不再交给 d3。两个理由：
+   * 1. d3 的 `wheeled` 只认「滚多少就缩放多少」，它没有「这次的滚轮是鼠标还是
+   *    触摸板」这个概念（markmap 用 UA 猜：Mac 一个样、Windows 另一个样，
+   *    而同一台 Windows 笔记本上鼠标和触摸板是混着用的）；
+   * 2. 更要紧的是它调用 `stopImmediatePropagation()` —— 只要放行，画布上
+   *    挂的 wheel 监听就再也收不到事件。
+   * 现在 wheel 的语义判定在 `render/wheel.ts`，d3 只负责把算好的 transform 落地。
    */
   private applyZoomFilter(): void {
     const mm = this.mm;
     if (!mm) return;
     mm.zoom.filter((event: any): boolean => {
-      if (event.type === "wheel") return true;
+      if (event.type === "wheel") return false;
       if (event.type === "touchstart" || event.type === "touchmove") return true;
       // 仅右键（button 2）拖拽平移
       return event.button === 2;
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // 视口：滚轮 / 触摸板 / 缩放键
+  // -------------------------------------------------------------------------
+
+  /**
+   * 滚轮入口。
+   *
+   * 三种设备行为，全部由 `WheelGesture` 判定（判据与理由都在那个文件里）：
+   * - **鼠标滚轮**（一格一格）→ 以指针为中心缩放，和以前一样；
+   * - **触摸板双指滑动**（连续、零碎、常有横向分量）→ 平移，图跟着手指走；
+   * - **捏合 / Ctrl+滚轮**（`ctrlKey` 的 wheel）→ 缩放。
+   *
+   * 位移攒到下一帧统一应用：触摸板一次滑动能发上百个事件，每个都改一次
+   * transform 就是上百次重绘。攒起来数学上等价（平移相加、同一点缩放相乘）。
+   */
+  private onWheel(e: WheelEvent): void {
+    if (!this.mm) return;
+    const viewport: number = this.canvasEl?.clientHeight || window.innerHeight;
+    const intent: WheelIntent | null = this.wheelGesture.classify(e, viewport);
+    if (!intent) return;
+
+    // 一律拦掉默认行为：不拦的话触摸板的惯性滚动会穿到后面的笔记编辑区
+    e.preventDefault();
+    this.userView = true;
+
+    if (intent.kind === "pan") {
+      this.wheelPanX += intent.dx;
+      this.wheelPanY += intent.dy;
+    } else {
+      this.wheelZoom *= intent.factor;
+      this.wheelAt = this.pointerInSvg(e);
+    }
+    this.flushWheelSoon();
+  }
+
+  /** 把这一帧攒下的位移交给 d3-zoom 落地（一帧最多一次） */
+  private flushWheelSoon(): void {
+    if (this.wheelQueued) return;
+    this.wheelQueued = true;
+    window.requestAnimationFrame(() => {
+      this.wheelQueued = false;
+      const zoom: number = this.zoomScale();
+      const k: number = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+      if (this.wheelZoom !== 1) {
+        const factor: number = this.wheelZoom;
+        // 键盘缩放没有指针位置，就以视口中心为锚点（和用户此刻盯着的地方一致）
+        const at: [number, number] = this.wheelAt ?? this.svgCenter();
+        this.wheelZoom = 1;
+        this.wheelAt = null;
+        this.applyZoom((sel) => sel.call(this.zoomBehavior().scaleBy, factor, at, null));
+      }
+      if (this.wheelPanX !== 0 || this.wheelPanY !== 0) {
+        const dx: number = this.wheelPanX;
+        const dy: number = this.wheelPanY;
+        this.wheelPanX = 0;
+        this.wheelPanY = 0;
+        // translateBy 的 x/y 是**内容坐标**（内部会乘 k），所以先按当前比例换成内容位移
+        this.applyZoom((sel) => sel.call(this.zoomBehavior().translateBy, dx / k, dy / k, null));
+      }
+    });
+  }
+
+  /**
+   * 把 svg 的 d3 selection 与 zoom 行为一起拿出来用。
+   *
+   * 这里不 import d3：transform 的玩法（`zoom.scaleBy` / `zoom.translateBy`）
+   * 由 markmap 实例提供，我们只负责算「该缩多少、该移多少」。类型上用最小形状，
+   * 因为 d3 的类型包没装，markmap 那边只能退化成 any。
+   */
+  private zoomBehavior(): any {
+    return this.mm?.zoom;
+  }
+
+  private applyZoom(op: (sel: { call: (fn: unknown, ...args: unknown[]) => void }) => void): void {
+    const mm = this.mm;
+    if (!mm) return;
+    op(mm.svg as unknown as { call: (fn: unknown, ...args: unknown[]) => void });
+  }
+
+  /** 指针在 svg 用户坐标系里的位置（d3 的 pointer 算法，兼容 viewBox 与 CSS 缩放） */
+  private pointerInSvg(e: { clientX: number; clientY: number }): [number, number] {
+    const svg = this.svgEl;
+    if (!svg) return [0, 0];
+    try {
+      const p = svg.createSVGPoint();
+      p.x = e.clientX;
+      p.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (ctm) {
+        const q = p.matrixTransform(ctm.inverse());
+        return [q.x, q.y];
+      }
+    } catch {
+      // 极老的实现没有 createSVGPoint，退回矩形换算
+    }
+    const r: DOMRect = svg.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+
+  /** 视口中心（svg 用户坐标），给没有指针位置的缩放当锚点 */
+  private svgCenter(): [number, number] {
+    const svg = this.svgEl;
+    if (!svg) return [0, 0];
+    const r: DOMRect = svg.getBoundingClientRect();
+    return this.pointerInSvg({ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 });
+  }
+
+  /** 以画布中心为锚点缩放（键盘缩放走这条） */
+  private zoomBy(factor: number): void {
+    this.wheelZoom *= factor;
+    this.wheelAt = null;
+    this.userView = true;
+    this.flushWheelSoon();
   }
 
   private nextFrame(): Promise<void> {
@@ -3822,6 +3970,16 @@ export class MindmapView extends ItemView {
         return;
       case "paste":
         void this.pasteIntoSelected();
+        return;
+      // 一档 ≈ 1.2 倍：和鼠标滚轮一格的幅度接近，连按几下不会一下冲出可视区
+      case "zoomIn":
+        this.zoomBy(1.2);
+        return;
+      case "zoomOut":
+        this.zoomBy(1 / 1.2);
+        return;
+      case "zoomFit":
+        this.fitView();
         return;
     }
   }

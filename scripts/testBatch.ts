@@ -14,6 +14,8 @@ import { nodeBarPosition } from "../src/ui/nodeBarPosition";
 import { PASTE_MAX_NODES } from "../src/edit/paste";
 import { ACTIONS, keyOf, matchAction } from "../src/app/actions";
 import type { ActionState, KeyLike } from "../src/app/actions";
+import { looksLikeNotch, toPixels, WheelGesture } from "../src/render/wheel";
+import type { WheelEventLike } from "../src/render/wheel";
 import { formatStats, treeStats } from "../src/domain/stats";
 import {
   firstChildRef,
@@ -1223,6 +1225,108 @@ console.log("\n=== T29: 动作表（键位 / 相位 / 块 的判定都在纯函�
     }
   }
   assert(dup.length === 0, `同一层的键位不重复${dup.length ? "：" + dup.join(", ") : ""}`);
+
+  // 缩放键：按物理键位归一（Shift+= 送来的是 "+"，小键盘是 Add）
+  const eq = (key: string, mods: Partial<KeyLike> = {}): KeyLike => k(key, { code: "Equal", ...mods });
+  const minus = (key: string, mods: Partial<KeyLike> = {}): KeyLike => k(key, { code: "Minus", ...mods });
+  assert(matchAction(eq("=", { ctrlKey: true }), "canvas", base) === "zoomIn", "Ctrl+= 放大");
+  assert(matchAction(eq("+", { ctrlKey: true, shiftKey: true }), "canvas", base) === "zoomIn", "Ctrl+Shift+= 也放大（键位相同）");
+  assert(matchAction(minus("-", { ctrlKey: true }), "canvas", base) === "zoomOut", "Ctrl+- 缩小");
+  assert(matchAction(k("0", { ctrlKey: true, code: "Digit0" }), "canvas", base) === "zoomFit", "Ctrl+0 归位");
+  assert(
+    matchAction(eq("=", { ctrlKey: true }), "canvas", { ...base, primary: -1 }) === "zoomIn",
+    "没选中节点也能缩放（纯视口操作）",
+  );
+  assert(
+    matchAction(eq("=", { ctrlKey: true }), "canvas", { ...base, phase: "editing" }) === null,
+    "编辑中不抢 Ctrl+=（那是输入框 / Obsidian 的缩放）",
+  );
+}
+
+console.log("\n=== T30: 滚轮 / 触摸板的语义判定（render/wheel.ts） ===");
+{
+  const wheel = (
+    dx: number,
+    dy: number,
+    extra: Partial<WheelEventLike> = {},
+  ): WheelEventLike => ({
+    deltaX: dx,
+    deltaY: dy,
+    deltaMode: 0,
+    ctrlKey: false,
+    shiftKey: false,
+    timeStamp: 1000,
+    ...extra,
+  });
+
+  // 1. 鼠标一格一格：缩放（方向和 d3 一致，向下滚 = 缩小）
+  const mouse = new WheelGesture();
+  const inA = mouse.classify(wheel(0, -100), 800);
+  assert(inA?.kind === "zoom" && inA.factor > 1, `鼠标上滚 = 放大：${JSON.stringify(inA)}`);
+  const outA = mouse.classify(wheel(0, 100, { timeStamp: 1040 }), 800);
+  assert(outA?.kind === "zoom" && outA.factor < 1, `鼠标下滚 = 缩小：${JSON.stringify(outA)}`);
+  assert(mouse.current === "zoom", "手势结论被记住");
+
+  // 2. 触摸板：零碎的值 → 平移，位移和 delta 反号（内容跟着手指走）
+  const pad = new WheelGesture();
+  const p1 = pad.classify(wheel(0, 7), 800);
+  assert(p1?.kind === "pan" && p1.dy === -7, `触摸板下划 = 内容上移：${JSON.stringify(p1)}`);
+  assert(pad.current === "pan", "判成触摸板");
+
+  // 3. 横向分量是触摸板的强信号
+  const p2 = pad.classify(wheel(3, -5, { timeStamp: 1020 }), 800);
+  assert(p2?.kind === "pan" && p2.dx === -3 && p2.dy === 5, `横向也平移：${JSON.stringify(p2)}`);
+
+  // 4. 手势内「zoom → pan」单向改判：触摸板的第一格可能正好是 100
+  const mixed = new WheelGesture();
+  assert(mixed.classify(wheel(0, 100), 800)?.kind === "zoom", "第一格像鼠标 → 先按缩放");
+  assert(mixed.classify(wheel(0, 9, { timeStamp: 1030 }), 800)?.kind === "pan", "第二格不像鼠标 → 整个手势改判平移");
+  assert(mixed.current === "pan", "改判是单向的");
+
+  // 5. 捏合 / Ctrl+滚轮：哪怕 delta 很小也要缩放
+  const pinch = new WheelGesture();
+  const z = pinch.classify(wheel(0, 4, { ctrlKey: true }), 800);
+  assert(z?.kind === "zoom" && z.factor < 1, `捏合缩放：${JSON.stringify(z)}`);
+  assert(pinch.classify(wheel(0, 4, { ctrlKey: true, timeStamp: 1016 }), 800)?.kind === "zoom", "捏合整段都要缩放");
+
+  // 6. Shift+滚轮 = 横向平移（浏览器的通用语义）
+  const shift = new WheelGesture();
+  const s1 = shift.classify(wheel(0, 100, { shiftKey: true }), 800);
+  assert(s1?.kind === "pan" && s1.dx === -100 && s1.dy === 0, `Shift+滚轮横移：${JSON.stringify(s1)}`);
+
+  // 7. deltaMode 换算：行模式 ×16，页模式按视口高度
+  assert(toPixels(3, 1, 800) === 48, "3 行 = 48px");
+  assert(toPixels(1, 2, 800) === 720, "1 页 = 视口 90%");
+  assert(toPixels(42, 0, 800) === 42, "像素模式原样");
+  const lines = new WheelGesture();
+  assert(lines.classify(wheel(0, 3, { deltaMode: 1 }), 800)?.kind === "zoom", "行模式是老式滚轮 → 缩放");
+
+  // 8. 单次事件的倍率夹紧
+  const clamp = new WheelGesture();
+  const huge = clamp.classify(wheel(0, 100000), 800);
+  assert(huge?.kind === "zoom" && huge.factor === 0.5, `巨大的 delta 不能把图甩飞：${JSON.stringify(huge)}`);
+
+  // 9. 空位移不拦（有些设备会发 delta 全 0 的占位事件）
+  assert(new WheelGesture().classify(wheel(0, 0), 800) === null, "没有位移就不接");
+
+  // 10. 新手势重新判定：隔久了再来一格鼠标滚轮要恢复缩放
+  const again = new WheelGesture();
+  again.classify(wheel(0, 7), 800);
+  assert(again.classify(wheel(0, -100, { timeStamp: 1600 }), 800)?.kind === "zoom", "隔了 600ms 算新手势");
+
+  // 11. reset 清掉结论
+  const rs = new WheelGesture();
+  rs.classify(wheel(0, 7), 800);
+  rs.reset();
+  assert(rs.current === null, "reset 后没有结论");
+
+  // 12. 形状判定本身
+  assert(looksLikeNotch(0, 100, 0), "100 是标准一格");
+  assert(looksLikeNotch(0, 120, 0), "120 也是（旧驱动）");
+  assert(!looksLikeNotch(0, 53, 0), "53 不是整格 → 触摸板");
+  assert(!looksLikeNotch(0, 7, 0), "7 更不是");
+  assert(!looksLikeNotch(3, 100, 0), "带横向分量 → 触摸板");
+  assert(looksLikeNotch(0, 1, 1), "行模式一定是鼠标");
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

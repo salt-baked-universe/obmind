@@ -438,6 +438,10 @@
      工具条和它浮出的面板（.obmind-header 是 100）始终在上层 */
   z-index: 0;
   transition: background-color 0.18s ease;
+  /* 触摸板惯性滚动到边界时不要「传」给外面的笔记区：
+     我们的 wheel 监听已经 preventDefault，这一条是兜底（有些合成事件
+     在 preventDefault 之前就被滚动容器吃掉了） */
+  overscroll-behavior: contain;
 }
 
 .obmind-canvas .markmap {

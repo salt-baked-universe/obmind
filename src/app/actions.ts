@@ -36,7 +36,17 @@ export type ActionId =
   | "navRight"
   | "newNote"
   /** 把剪贴板内容粘成选中节点的子节点（XMind 手感） */
-  | "paste";
+  | "paste"
+  /**
+   * 缩放与归位。
+   *
+   * 为什么要有键盘路径：触摸板的「捏合」在 Chromium 里是 `ctrlKey` 的 wheel，
+   * 但 Windows 的精密触摸板驱动不一定合成它（Electron 尤其飘）。没有这组键，
+   * 一个只用触摸板的人就没有任何缩放手段 —— 滚轮已经被判成平移了。
+   */
+  | "zoomIn"
+  | "zoomOut"
+  | "zoomFit";
 
 /**
  * 动作能挂在哪个监听层。
@@ -122,6 +132,17 @@ export const ACTIONS: readonly ActionDef[] = [
    * 用户想要的文字（XMind 里粘贴完就是成品主题，再弹一个全选的输入框只会挡路）。
    */
   { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable },
+
+  /**
+   * 缩放与归位。三个键位都按**物理键位**注册：Shift+= 送来的 key 是 `+`、
+   * Shift+- 是 `_`，但用户按的是同一个键，不该因为按住 Shift 就变成另一个动作
+   * （见 keyOf 里按 `code` 归一化那一段）。所以 `mod+=` 与 `mod+shift+=` 都要列。
+   *
+   * 不挂在 `when: pick` 上：没选中节点也该能缩放，这是纯视口操作。
+   */
+  { id: "zoomIn", keys: ["mod+=", "mod+shift+="], scopes: ["canvas", "view"] },
+  { id: "zoomOut", keys: ["mod+-", "mod+shift+-"], scopes: ["canvas", "view"] },
+  { id: "zoomFit", keys: ["mod+0"], scopes: ["canvas", "view"] },
 ];
 
 /** `keyOf` 只用到这几个字段，用最小结构类型是为了用例能直接构造事件对象 */
@@ -155,6 +176,14 @@ export function keyOf(e: KeyLike): string {
   else if (key === "ArrowDown") key = "down";
   else if (key === "ArrowLeft") key = "left";
   else if (key === "ArrowRight") key = "right";
+  // 等号 / 减号 / 零按**物理键位**归一：Shift+= 送来的 key 是 `"+"`、Shift+- 是
+  // `"_"`，小键盘是 `"Add"` / `"Subtract"` / 布局差异更大。缩放键只关心「按了哪个
+  // 位置」，不然同一件事要在表里写三四个键位字符串，而 shift 状态已经在前缀里了。
+  else if (e.code === "Equal") key = "=";
+  else if (e.code === "Minus") key = "-";
+  else if (e.code === "NumpadAdd") key = "=";
+  else if (e.code === "NumpadSubtract") key = "-";
+  else if (e.code === "Digit0" || e.code === "Numpad0") key = "0";
   else key = key.toLowerCase();
 
   parts.push(key);
