@@ -98,7 +98,9 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 - 授权 **GPL-3.0-or-later**（二开必须同样开源）。`LICENSE` 用 gnu.org 全文；`src/main.ts` 顶部三段式；**`esbuild.config.mjs` banner 必须带 GPL 声明 + 第三方版权**（markmap MIT / d3 ISC / @babel/runtime MIT）—— 上架后用户只拿得到 `main.js`。
 - 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。目录读默认分支 HEAD 的 manifest，安装取 Release 的 `main.js`/`manifest.json`/`styles.css`，tag 严格等于版本号（无 `v`）。
 - **GitHub 账号 `salt-baked-universe`**（`manifest.authorUrl` 已填）。`origin` = `https://github.com/salt-baked-universe/obmind.git`，但**仓库在 GitHub 上还没建**（该账号 0 个公开仓库）。本地 `git push` 会卡在 Git Credential Manager 的 GUI 授权框（`credential.helper=helper-selector`，非交互环境 90s 超时），**推送必须用户自己在终端/VS Code 做**。
-- **id = `obmind-map`，显示名 `obmind mindmap`**。原来的 `obmind` 已被 **MindBraid**（`soren-ac`，做同样的事）占用，提交时报 `An entry with this ID already exists`。id 发布后永久不可改；插件目录名必须等于 id（测试库已 mv 成 `plugins/obmind-map`）。
+- **id = `obmind-map`，显示名 `Outline mindmap`**（原名 `obmind mindmap` 被目录判「含 Obsidian 名称片段」—— 与 "Obsidian" 共享前缀 `ob`；id 那关不查这个）。id 发布后永久不可改；插件目录名必须等于 id（测试库在 `plugins/obmind-map`）。
+- **提交前先跑官方 lint**：`npx eslint src`（`eslint-plugin-obsidianmd` + `eslint.config.mjs` 吃 `recommended`），**0 error 是底线**。规则细节与 1.18.20 的全部修法见当日日志。
+- 两条硬约束（踩过的）：`obsidianmd/rule-custom-message` **不许 eslint-disable**（console 只能真删，探针输出改 `Notice`）；静态样式一律走 `src/render/domStyle.ts`，HTML 落地一律走 `src/render/html.ts` 的 `setRenderedHtml`（DOMParser，不用 sanitizeHTMLToDom，会洗掉公式样式）。
 - **仓库已建并推送**：`salt-baked-universe/obmind`（public）。`origin` 已配好。**本地能提交，但推不上去** —— 非 tty 环境拿不到 GCM 登录态（`could not read Username ... terminal prompts disabled`），push 与建 release 由用户在 VS Code / 自己终端完成。
 - **Release 资产的 manifest 会随版本固化**：只改仓库里的 id 不够，旧 release 里的 `manifest.json` 还带老 id，必须 bump 版本 + 重发资产。
 - 发布附件备在 `tmp/release-<版本>/`（三个文件 + `release-notes.md`），`tmp/` 已 ignore。
