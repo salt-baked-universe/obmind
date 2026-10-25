@@ -6780,11 +6780,14 @@ async function waitStableSize(opts) {
 }
 
 // src/render/wheel.ts
-var NOTCH_PX = 100;
+var WHEEL_MIN_PX = 28;
+var NOTCH_STEP = 0.2;
+var NOTCH_PX_MIN = 28;
+var NOTCH_PX_MAX = 400;
+var NOTCH_PX_FALLBACK = 100;
 var LINE_PX = 16;
 var PAGE_RATIO = 0.9;
 var GESTURE_GAP = 260;
-var NOTCH_GAIN = 2e-3;
 var PINCH_GAIN = 0.02;
 var FACTOR_MIN = 0.5;
 var FACTOR_MAX = 2;
@@ -6795,29 +6798,32 @@ function toPixels(delta, mode, viewport) {
     return delta * viewport * PAGE_RATIO;
   return delta;
 }
-function looksLikeNotch(dx, dy, mode) {
+function looksLikeWheel(dx, dy, mode) {
   if (mode !== 0)
     return true;
-  const onGrid = (v2) => {
-    const a = Math.abs(v2);
-    if (a === 0)
-      return true;
-    if (a < 50)
-      return false;
-    if (Math.round(a) !== a)
-      return false;
-    return a % NOTCH_PX === 0 || a % 120 === 0;
-  };
-  return onGrid(dx) && onGrid(dy);
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (!Number.isFinite(ay))
+    return false;
+  if (Math.abs(ay - Math.round(ay)) > 0.05)
+    return false;
+  if (ay < WHEEL_MIN_PX)
+    return false;
+  if (ax > 0.51)
+    return false;
+  return true;
 }
 var WheelGesture = class {
   constructor() {
     this.mode = null;
     this.last = -Infinity;
+    /** 本次手势观测到的「一格」像素；缩放倍率按它折算，所以 40px/格 和 120px/格 手感一致 */
+    this.notchPx = 0;
   }
   reset() {
     this.mode = null;
     this.last = -Infinity;
+    this.notchPx = 0;
   }
   /** 当前手势被判成了什么（null = 还没有手势） */
   get current() {
@@ -6845,16 +6851,24 @@ var WheelGesture = class {
       return { kind: "pan", dx: -d, dy: 0 };
     }
     const fresh = this.mode === null || e.timeStamp - this.last > GESTURE_GAP;
-    const notch = looksLikeNotch(dx, dy, e.deltaMode);
-    if (fresh || this.mode === "zoom" && !notch)
-      this.mode = notch ? "zoom" : "pan";
+    const wheel = looksLikeWheel(dx, dy, e.deltaMode);
+    if (fresh || this.mode === "zoom" && !wheel) {
+      this.mode = wheel ? "zoom" : "pan";
+      this.notchPx = wheel ? clampNotchPx(Math.abs(dy)) : 0;
+    }
     this.last = e.timeStamp;
     if (this.mode === "zoom") {
-      return { kind: "zoom", factor: clampFactor(Math.pow(2, -dy * NOTCH_GAIN)) };
+      const step = this.notchPx > 0 ? this.notchPx : NOTCH_PX_FALLBACK;
+      return { kind: "zoom", factor: clampFactor(Math.pow(2, -dy / step * NOTCH_STEP)) };
     }
     return { kind: "pan", dx: -dx, dy: -dy };
   }
 };
+function clampNotchPx(v2) {
+  if (!Number.isFinite(v2) || v2 <= 0)
+    return NOTCH_PX_FALLBACK;
+  return Math.min(NOTCH_PX_MAX, Math.max(NOTCH_PX_MIN, v2));
+}
 function clampFactor(f) {
   if (!Number.isFinite(f))
     return 1;
