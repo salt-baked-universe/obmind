@@ -6780,9 +6780,30 @@ async function waitStableSize(opts) {
 }
 
 // src/render/wheel.ts
-var WHEEL_MIN_PX = 28;
+var WHEEL_PIN_OPTIONS = [
+  {
+    value: "auto",
+    label: "\u81EA\u52A8\uFF08\u6309\u8BBE\u5907\u5224\u65AD\uFF09",
+    desc: "\u9F20\u6807\u6EDA\u8F6E\u7F29\u653E\u3001\u89E6\u6478\u677F\u53CC\u6307\u5E73\u79FB\u3002\u6309\u4E8B\u4EF6\u5F62\u72B6\u731C\uFF0C\u8986\u76D6\u7EDD\u5927\u591A\u6570\u8BBE\u5907\uFF1B\u5224\u9519\u5C31\u9009\u4E0B\u9762\u4E24\u6863\u3002"
+  },
+  {
+    value: "zoom",
+    label: "\u59CB\u7EC8\u7F29\u653E",
+    desc: "\u6EDA\u8F6E\u6C38\u8FDC\u7F29\u653E\uFF0C\u4E0D\u5224\u65AD\u8BBE\u5907\u3002\u53EA\u7528\u9F20\u6807\u65F6\u6700\u7701\u5FC3\u3002"
+  },
+  {
+    value: "pan",
+    label: "\u59CB\u7EC8\u5E73\u79FB",
+    desc: "\u6EDA\u8F6E\u6C38\u8FDC\u5E73\u79FB\uFF0C\u4E0D\u5224\u65AD\u8BBE\u5907\u3002\u53EA\u7528\u89E6\u6478\u677F\u3001\u53C8\u4E60\u60EF Ctrl+\u6EDA\u8F6E\u7F29\u653E\u65F6\u9009\u8FD9\u4E2A\u3002"
+  }
+];
+function normalizeWheelPin(v2) {
+  return v2 === "zoom" || v2 === "pan" ? v2 : "auto";
+}
+var WHEEL_MIN_PX = 16;
 var NOTCH_STEP = 0.2;
-var NOTCH_PX_MIN = 28;
+var MULTIPLE_TOL = 0.03;
+var NOTCH_PX_MIN = WHEEL_MIN_PX;
 var NOTCH_PX_MAX = 400;
 var NOTCH_PX_FALLBACK = 100;
 var LINE_PX = 16;
@@ -6805,8 +6826,6 @@ function looksLikeWheel(dx, dy, mode) {
   const ay = Math.abs(dy);
   if (!Number.isFinite(ay))
     return false;
-  if (Math.abs(ay - Math.round(ay)) > 0.05)
-    return false;
   if (ay < WHEEL_MIN_PX)
     return false;
   if (ax > 0.51)
@@ -6819,6 +6838,12 @@ var WheelGesture = class {
     this.last = -Infinity;
     /** 本次手势观测到的「一格」像素；缩放倍率按它折算，所以 40px/格 和 120px/格 手感一致 */
     this.notchPx = 0;
+    /** 用户在设置里钉死的语义；`"auto"` = 靠形状猜 */
+    this.pin = "auto";
+  }
+  /** 设置面板改动后调一次。不重置手势：用户改完设置会立刻滚，不该丢掉当前这一格 */
+  setPin(pin) {
+    this.pin = pin;
   }
   reset() {
     this.mode = null;
@@ -6851,10 +6876,32 @@ var WheelGesture = class {
       return { kind: "pan", dx: -d, dy: 0 };
     }
     const fresh = this.mode === null || e.timeStamp - this.last > GESTURE_GAP;
+    const ay = Math.abs(dy);
+    if (this.pin !== "auto") {
+      this.mode = this.pin;
+      this.last = e.timeStamp;
+      if (this.pin === "pan")
+        return { kind: "pan", dx: -dx, dy: -dy };
+      if (fresh || this.notchPx <= 0)
+        this.notchPx = clampNotchPx(ay);
+      return {
+        kind: "zoom",
+        factor: clampFactor(Math.pow(2, -dy / this.notchPx * NOTCH_STEP))
+      };
+    }
     const wheel = looksLikeWheel(dx, dy, e.deltaMode);
-    if (fresh || this.mode === "zoom" && !wheel) {
+    let steady = false;
+    if (!fresh && this.mode === "zoom" && this.notchPx > 0) {
+      const ratio = ay / this.notchPx;
+      const n = Math.round(ratio);
+      steady = n >= 1 && Math.abs(ratio - n) <= MULTIPLE_TOL;
+    }
+    if (fresh) {
       this.mode = wheel ? "zoom" : "pan";
-      this.notchPx = wheel ? clampNotchPx(Math.abs(dy)) : 0;
+      this.notchPx = wheel ? clampNotchPx(ay) : 0;
+    } else if (this.mode === "zoom" && !steady) {
+      this.mode = "pan";
+      this.notchPx = 0;
     }
     this.last = e.timeStamp;
     if (this.mode === "zoom") {
@@ -9864,10 +9911,11 @@ var HELP_ROWS = [
   ["Delete", "\u5220\u9664\u8282\u70B9\u53CA\u5176\u5168\u90E8\u5B50\u8282\u70B9\uFF08\u53EA\u5728\u6CA1\u5728\u7F16\u8F91\u65F6\u751F\u6548\uFF09"],
   ["\u62D6\u52A8\u8282\u70B9", "\u6309\u4F4F\u5DE6\u952E\u62D6\u5230\u522B\u7684\u5361\u7247\u4E0A\u6539\u53D8\u7236\u5B50\u5173\u7CFB"],
   ["\u9F20\u6807\u6EDA\u8F6E", "\u4EE5\u6307\u9488\u4E3A\u4E2D\u5FC3\u7F29\u653E\uFF08\u4E00\u683C\u4E00\u683C\u7684\u6EDA\u6CD5\uFF09"],
-  ["\u89E6\u6478\u677F\u53CC\u6307", "\u5E73\u79FB\u753B\u5E03\uFF1A\u56FE\u8DDF\u7740\u624B\u6307\u8D70\uFF08\u8FDE\u7EED\u3001\u5E26\u6A2A\u5411\u5206\u91CF\u7684\u4E00\u5F8B\u6309\u5E73\u79FB\u7B97\uFF09"],
+  ["\u89E6\u6478\u677F\u53CC\u6307", "\u5E73\u79FB\u753B\u5E03\uFF1A\u56FE\u8DDF\u7740\u624B\u6307\u8D70\uFF08\u8FDE\u7EED\u53D8\u5316\u3001\u5E26\u6A2A\u5411\u5206\u91CF\u7684\u4E00\u5F8B\u6309\u5E73\u79FB\u7B97\uFF09"],
   ["\u89E6\u6478\u677F\u634F\u5408", "\u7F29\u653E\uFF1B\u9A71\u52A8\u6CA1\u5408\u6210\u634F\u5408\u5C31\u7528 Ctrl+\u6EDA\u8F6E"],
   ["Ctrl/\u2318 + = / - / 0", "\u653E\u5927 / \u7F29\u5C0F / \u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3"],
   ["\u53F3\u952E\u62D6\u52A8 / Shift+\u6EDA\u8F6E", "\u5E73\u79FB\u753B\u5E03\uFF08\u89E6\u6478\u677F\uFF1A\u53CC\u6307\u6309\u4E0B\u518D\u62D6\uFF09"],
+  ["\u6EDA\u8F6E\u5224\u9519\u4E86", "\u8BBE\u7F6E \u2192 obmind \u2192\u300C\u6EDA\u8F6E\u64CD\u4F5C\u300D\u53EF\u9489\u6210\u300C\u59CB\u7EC8\u7F29\u653E / \u59CB\u7EC8\u5E73\u79FB\u300D\uFF0C\u4E0D\u518D\u9760\u5224\u65AD\u8BBE\u5907"],
   ["Ctrl/\u2318+\u5355\u51FB", "\u52A0\u9009 / \u51CF\u9009\uFF08\u70B9\u5728\u5DF2\u9009\u8282\u70B9\u4E0A\u5C31\u628A\u5B83\u53BB\u6389\uFF09"],
   ["Shift+\u5355\u51FB", "\u9009\u4E2D\u540C\u7EA7\u533A\u95F4\uFF1A\u5148\u70B9\u9996\uFF0C\u518D Shift \u70B9\u5C3E"],
   ["Alt+\u5355\u51FB", "\u6309\u8282\u70B9\u6587\u5B57\u6253\u5F00\u540C\u540D\u7B14\u8BB0"],
@@ -11521,6 +11569,7 @@ var MindmapView = class extends import_obsidian4.ItemView {
     var _a;
     if (!this.mm)
       return;
+    this.wheelGesture.setPin(normalizeWheelPin(this.plugin.settings.wheelMode));
     const viewport = ((_a = this.canvasEl) == null ? void 0 : _a.clientHeight) || window.innerHeight;
     const intent = this.wheelGesture.classify(e, viewport);
     if (!intent)
@@ -13617,7 +13666,8 @@ var DEFAULT_SETTINGS = {
   filterFrontmatter: true,
   navSync: DEFAULT_NAV_SYNC,
   noteTemplate: "",
-  syncNoteLine: true
+  syncNoteLine: true,
+  wheelMode: "auto"
 };
 var ObmindSettingTab = class extends import_obsidian5.PluginSettingTab {
   constructor(app, plugin) {
@@ -13641,6 +13691,24 @@ var ObmindSettingTab = class extends import_obsidian5.PluginSettingTab {
       toggle.setValue(this.plugin.settings.syncNoteLine);
       toggle.onChange(async (value) => {
         this.plugin.settings.syncNoteLine = value;
+        await this.plugin.saveSettings();
+      });
+    });
+    const wheelHint = containerEl.createDiv({ cls: "setting-item-description obmind-nav-hint" });
+    const paintWheelHint = (mode) => {
+      const hit = WHEEL_PIN_OPTIONS.find((o) => o.value === mode);
+      wheelHint.setText(hit ? hit.desc : "");
+    };
+    new import_obsidian5.Setting(containerEl).setName("\u6EDA\u8F6E\u64CD\u4F5C").setDesc("\u5BFC\u56FE\u91CC\u6EDA\u8F6E / \u89E6\u6478\u677F\u53CC\u6307\u6ED1\u52A8\u505A\u4EC0\u4E48\u3002Ctrl+\u6EDA\u8F6E\u4E0E\u634F\u5408\u59CB\u7EC8\u662F\u7F29\u653E\u3002").addDropdown((dd) => {
+      for (const opt of WHEEL_PIN_OPTIONS)
+        dd.addOption(opt.value, opt.label);
+      const current = normalizeWheelPin(this.plugin.settings.wheelMode);
+      dd.setValue(current);
+      paintWheelHint(current);
+      dd.onChange(async (value) => {
+        const mode = normalizeWheelPin(value);
+        this.plugin.settings.wheelMode = mode;
+        paintWheelHint(mode);
         await this.plugin.saveSettings();
       });
     });

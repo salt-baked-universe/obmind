@@ -1,7 +1,7 @@
 {
   "id": "obmind",
   "name": "obmind",
-  "version": "1.18.17",
+  "version": "1.18.18",
   "minAppVersion": "1.4.0",
   "description": "Turn the current note's headings and indentation into an interactive, XMind-style mindmap that edits the note back.",
   "author": "郭源潮",

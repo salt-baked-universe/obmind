@@ -3,6 +3,8 @@ import type MindmapPlugin from "./main";
 import type { MindmapTheme } from "./theme";
 import { DEFAULT_NAV_SYNC, NAV_SYNC_OPTIONS, normalizeNavSync } from "./app/NavPolicy";
 import type { NavSyncMode, NavSyncOption } from "./app/NavPolicy";
+import { WHEEL_PIN_OPTIONS, normalizeWheelPin } from "./render/wheel";
+import type { WheelPinMode } from "./render/wheel";
 
 export type { MindmapTheme };
 export { THEME_OPTIONS } from "./theme";
@@ -21,6 +23,13 @@ export interface ObmindSettings {
   noteTemplate: string;
   /** 选中节点时，把左侧同一篇笔记的光标 / 滚动位置跟到对应行 */
   syncNoteLine: boolean;
+  /**
+   * 滚轮语义：自动判断设备 / 永远缩放 / 永远平移。
+   *
+   * `deltaY` 由「系统滚动行数 × 显示缩放 ÷ 驱动」共同决定，没法穷举 ——
+   * 自动档覆盖大多数设备，判错时用户可以在这里钉死。
+   */
+  wheelMode: WheelPinMode;
 }
 
 export const DEFAULT_SETTINGS: ObmindSettings = {
@@ -29,6 +38,7 @@ export const DEFAULT_SETTINGS: ObmindSettings = {
   navSync: DEFAULT_NAV_SYNC,
   noteTemplate: "",
   syncNoteLine: true,
+  wheelMode: "auto",
 };
 
 export class ObmindSettingTab extends PluginSettingTab {
@@ -66,6 +76,31 @@ export class ObmindSettingTab extends PluginSettingTab {
         toggle.onChange(async (value) => {
           this.plugin.settings.syncNoteLine = value;
           await this.plugin.saveSettings();
+        });
+      });
+
+    // 滚轮语义：三档，默认自动判设备。判错时用户能一键钉死 ——
+    // 因为 deltaY 由「系统滚动行数 × 显示缩放 ÷ 驱动」决定，穷举不了。
+    const wheelHint = containerEl.createDiv({ cls: "setting-item-description obmind-nav-hint" });
+    const paintWheelHint = (mode: WheelPinMode): void => {
+      const hit = WHEEL_PIN_OPTIONS.find((o) => o.value === mode);
+      wheelHint.setText(hit ? hit.desc : "");
+    };
+
+    new Setting(containerEl)
+      .setName("滚轮操作")
+      .setDesc("导图里滚轮 / 触摸板双指滑动做什么。Ctrl+滚轮与捏合始终是缩放。")
+      .addDropdown((dd) => {
+        for (const opt of WHEEL_PIN_OPTIONS) dd.addOption(opt.value, opt.label);
+        const current: WheelPinMode = normalizeWheelPin(this.plugin.settings.wheelMode);
+        dd.setValue(current);
+        paintWheelHint(current);
+        dd.onChange(async (value: string) => {
+          const mode: WheelPinMode = normalizeWheelPin(value);
+          this.plugin.settings.wheelMode = mode;
+          paintWheelHint(mode);
+          await this.plugin.saveSettings();
+          // 不刷新导图：下一次滚轮就会读到新值
         });
       });
 

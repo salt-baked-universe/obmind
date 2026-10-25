@@ -14,7 +14,7 @@ import { nodeBarPosition } from "../src/ui/nodeBarPosition";
 import { PASTE_MAX_NODES } from "../src/edit/paste";
 import { ACTIONS, keyOf, matchAction } from "../src/app/actions";
 import type { ActionState, KeyLike } from "../src/app/actions";
-import { looksLikeWheel, toPixels, WheelGesture } from "../src/render/wheel";
+import { looksLikeWheel, normalizeWheelPin, toPixels, WheelGesture } from "../src/render/wheel";
 import type { WheelEventLike } from "../src/render/wheel";
 import { formatStats, treeStats } from "../src/domain/stats";
 import {
@@ -1288,23 +1288,55 @@ console.log("\n=== T30: 滚轮 / 触摸板的语义判定（render/wheel.ts） =
     `200px/格 也只是一格：${JSON.stringify(big)}`,
   );
 
-  // 3. 触摸板：零碎的值 → 平移，位移和 delta 反号（内容跟着手指走）
-  for (const px of [1, 3, 7, 13, 21]) {
+  // 3. 触摸板：小位移 → 平移，位移和 delta 反号（内容跟着手指走）
+  for (const px of [1, 3, 7, 11, 13]) {
     const pad = new WheelGesture();
     const p1 = pad.classify(wheel(0, px), 800);
     assert(p1?.kind === "pan" && p1.dy === -px, `触摸板 ${px}px 下划 = 内容上移：${JSON.stringify(p1)}`);
     assert(pad.current === "pan", "判成触摸板");
   }
 
+  // 3b. 快滑的第一格会够大（21px），先按鼠标缩放；第二格值一变就改判平移。
+  //     这是刻意的取舍：宁可偶发一格缩放，也不让滚轮整体失效。
+  const flick = new WheelGesture();
+  flick.classify(wheel(0, 21), 800);
+  assert(
+    flick.classify(wheel(0, 18, { timeStamp: 1016 }), 800)?.kind === "pan",
+    "快滑第二格不是整数倍 → 改判平移",
+  );
+
   // 4. 横向分量是触摸板的强信号（哪怕纵向值够大）
   const pad2 = new WheelGesture();
   const p2 = pad2.classify(wheel(3, -60, { timeStamp: 1020 }), 800);
   assert(p2?.kind === "pan" && p2.dx === -3 && p2.dy === 60, `横向也平移：${JSON.stringify(p2)}`);
 
-  // 5. 小数 = 连续设备
-  const pad3 = new WheelGesture();
-  const p3 = pad3.classify(wheel(0, -37.5), 800);
-  assert(p3?.kind === "pan", `非整数位移 → 触摸板：${JSON.stringify(p3)}`);
+  // 5. 回归 1.18.17 的 bug：150% 显示缩放下鼠标一格 = 100 / 1.5 = 66.666…
+  //    早先「整数」被当成鼠标的判据，于是这台机器的滚轮又被判成触摸板。
+  // 单独的第一次事件永远只能算「一格」—— 没有历史就不知道基准是多少。
+  // 「一次事件滚了两格」只能按手势内的第二格识别（见下面的 smooth）。
+  for (const px of [66.66666666666667, 50, 33.333333333333336, 26.666666666666668]) {
+    const g = new WheelGesture();
+    const r = g.classify(wheel(0, -px), 800);
+    assert(r?.kind === "zoom", `150% 缩放的一格 ${px}px 必须缩放：${JSON.stringify(r)}`);
+    assert(
+      Math.abs((r as { factor: number }).factor - Math.pow(2, 0.2)) < 1e-9,
+      `${px}px = 一格 = 1.149：${JSON.stringify(r)}`,
+    );
+  }
+  // 连续两格 66.666 和 133.333 都在同一手势里，不能被判成「不是整数倍」
+  const smooth = new WheelGesture();
+  assert(smooth.classify(wheel(0, 66.66666666666667), 800)?.kind === "zoom", "第一格缩放");
+  assert(
+    smooth.classify(wheel(0, 66.66666666666667, { timeStamp: 1060 }), 800)?.kind === "zoom",
+    "第二格同值 → 仍是缩放",
+  );
+  const twoNotch = smooth.classify(wheel(0, 133.33333333333334, { timeStamp: 1120 }), 800);
+  assert(twoNotch?.kind === "zoom", "滚了两格（2 倍 delta）→ 仍是缩放");
+  assert(
+    // 向下滚 = 缩小，所以是 2^-0.4
+    Math.abs((twoNotch as { factor: number }).factor - Math.pow(2, -0.4)) < 1e-9,
+    `两格 = 2^-0.4：${JSON.stringify(twoNotch)}`,
+  );
 
   // 6. 手势内「zoom → pan」单向改判：触摸板的第一格可能又大又整
   const mixed = new WheelGesture();
@@ -1355,11 +1387,51 @@ console.log("\n=== T30: 滚轮 / 触摸板的语义判定（render/wheel.ts） =
     assert(looksLikeWheel(0, px, 0), `${px}px 是鼠标一格`);
     assert(looksLikeWheel(0, -px, 0), `${-px}px 也是（符号不影响）`);
   }
-  for (const px of [1, 3, 7, 13, 21]) assert(!looksLikeWheel(0, px, 0), `${px}px 更像触摸板`);
-  assert(!looksLikeWheel(0, 37.5, 0), "非整数 → 触摸板");
+  for (const px of [1, 3, 7, 11, 13]) assert(!looksLikeWheel(0, px, 0), `${px}px 更像触摸板`);
+  assert(looksLikeWheel(0, 37.5, 0), "小数不算触摸板（150% 缩放的鼠标就是小数）");
   assert(!looksLikeWheel(3, 100, 0), "带横向分量 → 触摸板");
   assert(looksLikeWheel(0, 1, 1), "行模式一定是鼠标");
   assert(looksLikeWheel(0, 1, 2), "页模式一定是鼠标");
+
+  // 15. 设置里钉死语义：不再猜设备。形状判据永远只能覆盖大多数机器，
+  //     这一档是「猜错了用户自己按一下」的出口。
+  const pz = new WheelGesture();
+  pz.setPin("zoom");
+  assert(pz.classify(wheel(0, 7), 800)?.kind === "zoom", "强制缩放：触摸板的小值也缩放");
+  assert(pz.classify(wheel(0, 3, { timeStamp: 1020 }), 800)?.kind === "zoom", "强制缩放不看形状");
+  const pz2 = new WheelGesture();
+  pz2.setPin("zoom");
+  const pzr = pz2.classify(wheel(0, -66.66666666666667), 800);
+  assert(
+    pzr?.kind === "zoom" &&
+      Math.abs((pzr as { factor: number }).factor - Math.pow(2, 0.2)) < 1e-9,
+    `强制缩放仍按格算（150% 缩放也是一格 1.149）：${JSON.stringify(pzr)}`,
+  );
+
+  const pp = new WheelGesture();
+  pp.setPin("pan");
+  const ppr = pp.classify(wheel(0, -100), 800);
+  assert(ppr?.kind === "pan" && ppr.dy === 100, `强制平移：鼠标一格也平移：${JSON.stringify(ppr)}`);
+  assert(new WheelGesture().classify(wheel(0, -100), 800)?.kind === "zoom", "auto 档不受影响");
+
+  // Ctrl / Shift 的优先级高于 pin：它们本身就是明确的意图
+  const pp2 = new WheelGesture();
+  pp2.setPin("pan");
+  assert(
+    pp2.classify(wheel(0, -4, { ctrlKey: true }), 800)?.kind === "zoom",
+    "强制平移下 Ctrl+滚轮仍然缩放",
+  );
+  const pp3 = new WheelGesture();
+  pp3.setPin("zoom");
+  const sh = pp3.classify(wheel(0, -100, { shiftKey: true }), 800);
+  assert(sh?.kind === "pan" && sh.dx === 100, `强制缩放下 Shift 仍然横移：${JSON.stringify(sh)}`);
+
+  // 设置里读回来的是任意字符串，必须收敛
+  assert(normalizeWheelPin("zoom") === "zoom", "认得 zoom");
+  assert(normalizeWheelPin("pan") === "pan", "认得 pan");
+  assert(normalizeWheelPin("auto") === "auto", "认得 auto");
+  assert(normalizeWheelPin(undefined) === "auto", "旧的设置文件（没有这个字段）→ auto");
+  assert(normalizeWheelPin("ZOOM") === "auto", "写错了就回 auto");
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

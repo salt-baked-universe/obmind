@@ -11,29 +11,70 @@
  * 判据没法问系统（Web 没有「当前输入设备」的 API，而且同一台机器上鼠标和
  * 触摸板是混着用的），只能看事件本身的形状。
  *
- * **这里踩过一个大坑（1.18.16 → 1.18.17）**：一开始把「鼠标一格」写成了
- * `|deltaY| === 100 或 120` —— 那是 Chromium 在 Windows 默认「一次滚 3 行」
- * 下的换算结果。可 Windows 的「每次滚动的行数」是用户可调的，Chromium 的公式是
- * `行数 × 40`：滚 1 行 = 40、滚 2 行 = 80、滚 4 行 = 160、滚 5 行 = 200。
- * 于是只要系统设置不是 3 行，鼠标滚轮就全被判成触摸板，**滚轮变成了上下平移**。
- * 结论：不能拿「格 = 100px」当公理，只能用量级 + 离散性判形状。
+ * **这里踩过两个坑，都是同一个教训：设备参数不能当公理。**
+ *
+ * 坑一（1.18.16）：把「鼠标一格」写成 `|deltaY| === 100 或 120` —— 那是 Chromium
+ * 在 Windows 默认「一次滚 3 行」下的换算结果。而「每次滚动的行数」是用户可调的，
+ * Chromium 的公式是 `行数 × 40`：滚 1 行 = 40、4 行 = 160。于是设置不是 3 行的机器上，
+ * 鼠标滚轮全被判成触摸板，**滚轮变成了上下平移**。
+ *
+ * 坑二（1.18.17）：改成「整数 = 鼠标」之后，150% 显示缩放的机器报 `66.666…`
+ * （= 100 ÷ 1.5，Chromium 把 CSS 像素按 deviceScaleFactor 除了一遍），
+ * 小数判据又把它判成触摸板，**滚轮还是平移**。
+ *
+ * 于是不再猜「一格是多少像素」，改用**手势内自证**：
+ * 鼠标的 delta 一定是首格的整数倍（一格 66.67 → 两格 133.33），
+ * 触摸板是连续变化的值（40 → 43 → 47），比值落不到整数上。
+ * 首格只判「有没有横向分量 / 是不是连续微动」，宁可先按鼠标处理（后面能自愈），
+ * 因为把鼠标判成触摸板的代价（滚轮彻底不能缩放）比反过来大得多。
  *
  * 三个可用信号：
  * 1. `deltaMode`：行 / 页模式只有传统鼠标驱动才会给；
- * 2. 量级与整数性：鼠标每格是几十到几百的整数，触摸板是 3、7、13 这种小值，
- *    而且常常带小数；
+ * 2. 量级：触摸板的单次位移通常只有个位数（鼠标最小也有 16 以上）；
  * 3. 横向分量：触摸板双指不可能完全垂直，几乎总有 deltaX。
  *
  * 判定仍然是**按手势**做的：手势内的结论粘住。第一格像鼠标就先缩放，
- * 后面任何一格不像（变小、变小数、出现横向分量）就把整个手势改判成平移 ——
- * 鼠标不会产生「小半格」，所以这个单向改判不会误反。反方向（pan → zoom）不做：
- * 一旦判成平移，说明已经观测到连续位移，鼠标不会中途出现。
+ * 后面任何一格不像（变小、出现横向分量、不是首格的整数倍）就把整个手势改判成平移。
+ * 反方向（pan → zoom）不做：一旦判成平移，说明已经观测到连续位移，鼠标不会中途出现。
  *
  * 捏合（pinch）在 Chromium 里被合成成 `ctrlKey === true` 的 wheel —— 这也是
  * d3-zoom 的判定方式，两边一致。
  */
 
 export type WheelMode = "zoom" | "pan";
+
+/**
+ * 用户在设置里钉死的滚轮语义。
+ *
+ * `"auto"` 才是靠事件形状猜；另两档是「别猜了，就按我说的做」。
+ * 为什么需要它：**形状判据永远只能覆盖大多数设备**。`deltaY` 由三件事共同决定 ——
+ * 系统滚动行数、显示缩放（`100 ÷ dsf`）、驱动；再加上触摸板的连续位移，
+ * 全世界的组合不可能穷举。猜准了是运气，用户按一下开关才是确定。
+ */
+export type WheelPinMode = "auto" | WheelMode;
+
+export const WHEEL_PIN_OPTIONS: Array<{ value: WheelPinMode; label: string; desc: string }> = [
+  {
+    value: "auto",
+    label: "自动（按设备判断）",
+    desc: "鼠标滚轮缩放、触摸板双指平移。按事件形状猜，覆盖绝大多数设备；判错就选下面两档。",
+  },
+  {
+    value: "zoom",
+    label: "始终缩放",
+    desc: "滚轮永远缩放，不判断设备。只用鼠标时最省心。",
+  },
+  {
+    value: "pan",
+    label: "始终平移",
+    desc: "滚轮永远平移，不判断设备。只用触摸板、又习惯 Ctrl+滚轮缩放时选这个。",
+  },
+];
+
+/** 设置里存的是任意字符串，读回来必须收敛 */
+export function normalizeWheelPin(v: unknown): WheelPinMode {
+  return v === "zoom" || v === "pan" ? v : "auto";
+}
 
 /** 只用到这几个字段，用例可以直接构造对象 */
 export interface WheelEventLike {
@@ -52,14 +93,23 @@ export type WheelIntent =
 /**
  * 鼠标一格的最小量级。
  *
- * Windows 上「一次滚 1 行」= 40px（Chromium: 行数 × 40），这是合法配置的下限；
- * 触摸板的单次位移通常是个位数到二十几。28 落在两者之间的空隙里。
+ * 触摸板的单次位移是个位数（1~13）；鼠标最小的一档是「滚 1 行」，
+ * 200% 缩放下约 20、300% 下约 13 —— 取 16 卡在常见触摸板值与极端 DPI 之间。
+ * 宁可偶尔把触摸板的大位移当成鼠标（第二格会因为「不是整数倍」自愈），
+ * 也不要把鼠标判成触摸板（那等于滚轮彻底失效）。
  */
-const WHEEL_MIN_PX = 28;
+const WHEEL_MIN_PX = 16;
 /** 一格对应的「2 的多少次方」。0.2 → 每格 1.149 倍，与 d3-zoom 默认手感一致 */
 const NOTCH_STEP = 0.2;
+/**
+ * 手势内「这一格是首格的整数倍」的容差。
+ *
+ * 鼠标是同一步长重复（66.666 → 133.333，比值精确到 1e-13）；
+ * 触摸板是连续值（40 → 43，比值 1.075）。0.03 只允许浮点误差级别的偏差。
+ */
+const MULTIPLE_TOL = 0.03;
 /** 一格像素数的合理区间；超出就说明这个事件不是「一格」的语义，退回默认 */
-const NOTCH_PX_MIN = 28;
+const NOTCH_PX_MIN = WHEEL_MIN_PX;
 const NOTCH_PX_MAX = 400;
 const NOTCH_PX_FALLBACK = 100;
 /** `deltaMode === 1`（行）的换算：按浏览器默认行高 */
@@ -82,13 +132,11 @@ export function toPixels(delta: number, mode: number, viewport: number): number 
 }
 
 /**
- * 这次滚轮是不是「鼠标一格一格」的形状。
+ * 这次滚轮像不像「鼠标一格一格」。
  *
- * 不判「等于某个魔数」，只判三件事：整数、量级够大、没有横向分量。
- * 判「像鼠标」而不是判「像触摸板」，是因为漏判的代价不对称：
- * 把触摸板误判成鼠标 → 一划就缩放，非常难受；把鼠标误判成触摸板 →
- * 滚轮完全变成平移（用户原话：「鼠标滚轮怎么变上下滑动了」），更难受。
- * 前者还有第二格纠正的机会，后者一旦判错整个手势都没救。
+ * **不判整数**：150% 显示缩放下鼠标一格是 `66.666…`（Chromium 按
+ * deviceScaleFactor 除过一遍），小数在鼠标这边完全正常 —— 这条当初把
+ * 用户 150% 屏的滚轮判成了触摸板。只判量级和横向分量。
  */
 export function looksLikeWheel(dx: number, dy: number, mode: number): boolean {
   // 行 / 页模式是传统滚轮驱动才有的表达方式
@@ -97,8 +145,6 @@ export function looksLikeWheel(dx: number, dy: number, mode: number): boolean {
   const ax: number = Math.abs(dx);
   const ay: number = Math.abs(dy);
   if (!Number.isFinite(ay)) return false;
-  // 小数 = 连续设备。Chromium 给鼠标的永远是整数，容差只为吃掉浮点误差
-  if (Math.abs(ay - Math.round(ay)) > 0.05) return false;
   // 量级太小 = 触摸板的连续微动
   if (ay < WHEEL_MIN_PX) return false;
   // 双指几乎总有横向分量；鼠标滚轮除了按住 Shift（已提前分支）不会有
@@ -117,6 +163,13 @@ export class WheelGesture {
   private last = -Infinity;
   /** 本次手势观测到的「一格」像素；缩放倍率按它折算，所以 40px/格 和 120px/格 手感一致 */
   private notchPx = 0;
+  /** 用户在设置里钉死的语义；`"auto"` = 靠形状猜 */
+  private pin: WheelPinMode = "auto";
+
+  /** 设置面板改动后调一次。不重置手势：用户改完设置会立刻滚，不该丢掉当前这一格 */
+  setPin(pin: WheelPinMode): void {
+    this.pin = pin;
+  }
 
   reset(): void {
     this.mode = null;
@@ -157,12 +210,42 @@ export class WheelGesture {
     }
 
     const fresh: boolean = this.mode === null || e.timeStamp - this.last > GESTURE_GAP;
+    const ay: number = Math.abs(dy);
+
+    // 用户钉死了语义：不再看形状，直接按他说的做。
+    // 倍率仍然按「格」算，notchPx 取手势的第一个事件 —— 这样不同 DPI 下
+    // 一格还是 1.149，不会因为 deltaY 是 66.67 就缩得特别慢。
+    if (this.pin !== "auto") {
+      this.mode = this.pin;
+      this.last = e.timeStamp;
+      if (this.pin === "pan") return { kind: "pan", dx: -dx, dy: -dy };
+      if (fresh || this.notchPx <= 0) this.notchPx = clampNotchPx(ay);
+      return {
+        kind: "zoom",
+        factor: clampFactor(Math.pow(2, (-dy / this.notchPx) * NOTCH_STEP)),
+      };
+    }
+
     const wheel: boolean = looksLikeWheel(dx, dy, e.deltaMode);
+    // 手势内自证：鼠标这一格必须是首格的整数倍（一格 66.67 → 两格 133.33）；
+    // 触摸板是连续值（40 → 43），比值落不到整数上。
+    let steady = false;
+    if (!fresh && this.mode === "zoom" && this.notchPx > 0) {
+      const ratio: number = ay / this.notchPx;
+      const n: number = Math.round(ratio);
+      steady = n >= 1 && Math.abs(ratio - n) <= MULTIPLE_TOL;
+    }
     // 手势内只允许「zoom → pan」单向改判：鼠标不会中途变成触摸板，
-    // 但触摸板的第一格完全可能够大够整，紧跟的一格就会把它揪出来。
-    if (fresh || (this.mode === "zoom" && !wheel)) {
+    // 但触摸板的第一格可能够大够整，紧跟的一格就会把它揪出来。
+    if (fresh) {
       this.mode = wheel ? "zoom" : "pan";
-      this.notchPx = wheel ? clampNotchPx(Math.abs(dy)) : 0;
+      this.notchPx = wheel ? clampNotchPx(ay) : 0;
+    } else if (this.mode === "zoom" && !steady) {
+      // 这一格不是首格的整数倍 → 整个手势其实是连续设备。
+      // 注意这里必须**直接判 pan**，不能再问一次 `wheel`：
+      // 触摸板快滑时单格也能超过阈值，问了就又回到 zoom。
+      this.mode = "pan";
+      this.notchPx = 0;
     }
     this.last = e.timeStamp;
 

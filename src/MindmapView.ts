@@ -31,7 +31,7 @@ import {
   traceSince,
 } from "./render/trace";
 import { waitStableSize } from "./render/viewport";
-import { WheelGesture } from "./render/wheel";
+import { WheelGesture, normalizeWheelPin } from "./render/wheel";
 import type { WheelIntent } from "./render/wheel";
 import { applyFolds, collectFolds } from "./edit/folds";
 import { firstChildRef, stepVisible, visibleLeafRefs } from "./domain/nav";
@@ -113,10 +113,11 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["Delete", "删除节点及其全部子节点（只在没在编辑时生效）"],
   ["拖动节点", "按住左键拖到别的卡片上改变父子关系"],
   ["鼠标滚轮", "以指针为中心缩放（一格一格的滚法）"],
-  ["触摸板双指", "平移画布：图跟着手指走（连续、带横向分量的一律按平移算）"],
+  ["触摸板双指", "平移画布：图跟着手指走（连续变化、带横向分量的一律按平移算）"],
   ["触摸板捏合", "缩放；驱动没合成捏合就用 Ctrl+滚轮"],
   ["Ctrl/⌘ + = / - / 0", "放大 / 缩小 / 缩放到适合窗口"],
   ["右键拖动 / Shift+滚轮", "平移画布（触摸板：双指按下再拖）"],
+  ["滚轮判错了", "设置 → obmind →「滚轮操作」可钉成「始终缩放 / 始终平移」，不再靠判断设备"],
   ["Ctrl/⌘+单击", "加选 / 减选（点在已选节点上就把它去掉）"],
   ["Shift+单击", "选中同级区间：先点首，再 Shift 点尾"],
   ["Alt+单击", "按节点文字打开同名笔记"],
@@ -2219,6 +2220,9 @@ export class MindmapView extends ItemView {
    */
   private onWheel(e: WheelEvent): void {
     if (!this.mm) return;
+    // 每次滚轮同步一次设置：用户改完设置会立刻滚，不该要求重载视图。
+    // 内存读 + 一次字符串收敛，代价可以忽略。
+    this.wheelGesture.setPin(normalizeWheelPin(this.plugin.settings.wheelMode));
     const viewport: number = this.canvasEl?.clientHeight || window.innerHeight;
     const intent: WheelIntent | null = this.wheelGesture.classify(e, viewport);
     if (!intent) return;
