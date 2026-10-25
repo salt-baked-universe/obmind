@@ -96,3 +96,16 @@ Obsidian 插件：笔记 → XMind 风格思维导图。当前 1.18.13（`manife
 - 授权 **GPL-3.0-or-later**（用户定版：二开必须同样开源）。`LICENSE` 用 gnu.org 官方全文；`src/main.ts` 顶部三段式声明；**`esbuild.config.mjs` 的 banner 必须带 GPL 声明 + 第三方版权许可**（markmap MIT / d3 ISC / @babel/runtime MIT）—— 上架后用户只拿得到 `main.js`。
 - 上架流程：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不再提 PR）。tag 严格等于版本号（无 `v` 前缀）。
 - 仓库仍**无 git remote**，`authorUrl` 待补。
+
+## 发布（自 MEMORY.md 迁出，2026-10-25）
+
+- 授权 **GPL-3.0-or-later**（二开必须同样开源）。`LICENSE` 用 gnu.org 全文；`src/main.ts` 顶部三段式；**`esbuild.config.mjs` banner 必须带 GPL 声明 + 第三方版权**（markmap MIT / d3 ISC / @babel/runtime MIT）—— 上架后用户只拿得到 `main.js`。
+- 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。目录读默认分支 HEAD 的 manifest，安装取 Release 的 `main.js`/`manifest.json`/`styles.css`，tag 严格等于版本号（无 `v`）。
+- **GitHub 账号 `salt-baked-universe`**（`manifest.authorUrl` 已填），仓库 `salt-baked-universe/obmind` 已建并推送（public）。**本地能 commit，但非 tty 环境 push 拿不到 GCM 登录态**（`could not read Username ... terminal prompts disabled`），push 与建 release 必须用户自己在终端 / VS Code 做。
+- **id = `obmind-map`（已发布，永久不可改），显示名 `Weaver Mindmap`**。名字被退过两次：`obmind mindmap` → 判「含 Obsidian 名称片段」（与 "Obsidian" 共享前缀 `ob`；id 那关不查）；`Outline mindmap` → 与 `outline-mindmap`（CH / cimuyang，做的也是大纲↔导图双向）**显示名完全重名**，条目被隐藏。教训：**id 只能查重 id，name 要单独查重 name**，且目录对 name 是大小写不敏感的精确比对。
+- 查重方法（提交前必做）：拉 `https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json`（9432 条，由 `mirror-community-json.yml` 从新目录镜像），按 `name`/`id` 归一化（去非字母数字 + 小写）后精确比对。
+- 插件目录名必须等于 id（测试库在 `plugins/obmind-map`）。
+- **提交前先跑官方 lint**：`npx eslint src`（`eslint-plugin-obsidianmd` + `eslint.config.mjs` 吃 `recommended`），**0 error 是底线**。规则细节与 1.18.20 的全部修法见当日日志。
+- 两条硬约束（踩过的）：`obsidianmd/rule-custom-message` **不许 eslint-disable**（console 只能真删，探针输出改 `Notice`）；静态样式一律走 `src/render/domStyle.ts`，HTML 落地一律走 `src/render/html.ts` 的 `setRenderedHtml`（DOMParser，不用 sanitizeHTMLToDom，会洗掉公式样式）。
+- **Release 资产的 manifest 随版本固化**：只改仓库里的 id 不够，旧 release 还带老 id → 必须 bump 版本 + 重发资产。
+- 发布附件备在 `tmp/release-<版本>/`（三个文件 + `release-notes.md`），`tmp/` 已 ignore。

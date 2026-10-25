@@ -442,6 +442,10 @@
      我们的 wheel 监听已经 preventDefault，这一条是兜底（有些合成事件
      在 preventDefault 之前就被滚动容器吃掉了） */
   overscroll-behavior: contain;
+  /* 触屏（Surface 之类）上单指拖动是平移画布、双指是缩放，都由 d3 接管。
+     不声明 none 的话浏览器会先做「滚动 / 页面缩放」，并且按手势起始方向
+     锁死一个轴 —— 表现就是「只能上下 / 只能左右」。 */
+  touch-action: none;
 }
 
 .obmind-canvas .markmap {

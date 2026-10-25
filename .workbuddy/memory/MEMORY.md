@@ -1,12 +1,12 @@
 # obmind 项目约定
 
-Obsidian 插件：笔记 → XMind 风格思维导图。当前 **1.18.16**（`manifest.json` / `package.json` / `versions.json` 三处同步）。
+Obsidian 插件：笔记 → XMind 风格思维导图。当前 **1.18.22**（`manifest.json` / `package.json` / `versions.json` 三处同步）。
 
 > 详细推导/实测数据见同目录 **`MARKMAP-NOTES.md`**（不自动注入，需要查证时再读）。
 
 ## 分层（单向向下，`domain` 不 import obsidian、不碰 DOM）
 
-L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、nav、stats）→ L2 `render/`（painter、frame、colors、viewport、geometry、wheel）+ `ui/` + `export/` → L3 `edit/`（writer＝`applyOp` 唯一写出口、move、create、block、text、inlineText、drag、boxSelect、paste）→ L4 `app/`（runtime、EditService/QueryService、NavStack/NavPolicy、History 快照上限 40、notePlan、plan、actions）→ L5 `MindmapView`（事件翻译 + 投影 + 面板 + 分发；`parser.ts` 只是组装层）。IO 走 `io/`。
+L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、nav、stats）→ L2 `render/`（painter、frame、colors、viewport、geometry、wheel）+ `ui/` + `export/` → L3 `edit/`（writer＝`applyOp` 唯一写出口，move/create/block/text/inlineText/drag/boxSelect/paste）→ L4 `app/`（runtime、EditService/QueryService、NavStack/NavPolicy、History 上限 40、notePlan、plan、actions）→ L5 `MindmapView`（事件翻译 + 投影 + 面板 + 分发）。IO 走 `io/`。
 
 ## markmap 硬约束
 
@@ -32,16 +32,16 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 ## 解析（domain/syntax）
 
 19. 两套层级：标题（`#`）与缩进。`indentOfCols(cols+step, unit)`；制表符按 4 列。深度用**缩进栈**推导（非 `floor`）；`detectIndent` 取「整除最多行且覆盖 ≥85% 缩进行的最小候选」，否则 GCD。
-20. **块（围栏/公式/表格/普通引用）是宿主的独立只读子节点**：`RawLine.block`（单个），`src.line` = 代理行（free）或围栏行（bound），`blockStart/blockEnd` 记行区间，`proxyLine` 记代理行。块在缩进推导里拿深度但**不写缩进栈**（否则吞掉后面紧跟的节点）。`<!-- obmind:block -->` 是代理行：围栏最多缩 0–3 格，块自己扛不了缩进 —— 这条是整套设计的地基。归属看顺序，不看缩进。细节见 `MARKMAP-NOTES.md`。
+20. **块（围栏/公式/表格/普通引用）是宿主的独立只读子节点**：`RawLine.block`（单个），`src.line` = 代理行（free）或围栏行（bound），`blockStart/blockEnd` 记区间，`proxyLine` 记代理行。块拿深度但**不写缩进栈**（否则吞掉后面的节点）。**`<!-- obmind:block -->` 是代理行**：围栏最多缩 0–3 格，块自己扛不了缩进 —— 整套设计的地基。归属看顺序不看缩进。细节见 `MARKMAP-NOTES.md`。
 21. **callout 是容器**：`> [!note] 标题` 自成节点，正文剥一层 `>` 当虚拟行继续分层；无标题用正文首行顶上（`promoted` 层级上移一层）。`v.orig/v.off` 换回原文坐标。
 22. 回写先校验锚点行原文，宁可失败不能错位；跨多行加 `Span.checkEnd`。`applyOp` 顺带返回新全文，别再读文件。
 23. 回写/移动保留引用前缀（`quoteOf`/`markOf`/`splitLine`）；进出 callout 用 `rebaseQuote` 换整块前缀。callout 标题的「同级」在引用外、`mark` 不沿用 `[!note] `；其子级不能再缩进。
-24. 插入块插在**宿主行之后**。**围栏类块（代码/公式）一律顶格**，缩进全由代理行承担 —— 旧版对齐到列表内容列，11 层 tab 的提纲算成 42 列，既不在列表项里又超 3 格，Obsidian 当缩进代码块、` ```python ` 原样露出；引用/表格不是围栏，仍对齐列表内容列。callout 内每行带 `>`。`insertBlock` 自带代理行 + `insertBlockAt`（弹语言选择框前先抓行号，失焦会清选中集）；拖裸块由 `moveNode` 自动补代理行升级 free（`frozenIn` 只冻块体）。语言用 `ui/codeLang.ts` 的 FuzzySuggestModal，50 个常用 + 可自敲，上次的存 localStorage。
+24. 插入块插在**宿主行之后**。**围栏类块（代码/公式）一律顶格**，缩进全由代理行承担 —— 旧版对齐到列表内容列，11 层 tab 的提纲算成 42 列，既不在列表项里又超 3 格 → Obsidian 当缩进代码块、` ```python ` 原样露出；引用/表格不是围栏，仍对齐列表内容列。callout 内每行带 `>`。`insertBlock` 自带代理行 + `insertBlockAt`（弹语言框前先抓行号）；拖裸块由 `moveNode` 补代理行。语言走 `ui/codeLang.ts` 的 FuzzySuggestModal。
 25. GFM 表格要「头行含 `|` + 分隔行 + 分隔行自身含 `|`」；列表下缩进表格先 dedent。
 
 ## 交互
 
-26. 选中是**集合**：`selectedLines` + `primaryLine`。左键节点=拖、空白=框选、单击=选中、Ctrl=加减选、Shift=同级区间（先 Shift 后 Ctrl）、Alt=开同名笔记。右键=平移（`zoom.filter` 仅 `button===2`，每次 create/setOptions 后重设），>4px 才压 contextmenu。
+26. 选中是**集合**：`selectedLines` + `primaryLine`。左键节点=拖、空白=框选、单击=选中、Ctrl=加减选、Shift=同级区间（先 Shift 后 Ctrl）、Alt=开同名笔记。右键/中键=平移（`zoom.filter` 只放行 `button 2|1`，每次 create/setOptions 后重设），右键 >4px 才压 contextmenu。
 27. 整体拖动/批量删除只作用顶层成员（`groupOf`）；删除把各区间求并集后一次性 whole 重写。`removeGroup` → View 必须 `applySelection([focus], focus, false)`。
 28. `collectSrc` 不含 depth=0 的根 → `depth===0` 的根保护是死代码。
 29. **「拖动时藏起来的线」是谓词不是动作**：`painter.markShifted(roots,on)`，`applyLink` 命中只给 `display:none`。提层走 `View.raiseNodes()`（`takeRecords` → `disconnect` → 挪 → `observe`；每次 appendChild 两条记录）。收尾 `sweepDragShift(skip)` 跳过 `drag.liveMembers()`。
@@ -70,8 +70,8 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 
 ## 块卡片
 
-49. 块内容由 `MarkdownRenderer.render` 产 HTML，**必须包 `<div class="obmind-block-md markdown-rendered">`** —— 代码底色、高亮、表格线、引用条、公式全挂 `.markdown-rendered` 下。渲染必须在 `setData` **之前** await 完（markmap 读 `foreignObject > div > div` 的 scrollWidth/Height）。缓存 key=`file.path|kind|lang|raw`。
-50. 复制按钮是**阅读视图后处理**加的，渲染器不给：`decorateCodeBlocks` 给每个 `<pre>` 补 `<button class="copy-code-button">`，点击走**画布事件委托**（字符串化会丢监听）。宽度只能 `:has(.obmind-block-md)` + `width:max-content; max-width:640px`（`width:auto` 会让内部 fit-content 塌成 26px；`--markmap-max-width` 无法逐节点设）。`pre` 强制 `pre-wrap`。
+49. 块内容由 `MarkdownRenderer.render` 产 HTML，**必须包 `<div class="obmind-block-md markdown-rendered">`**（代码底色/高亮/表格线/引用条/公式全挂 `.markdown-rendered` 下）。渲染必须在 `setData` **之前** await 完（markmap 读 `foreignObject > div > div` 的 scrollWidth/Height）。缓存 key=`file.path|kind|lang|raw`。
+50. 复制按钮是**阅读视图后处理**加的：`decorateCodeBlocks` 给每个 `<pre>` 补 `<button class="copy-code-button">`，点击走**画布事件委托**（字符串化会丢监听）。宽度只能 `:has(.obmind-block-md)` + `width:max-content; max-width:640px`（`width:auto` 会让内部 fit-content 塌成 26px）。`pre` 强制 `pre-wrap`。
 51. 块只读全链路：`startEdit` / 双击（`.obmind-block-md` 内 return，让文字可选）/ 新建 / 插块 / 提层 / 拖动 / 浮动条（只剩删除）/ 新建笔记；纯函数层 `EditService.commit|create|insertBlock`、`moveNode` 的 `child` 模式全拦。`plan` 层 `srcOf()` 对块返 `null` → 块**绝不走 patch 通道**（换 innerHTML 不重跑渲染器），改块即整树重建。
 
 ## 导航
@@ -84,25 +84,13 @@ L0 `types.ts`（`SrcRef`/`BlockInfo`/`TreeNode`）→ L1 `domain/`（syntax、na
 56. **键位只有一张表**（`app/actions.ts`）：`ACTIONS` = id + 归一化 keys(`mod/alt/shift`) + scopes(`canvas`/`view`) + `when(ActionState)`；`matchAction` 统一挡 `phase!=="idle"`（编辑/拖动/重建都不接），视图只剩 `runAction(id)` 的 switch。加操作 = 表里一行 + 一个 case。两条键盘链判据必须同源，否则「重建中在画布按 Tab」会拿旧快照建节点。
 57. **IO 走端口**：`io/clipboard.ts` 的 `ClipboardPort`（读失败返空串，不抛）+ `memoryClipboard`。Ctrl+V → `edit/paste.ts` `planPaste`：一行一个同级子节点、**不按源缩进还原层级**（猜错会写出结构错的笔记）、剥一层 `>`/列表标记/`#`、第一行交 `planCreate` 再切前缀复用、上限 200、粘完不进编辑框。读完剪贴板必须复查 `phase` 与 `primaryLine`。
 
-58. **滚轮只有一个入口**（1.18.16）：`applyZoomFilter` 对 wheel 返 `false` + `buildOptions` 的 `pan:false`（d3 的 `wheeled` 会 `stopImmediatePropagation()`；markmap 的 `handlePan` 抢同一个 wheel）。判定在 `render/wheel.ts`：`ctrlKey`/`Shift` 特判 → **手势内自证**（鼠标这一格是首格的整数倍，触摸板是连续值）→ 量级 `|dy|≥16` + `|dx|≈0` 才先按鼠标。**绝不猜「一格=多少像素」**：同一个鼠标，3 行@100% = 100、1 行@100% = 40、3 行@150% = 66.67（Chromium 按 `行数×40÷dsf`），1.18.16 写死 100/120、1.18.17 又要求整数，两次都把用户滚轮判成触摸板。倍率**按格算**（`notchPx` = 手势首值，一格恒 2^0.2）。设置项 `wheelMode`（auto/zoom/pan）是兜底出口。攒到下一帧一次 `scaleBy(f, 锚点, null)` / `translateBy(dx/k, dy/k, null)`；键盘兜底 `mod+= / - / 0`。
+58. **滚轮只有一个入口**（1.18.16）：`applyZoomFilter` 对 wheel 返 `false` + `buildOptions` 的 `pan:false`（d3 的 `wheeled` 会 `stopImmediatePropagation()`；markmap 的 `handlePan` 抢同一个 wheel）。**监听挂捕获阶段**（1.18.22）：块卡片里的 `.table-wrapper`/embed 自己是滚动容器，冒泡阶段才拿到时那一轴已被吃掉。判定在 `render/wheel.ts`：`ctrlKey`/`Shift` 特判 → **手势内自证**（鼠标这一格是首格的整数倍，触摸板是连续值）→ `|dy|≥16` + `|dx|≈0` 先按鼠标。**绝不猜「一格=多少像素」**（3 行@100%=100、1 行@100%=40、3 行@150%=66.67；1.18.16 写死 100/120、1.18.17 要求整数，两次都判错）。倍率**按格算**（一格恒 2^0.2），`wheelMode` 是兜底出口；攒到下一帧一次 `scaleBy`/`translateBy(dx/k, dy/k)`；键盘 `mod+= / - / 0`。**触摸板双指锁单轴是 Windows 手势识别**（手指要明显斜过阈值才解锁），插件侧拿不到未锁的轴。
 
 ## 构建与验证
 
-- 链路：`npx tsc -noEmit -skipLibCheck` → `npm test`（esbuild + Node，`scripts/testBatch.ts`，T1–T27）→ `node esbuild.config.mjs production`（Windows 沙箱可能 EBUSY）→ `node tmp/smoke.cjs` → 部署到 `D:/BJRepository/2. 知识星球/.obsidian/plugins/obmind` 比 sha1。
+- 链路：`npx tsc -noEmit -skipLibCheck` → `npm test`（esbuild + Node，`scripts/testBatch.ts`，T1–T30）→ `node esbuild.config.mjs production`（Windows 沙箱可能 EBUSY）→ `node tmp/smoke.cjs` → 部署到 `D:/BJRepository/2. 知识星球/.obsidian/plugins/obmind-map`（目录名必须等于 id）比 sha1。
 - 埋点规矩：**每个可能出问题的分支都要有数字**；假证据比没证据更浪费时间。**1.18.12 起业务侧埋点全部注释停用**（`src/render/trace.ts` 与命令开关保留），要排查就在原处解开，别另起一套。
 - 浏览器行为用 **Python Playwright + `channel="msedge"`**（`D:/Program Files/Python314/python.exe`）；`--virtual-time-budget` 下 rAF 不推进。探针 `tmp/*.ts|py`：`lagProbe`/`paintProbe`/`dragProbe`/`widenProbe`/`createProbe3`/`blockProbe2`。探针里没有 `MarkdownRenderer`，原生样式只能真机验。
 - 现场探针三档 off/events/frames，开关存 localStorage `obmind:trace`；`window.obmindTrace` + 两条诊断命令。热路径先 `isTracing()`；`installTraceConsole` 不能幂等。
 
-## 发布
-
-- 授权 **GPL-3.0-or-later**（二开必须同样开源）。`LICENSE` 用 gnu.org 全文；`src/main.ts` 顶部三段式；**`esbuild.config.mjs` banner 必须带 GPL 声明 + 第三方版权**（markmap MIT / d3 ISC / @babel/runtime MIT）—— 上架后用户只拿得到 `main.js`。
-- 上架：`community.obsidian.md` 登录 + 绑 GitHub + Add plugin（不提 PR）。目录读默认分支 HEAD 的 manifest，安装取 Release 的 `main.js`/`manifest.json`/`styles.css`，tag 严格等于版本号（无 `v`）。
-- **GitHub 账号 `salt-baked-universe`**（`manifest.authorUrl` 已填）。`origin` = `https://github.com/salt-baked-universe/obmind.git`，但**仓库在 GitHub 上还没建**（该账号 0 个公开仓库）。本地 `git push` 会卡在 Git Credential Manager 的 GUI 授权框（`credential.helper=helper-selector`，非交互环境 90s 超时），**推送必须用户自己在终端/VS Code 做**。
-- **id = `obmind-map`（已发布，永久不可改），显示名 `Weaver Mindmap`**。名字被退过两次：`obmind mindmap` → 判「含 Obsidian 名称片段」（与 "Obsidian" 共享前缀 `ob`；id 那关不查）；`Outline mindmap` → 与 `outline-mindmap`（CH / cimuyang，做的也是大纲↔导图双向）**显示名完全重名**，条目被隐藏。教训：**id 只能查重 id，name 要单独查重 name**，且目录对 name 是大小写不敏感的精确比对。
-- 查重方法（提交前必做）：拉 `https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json`（9432 条，由 `mirror-community-json.yml` 从新目录镜像），按 `name`/`id` 归一化（去非字母数字 + 小写）后精确比对。
-- 插件目录名必须等于 id（测试库在 `plugins/obmind-map`）。
-- **提交前先跑官方 lint**：`npx eslint src`（`eslint-plugin-obsidianmd` + `eslint.config.mjs` 吃 `recommended`），**0 error 是底线**。规则细节与 1.18.20 的全部修法见当日日志。
-- 两条硬约束（踩过的）：`obsidianmd/rule-custom-message` **不许 eslint-disable**（console 只能真删，探针输出改 `Notice`）；静态样式一律走 `src/render/domStyle.ts`，HTML 落地一律走 `src/render/html.ts` 的 `setRenderedHtml`（DOMParser，不用 sanitizeHTMLToDom，会洗掉公式样式）。
-- **仓库已建并推送**：`salt-baked-universe/obmind`（public）。`origin` 已配好。**本地能提交，但推不上去** —— 非 tty 环境拿不到 GCM 登录态（`could not read Username ... terminal prompts disabled`），push 与建 release 由用户在 VS Code / 自己终端完成。
-- **Release 资产的 manifest 会随版本固化**：只改仓库里的 id 不够，旧 release 里的 `manifest.json` 还带老 id，必须 bump 版本 + 重发资产。
-- 发布附件备在 `tmp/release-<版本>/`（三个文件 + `release-notes.md`），`tmp/` 已 ignore。
+> 发布 / 上架 / 命名 / lint / 推送的一切细节：见 **`MARKMAP-NOTES.md` 的「发布」章节**。只记三条硬事实：id 与目录名都是 `obmind-map`（永久不可改），显示名 `Weaver Mindmap`；非 tty 环境 push 拿不到 GCM 登录态，push/release 由用户自己做；提交前必跑 `npx eslint src`（0 error）。

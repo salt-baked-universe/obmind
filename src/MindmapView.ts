@@ -114,6 +114,10 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["触摸板捏合", "缩放；驱动没合成捏合就用 Ctrl+滚轮"],
   ["Ctrl/⌘ + = / - / 0", "放大 / 缩小 / 缩放到适合窗口"],
   ["右键拖动 / Shift+滚轮", "平移画布（触摸板：双指按下再拖）"],
+  [
+    "中键拖动",
+    "平移画布，方向完全自由（触摸板：三指点按一下再拖）。双指滑动被系统锁了方向时用这条",
+  ],
   ["滚轮判错了", "设置 → obmind →「滚轮操作」可钉成「始终缩放 / 始终平移」，不再靠判断设备"],
   ["Ctrl/⌘+单击", "加选 / 减选（点在已选节点上就把它去掉）"],
   ["Shift+单击", "选中同级区间：先点首，再 Shift 点尾"],
@@ -788,8 +792,13 @@ export class MindmapView extends ItemView {
     // `passive: false` 是硬要求：不 preventDefault 的话，触摸板的惯性滚动会穿到
     // 底下的编辑区 —— 图没动，笔记先滚走一屏。它同时承担「用户动过视口」的记账
     // （滚过之后就别再跟着容器尺寸自动适配了，否则一调窗口就把视角抢走）。
+    // 捕获阶段：块卡片里的表格（`.table-wrapper`）、内嵌 embed 自己就是可滚动容器，
+    // 冒泡阶段才拿到时 Chromium 已经把它们判成滚动目标 —— 那一轴的 delta 会被
+    // 它们吃掉（只剩另一个轴能动，看起来就像「触摸板被锁了一个方向」）。
+    // 放在捕获阶段 + preventDefault，事件在到达任何子元素之前就被我们接管。
     this.registerDomEvent(canvas, "wheel", (e: WheelEvent) => this.onWheel(e), {
       passive: false,
+      capture: true,
     });
 
     // 初始没有导航，先置成隐藏，免得空容器占位
@@ -2199,14 +2208,23 @@ export class MindmapView extends ItemView {
    *    挂的 wheel 监听就再也收不到事件。
    * 现在 wheel 的语义判定在 `render/wheel.ts`，d3 只负责把算好的 transform 落地。
    */
+  /**
+   * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
+   * 右键(2)与中键(1)拖拽平移画布；滚轮与触屏手势由我们自己接管。
+   *
+   * 中键是特意加的：Windows 触摸板的双指滑动由**系统**合成成滚动，系统会先锁定
+   * 主轴（要手指明显斜过阈值才解锁），插件这一侧拿到的就只有单轴 delta。
+   * 三指点按 = 中键，它走 pointer 事件、完全不经过那套手势识别，位移想怎么斜就怎么斜 ——
+   * 这是「双指被锁轴」时唯一一条确定自由的路径。
+   */
   private applyZoomFilter(): void {
     const mm = this.mm;
     if (!mm) return;
     mm.zoom.filter((event: Event): boolean => {
       if (event.type === "wheel") return false;
       if (event.type === "touchstart" || event.type === "touchmove") return true;
-      // 仅右键（button 2）拖拽平移
-      return (event as MouseEvent).button === 2;
+      const button: number = (event as MouseEvent).button;
+      return button === 2 || button === 1;
     });
   }
 

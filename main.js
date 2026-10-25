@@ -9957,6 +9957,10 @@ var HELP_ROWS = [
   ["\u89E6\u6478\u677F\u634F\u5408", "\u7F29\u653E\uFF1B\u9A71\u52A8\u6CA1\u5408\u6210\u634F\u5408\u5C31\u7528 Ctrl+\u6EDA\u8F6E"],
   ["Ctrl/\u2318 + = / - / 0", "\u653E\u5927 / \u7F29\u5C0F / \u7F29\u653E\u5230\u9002\u5408\u7A97\u53E3"],
   ["\u53F3\u952E\u62D6\u52A8 / Shift+\u6EDA\u8F6E", "\u5E73\u79FB\u753B\u5E03\uFF08\u89E6\u6478\u677F\uFF1A\u53CC\u6307\u6309\u4E0B\u518D\u62D6\uFF09"],
+  [
+    "\u4E2D\u952E\u62D6\u52A8",
+    "\u5E73\u79FB\u753B\u5E03\uFF0C\u65B9\u5411\u5B8C\u5168\u81EA\u7531\uFF08\u89E6\u6478\u677F\uFF1A\u4E09\u6307\u70B9\u6309\u4E00\u4E0B\u518D\u62D6\uFF09\u3002\u53CC\u6307\u6ED1\u52A8\u88AB\u7CFB\u7EDF\u9501\u4E86\u65B9\u5411\u65F6\u7528\u8FD9\u6761"
+  ],
   ["\u6EDA\u8F6E\u5224\u9519\u4E86", "\u8BBE\u7F6E \u2192 obmind \u2192\u300C\u6EDA\u8F6E\u64CD\u4F5C\u300D\u53EF\u9489\u6210\u300C\u59CB\u7EC8\u7F29\u653E / \u59CB\u7EC8\u5E73\u79FB\u300D\uFF0C\u4E0D\u518D\u9760\u5224\u65AD\u8BBE\u5907"],
   ["Ctrl/\u2318+\u5355\u51FB", "\u52A0\u9009 / \u51CF\u9009\uFF08\u70B9\u5728\u5DF2\u9009\u8282\u70B9\u4E0A\u5C31\u628A\u5B83\u53BB\u6389\uFF09"],
   ["Shift+\u5355\u51FB", "\u9009\u4E2D\u540C\u7EA7\u533A\u95F4\uFF1A\u5148\u70B9\u9996\uFF0C\u518D Shift \u70B9\u5C3E"],
@@ -10432,7 +10436,8 @@ var MindmapView = class extends import_obsidian5.ItemView {
       onSelect: (lines2, additive) => this.applySelection(lines2, -1, additive)
     });
     this.registerDomEvent(canvas, "wheel", (e) => this.onWheel(e), {
-      passive: false
+      passive: false,
+      capture: true
     });
     this.renderBreadcrumb();
     this.registerDomEvent(document, "keydown", (e) => this.onGlobalKeyDown(e));
@@ -11581,6 +11586,15 @@ var MindmapView = class extends import_obsidian5.ItemView {
    *    挂的 wheel 监听就再也收不到事件。
    * 现在 wheel 的语义判定在 `render/wheel.ts`，d3 只负责把算好的 transform 落地。
    */
+  /**
+   * 重设 markmap 的缩放过滤器：左键(0)不再平移画布（留给节点拖动 / 框选），
+   * 右键(2)与中键(1)拖拽平移画布；滚轮与触屏手势由我们自己接管。
+   *
+   * 中键是特意加的：Windows 触摸板的双指滑动由**系统**合成成滚动，系统会先锁定
+   * 主轴（要手指明显斜过阈值才解锁），插件这一侧拿到的就只有单轴 delta。
+   * 三指点按 = 中键，它走 pointer 事件、完全不经过那套手势识别，位移想怎么斜就怎么斜 ——
+   * 这是「双指被锁轴」时唯一一条确定自由的路径。
+   */
   applyZoomFilter() {
     const mm = this.mm;
     if (!mm)
@@ -11590,7 +11604,8 @@ var MindmapView = class extends import_obsidian5.ItemView {
         return false;
       if (event.type === "touchstart" || event.type === "touchmove")
         return true;
-      return event.button === 2;
+      const button = event.button;
+      return button === 2 || button === 1;
     });
   }
   // -------------------------------------------------------------------------
