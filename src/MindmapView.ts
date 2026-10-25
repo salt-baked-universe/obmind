@@ -528,6 +528,23 @@ export class MindmapView extends ItemView {
   private wheelZoom = 1;
   /** 缩放的锚点（画布坐标；捏合时手指在哪就以哪为中心） */
   private wheelAt: [number, number] | null = null;
+  /**
+   * 这一帧攒的缩放是「手势猜出来的」，可能被同一手势的后续事件推翻。
+   *
+   * 键盘缩放（`zoomBy`）不置它：那个语义是用户明确按下的键，没有猜的成分，
+   * 不该跟着手势的改判一起被丢掉。
+   */
+  private wheelZoomFromGesture = false;
+  /**
+   * 手势首格缩放的挂起帧数。1 = 再等一帧确认，0 = 立即落地。
+   *
+   * 为什么要等：手势首格只能靠形状猜设备，而 Windows 触摸板的轴锁会把
+   * `deltaX` 压成**精确 0** —— 「双指几乎总有横向分量」这个最可靠的信号在
+   * 快滑首格上永远拿不到，只剩量级一个判据，于是快滑的首格几乎必被猜成鼠标，
+   * 一次性跳 15% 缩放。挂一帧的代价是鼠标滚轮第一格晚 16.7ms（离散滚轮不可感知），
+   * 收益是猜错时用户看不到任何跳变。
+   */
+  private wheelZoomHold = 0;
 
   /**
    * 兼容旧调用：单值选中 = 只选一个。写入会同步 selectedLines（赋 -1 即清空集合）。
@@ -2262,6 +2279,9 @@ export class MindmapView extends ItemView {
     } else {
       this.wheelZoom *= intent.factor;
       this.wheelAt = this.pointerInSvg(e);
+      this.wheelZoomFromGesture = true;
+      // 首格是猜的：先挂一帧等第二格来确认（见 wheelZoomHold 的注释）
+      if (this.wheelGesture.takeFirstNotch()) this.wheelZoomHold = 1;
     }
     this.flushWheelSoon();
   }
@@ -2272,30 +2292,51 @@ export class MindmapView extends ItemView {
     this.wheelQueued = true;
     window.requestAnimationFrame(() => {
       this.wheelQueued = false;
-      const zoom: number = this.zoomScale();
-      const k: number = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+      let again: boolean = false;
       if (this.wheelZoom !== 1) {
-        const factor: number = this.wheelZoom;
-        // 键盘缩放没有指针位置，就以视口中心为锚点（和用户此刻盯着的地方一致）
-        const at: [number, number] = this.wheelAt ?? this.svgCenter();
-        this.wheelZoom = 1;
-        this.wheelAt = null;
-        this.applyZoom((sel) => {
-          const zoom = this.zoomBehavior();
-          if (zoom) sel.call(() => zoom.scaleBy(sel, factor, at));
-        });
+        // 同一帧里手势已经被第二格自证改判成平移 → 这份缩放是猜错的产物。
+        // 扔掉而不是「缩放完再平移」：后者会让用户看到一次 15% 的跳变再被拖回。
+        // 触摸板 120Hz、屏幕 60Hz，第二个事件通常在本帧 flush 之前就到了，
+        // 所以绝大多数情况下这次跳变根本不会被画出来。
+        const cancelled: boolean = this.wheelZoomFromGesture && this.wheelGesture.current === "pan";
+        if (cancelled) {
+          this.wheelZoom = 1;
+          this.wheelAt = null;
+        } else if (this.wheelZoomHold > 0) {
+          // 首格只等一帧：第二个事件在这一帧内没来，就说明它大概率是鼠标滚轮
+          // （一格一格，间隔远大于一帧），没必要再拖。
+          this.wheelZoomHold--;
+          again = true;
+        } else {
+          const factor: number = this.wheelZoom;
+          // 键盘缩放没有指针位置，就以视口中心为锚点（和用户此刻盯着的地方一致）
+          const at: [number, number] = this.wheelAt ?? this.svgCenter();
+          this.wheelZoom = 1;
+          this.wheelAt = null;
+          this.applyZoom((sel) => {
+            const zoom = this.zoomBehavior();
+            if (zoom) sel.call(() => zoom.scaleBy(sel, factor, at));
+          });
+        }
+        // 缩放还挂着（hold 中）时不能清，下一帧还要拿它判断 cancelled
+        if (this.wheelZoom === 1) this.wheelZoomFromGesture = false;
       }
       if (this.wheelPanX !== 0 || this.wheelPanY !== 0) {
         const dx: number = this.wheelPanX;
         const dy: number = this.wheelPanY;
         this.wheelPanX = 0;
         this.wheelPanY = 0;
-        // translateBy 的 x/y 是**内容坐标**（内部会乘 k），所以先按当前比例换成内容位移
+        // k 必须在本帧的缩放**落地之后**读：translateBy 的 x/y 是内容坐标，
+        // 它内部还会再乘一次当前 k。用 flush 开头那份旧 k 会把这一帧的平移
+        // 放大 (k新/k旧) 倍 —— 实测同帧 zoom+pan 过冲 14.87%。
+        const scale: number = this.zoomScale();
+        const kNow: number = Number.isFinite(scale) && scale > 0 ? scale : 1;
         this.applyZoom((sel) => {
           const zoom = this.zoomBehavior();
-          if (zoom) sel.call(() => zoom.translateBy(sel, dx / k, dy / k));
+          if (zoom) sel.call(() => zoom.translateBy(sel, dx / kNow, dy / kNow));
         });
       }
+      if (again) this.flushWheelSoon();
     });
   }
 

@@ -165,6 +165,14 @@ export class WheelGesture {
   private notchPx = 0;
   /** 用户在设置里钉死的语义；`"auto"` = 靠形状猜 */
   private pin: WheelPinMode = "auto";
+  /**
+   * 上一条事件是否「猜出了」一个新手势的缩放（auto 档首格）。
+   *
+   * 调用方拿它决定这一格先别急着落地：首格是**猜**的（鼠标一格 vs 触摸板快滑的
+   * 第一格在形状上无法区分 —— 轴锁还会把触摸板的 deltaX 压成 0），同一手势的
+   * 第二格通常在一帧内就会把它推翻。先挂一帧，猜错就是零代价。
+   */
+  private firstNotchEdge = false;
 
   /** 设置面板改动后调一次。不重置手势：用户改完设置会立刻滚，不该丢掉当前这一格 */
   setPin(pin: WheelPinMode): void {
@@ -175,6 +183,19 @@ export class WheelGesture {
     this.mode = null;
     this.last = -Infinity;
     this.notchPx = 0;
+    this.firstNotchEdge = false;
+  }
+
+  /**
+   * 取走「刚猜出一个新手势缩放」这一事实（取完即清）。
+   *
+   * 用 take 语义而不是只读 getter：调用方必须消费掉它，否则上一格的边沿
+   * 会一直挂着，下一格也被当成首格延后 —— 等于给整个手势加了一帧匀速延迟。
+   */
+  takeFirstNotch(): boolean {
+    const v: boolean = this.firstNotchEdge;
+    this.firstNotchEdge = false;
+    return v;
   }
 
   /** 当前手势被判成了什么（null = 还没有手势） */
@@ -188,9 +209,23 @@ export class WheelGesture {
    * @param viewport 视口高度，只用于把「页」换算成像素
    */
   classify(e: WheelEventLike, viewport: number): WheelIntent | null {
+    this.firstNotchEdge = false;
     const dx: number = toPixels(e.deltaX, e.deltaMode, viewport);
     const dy: number = toPixels(e.deltaY, e.deltaMode, viewport);
-    if (dx === 0 && dy === 0) return null;
+    if (dx === 0 && dy === 0) {
+      // 没有位移，不接这个事件 —— 但**手势要续上**。
+      //
+      // Windows 触摸板会把不足 1px 的位移 floor 成 0，一次慢速拖动能夹进几十个
+      // delta 全 0 的事件。它们本身不产生位移，却证明「手指还在动」。
+      // 不刷新 last 的话，GESTURE_GAP 一到，手势就被判成中断；下一次真正带位移的
+      // 事件会**重新猜一次设备**，于是同一个手势中途从平移跳回缩放
+      // （尤其轴锁下 dx 恒 0，快滑的首格几乎必被猜成鼠标滚轮）。
+      //
+      // 只在已有手势时续期：空闲时收到 0 事件不能把 last 拉近，否则后面的大事件
+      // 会变成「非 fresh 且没有结论」，一路走到函数末尾被当成平移。
+      if (this.mode !== null) this.last = e.timeStamp;
+      return null;
+    }
 
     // 捏合 = ctrlKey 的 wheel（Windows 精密触摸板与 macOS 触摸板都是这么合成的）。
     // 「Ctrl + 滚轮」也归到这里：两件事的意图都是缩放，没必要分开。
@@ -240,6 +275,9 @@ export class WheelGesture {
     if (fresh) {
       this.mode = wheel ? "zoom" : "pan";
       this.notchPx = wheel ? clampNotchPx(ay) : 0;
+      // 这一格是猜的：告诉调用方「先挂一帧再落地」，让第二格有机会推翻它。
+      // pin 档不设 —— 用户已经钉死了语义，没有可推翻的结论。
+      this.firstNotchEdge = wheel;
     } else if (this.mode === "zoom" && !steady) {
       // 这一格不是首格的整数倍 → 整个手势其实是连续设备。
       // 注意这里必须**直接判 pan**，不能再问一次 `wheel`：

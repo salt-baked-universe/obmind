@@ -6895,6 +6895,14 @@ var WheelGesture = class {
     this.notchPx = 0;
     /** 用户在设置里钉死的语义；`"auto"` = 靠形状猜 */
     this.pin = "auto";
+    /**
+     * 上一条事件是否「猜出了」一个新手势的缩放（auto 档首格）。
+     *
+     * 调用方拿它决定这一格先别急着落地：首格是**猜**的（鼠标一格 vs 触摸板快滑的
+     * 第一格在形状上无法区分 —— 轴锁还会把触摸板的 deltaX 压成 0），同一手势的
+     * 第二格通常在一帧内就会把它推翻。先挂一帧，猜错就是零代价。
+     */
+    this.firstNotchEdge = false;
   }
   /** 设置面板改动后调一次。不重置手势：用户改完设置会立刻滚，不该丢掉当前这一格 */
   setPin(pin) {
@@ -6904,6 +6912,18 @@ var WheelGesture = class {
     this.mode = null;
     this.last = -Infinity;
     this.notchPx = 0;
+    this.firstNotchEdge = false;
+  }
+  /**
+   * 取走「刚猜出一个新手势缩放」这一事实（取完即清）。
+   *
+   * 用 take 语义而不是只读 getter：调用方必须消费掉它，否则上一格的边沿
+   * 会一直挂着，下一格也被当成首格延后 —— 等于给整个手势加了一帧匀速延迟。
+   */
+  takeFirstNotch() {
+    const v2 = this.firstNotchEdge;
+    this.firstNotchEdge = false;
+    return v2;
   }
   /** 当前手势被判成了什么（null = 还没有手势） */
   get current() {
@@ -6915,10 +6935,14 @@ var WheelGesture = class {
    * @param viewport 视口高度，只用于把「页」换算成像素
    */
   classify(e, viewport) {
+    this.firstNotchEdge = false;
     const dx = toPixels(e.deltaX, e.deltaMode, viewport);
     const dy = toPixels(e.deltaY, e.deltaMode, viewport);
-    if (dx === 0 && dy === 0)
+    if (dx === 0 && dy === 0) {
+      if (this.mode !== null)
+        this.last = e.timeStamp;
       return null;
+    }
     if (e.ctrlKey) {
       this.mode = "zoom";
       this.last = e.timeStamp;
@@ -6954,6 +6978,7 @@ var WheelGesture = class {
     if (fresh) {
       this.mode = wheel ? "zoom" : "pan";
       this.notchPx = wheel ? clampNotchPx(ay) : 0;
+      this.firstNotchEdge = wheel;
     } else if (this.mode === "zoom" && !steady) {
       this.mode = "pan";
       this.notchPx = 0;
@@ -10222,6 +10247,23 @@ var MindmapView = class extends import_obsidian5.ItemView {
     /** 缩放的锚点（画布坐标；捏合时手指在哪就以哪为中心） */
     this.wheelAt = null;
     /**
+     * 这一帧攒的缩放是「手势猜出来的」，可能被同一手势的后续事件推翻。
+     *
+     * 键盘缩放（`zoomBy`）不置它：那个语义是用户明确按下的键，没有猜的成分，
+     * 不该跟着手势的改判一起被丢掉。
+     */
+    this.wheelZoomFromGesture = false;
+    /**
+     * 手势首格缩放的挂起帧数。1 = 再等一帧确认，0 = 立即落地。
+     *
+     * 为什么要等：手势首格只能靠形状猜设备，而 Windows 触摸板的轴锁会把
+     * `deltaX` 压成**精确 0** —— 「双指几乎总有横向分量」这个最可靠的信号在
+     * 快滑首格上永远拿不到，只剩量级一个判据，于是快滑的首格几乎必被猜成鼠标，
+     * 一次性跳 15% 缩放。挂一帧的代价是鼠标滚轮第一格晚 16.7ms（离散滚轮不可感知），
+     * 收益是猜错时用户看不到任何跳变。
+     */
+    this.wheelZoomHold = 0;
+    /**
      * 导图内跳转栈：点双链时把上一篇压进来，面包屑显示整条路径。
      *
      * 栈非空时导图显示的是**栈顶那篇**。笔记窗口要不要跟着走，
@@ -11639,6 +11681,9 @@ var MindmapView = class extends import_obsidian5.ItemView {
     } else {
       this.wheelZoom *= intent.factor;
       this.wheelAt = this.pointerInSvg(e);
+      this.wheelZoomFromGesture = true;
+      if (this.wheelGesture.takeFirstNotch())
+        this.wheelZoomHold = 1;
     }
     this.flushWheelSoon();
   }
@@ -11650,30 +11695,44 @@ var MindmapView = class extends import_obsidian5.ItemView {
     window.requestAnimationFrame(() => {
       var _a;
       this.wheelQueued = false;
-      const zoom = this.zoomScale();
-      const k = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+      let again = false;
       if (this.wheelZoom !== 1) {
-        const factor = this.wheelZoom;
-        const at = (_a = this.wheelAt) != null ? _a : this.svgCenter();
-        this.wheelZoom = 1;
-        this.wheelAt = null;
-        this.applyZoom((sel) => {
-          const zoom2 = this.zoomBehavior();
-          if (zoom2)
-            sel.call(() => zoom2.scaleBy(sel, factor, at));
-        });
+        const cancelled = this.wheelZoomFromGesture && this.wheelGesture.current === "pan";
+        if (cancelled) {
+          this.wheelZoom = 1;
+          this.wheelAt = null;
+        } else if (this.wheelZoomHold > 0) {
+          this.wheelZoomHold--;
+          again = true;
+        } else {
+          const factor = this.wheelZoom;
+          const at = (_a = this.wheelAt) != null ? _a : this.svgCenter();
+          this.wheelZoom = 1;
+          this.wheelAt = null;
+          this.applyZoom((sel) => {
+            const zoom = this.zoomBehavior();
+            if (zoom)
+              sel.call(() => zoom.scaleBy(sel, factor, at));
+          });
+        }
+        if (this.wheelZoom === 1)
+          this.wheelZoomFromGesture = false;
       }
       if (this.wheelPanX !== 0 || this.wheelPanY !== 0) {
         const dx = this.wheelPanX;
         const dy = this.wheelPanY;
         this.wheelPanX = 0;
         this.wheelPanY = 0;
+        const scale = this.zoomScale();
+        const kNow = Number.isFinite(scale) && scale > 0 ? scale : 1;
         this.applyZoom((sel) => {
-          const zoom2 = this.zoomBehavior();
-          if (zoom2)
-            sel.call(() => zoom2.translateBy(sel, dx / k, dy / k));
+          const zoom = this.zoomBehavior();
+          if (zoom)
+            sel.call(() => zoom.translateBy(sel, dx / kNow, dy / kNow));
         });
       }
+      if (again)
+        this.flushWheelSoon();
     });
   }
   /**

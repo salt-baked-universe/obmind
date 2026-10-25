@@ -1432,6 +1432,47 @@ console.log("\n=== T30: 滚轮 / 触摸板的语义判定（render/wheel.ts） =
   assert(normalizeWheelPin("auto") === "auto", "认得 auto");
   assert(normalizeWheelPin(undefined) === "auto", "旧的设置文件（没有这个字段）→ auto");
   assert(normalizeWheelPin("ZOOM") === "auto", "写错了就回 auto");
+
+  // 16. 首格边沿：只有 auto 档**猜**出来的缩放才需要「先挂一帧」等第二格确认。
+  //     边沿必须被取走，否则整段手势都白白延后一帧。
+  const edge = new WheelGesture();
+  assert(edge.takeFirstNotch() === false, "还没滚过，没有边沿");
+  edge.classify(wheel(0, -100), 800);
+  assert(edge.takeFirstNotch() === true, "首格像鼠标 → 有边沿（要先挂一帧）");
+  assert(edge.takeFirstNotch() === false, "取走即清");
+  edge.classify(wheel(0, -100, { timeStamp: 1060 }), 800);
+  assert(edge.takeFirstNotch() === false, "同一手势的第二格不再有边沿");
+  const edgePad = new WheelGesture();
+  edgePad.classify(wheel(0, 3), 800);
+  assert(edgePad.takeFirstNotch() === false, "判成平移没有可推翻的缩放，不需要挂起");
+  const edgePin = new WheelGesture();
+  edgePin.setPin("zoom");
+  edgePin.classify(wheel(0, 3), 800);
+  assert(edgePin.takeFirstNotch() === false, "钉死缩放时不用猜，不用挂起");
+
+  // 17. 零位移事件（Windows 触摸板会把不足 1px 的位移 floor 成 0）必须**续上手势**。
+  //     不续的话 GESTURE_GAP 一到就重新猜设备 —— 同一手势从中途从平移跳回缩放
+  //     （轴锁下 deltaX 恒 0，快滑首格几乎必被猜成鼠标），用户看到的就是「一顿一跳」。
+  const zeros = new WheelGesture();
+  assert(zeros.classify(wheel(0, 3), 800)?.kind === "pan", "先判平移");
+  for (let i = 1; i <= 30; i++) {
+    assert(zeros.classify(wheel(0, 0, { timeStamp: 1000 + i * 10 }), 800) === null, "零位移不产生位移");
+  }
+  const afterZeros = zeros.classify(wheel(0, -40, { timeStamp: 1320 }), 800);
+  assert(
+    afterZeros?.kind === "pan",
+    `30 个零事件之后仍是同一个手势，不能重新猜设备：${JSON.stringify(afterZeros)}`,
+  );
+
+  // 18. 反过来：空闲时收到零事件不能把 last 拉近，否则后面第一格会变成
+  //     「非 fresh 但没有结论」，一路走到函数末尾被当成平移 —— 鼠标滚轮就不能缩放了。
+  const idleZero = new WheelGesture();
+  idleZero.classify(wheel(0, 0), 800);
+  assert(idleZero.current === null, "空闲零事件不产生结论");
+  assert(
+    idleZero.classify(wheel(0, -100), 800)?.kind === "zoom",
+    "空闲零事件之后的第一格仍然是新手势（缩放）",
+  );
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);
