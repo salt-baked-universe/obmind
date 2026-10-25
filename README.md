@@ -113,6 +113,13 @@ Two diagnostic commands (*start / stop flicker log*, *save flicker log to vault 
 - Obsidian **1.7.2** or newer.
 - Desktop first: the plugin loads on mobile, but the gestures are designed for a mouse and a trackpad.
 
+## Privacy and permissions
+
+- **No network.** The plugin makes no requests of any kind and has no telemetry, no account, no update check of its own.
+- **Vault only.** It reads the note you are looking at and writes back the lines you edited. Nothing outside the vault is touched, and the diagnostic log command writes its file into the vault root.
+- **Clipboard.** The plugin reads the system clipboard only when you press `Ctrl+V` inside the map (to paste lines as child nodes), and writes to it only when you explicitly copy a node or a code block. Clipboard content is never stored or sent anywhere.
+- **Local storage.** Two small preferences — the last code-block language you picked, and the diagnostic switch — are kept in the plugin's local storage in Obsidian, so they survive a restart. Notes and vault contents are never stored there.
+
 ## Troubleshooting
 
 - **The map looks empty right after opening** — it waits for the pane to settle, then fits. If it stays blank, run *Re-read note and redraw*.
@@ -231,6 +238,13 @@ The bundled dependencies (markmap, d3) are MIT/ISC and compatible with the GPL; 
 
 - 最低 Obsidian 版本：`1.7.2`
 - 桌面优先。移动端可加载，但手势按桌面设计，未做触屏优化。
+
+### 隐私与权限
+
+- **不联网**：不发任何请求，无遥测、无账号、不自带更新检查。
+- **只碰当前库**：读你正在看的笔记，写你改过的那几行；诊断日志写到库根目录。
+- **剪贴板**：只在图里按 `Ctrl+V` 时读一次（把行粘成子节点），只在你明确点「复制」时写入；内容不落盘、不外发。
+- **本地存储**：只在 Obsidian 的本地存储里放两项小偏好（上次选的代码块语言、诊断开关），不存笔记内容。
 
 ### 反馈
 
