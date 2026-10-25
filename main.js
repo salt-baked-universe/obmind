@@ -10772,7 +10772,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     if (on) {
       const name = (_b = (_a = this.targetFile) == null ? void 0 : _a.basename) != null ? _b : "\u5F53\u524D\u7B14\u8BB0";
       new import_obsidian5.Notice(
-        `obmind\uFF1A\u5DF2\u9489\u4F4F\u300C${name}\u300D\uFF0C\u5207\u6362\u7B14\u8BB0\u65F6\u8FD9\u5F20\u56FE\u4FDD\u6301\u4E0D\u52A8\uFF08\u70B9\u53CC\u94FE\u53EA\u5207\u7B14\u8BB0\uFF09`,
+        `Weaver Mindmap\uFF1A\u5DF2\u9489\u4F4F\u300C${name}\u300D\uFF0C\u5207\u6362\u7B14\u8BB0\u65F6\u8FD9\u5F20\u56FE\u4FDD\u6301\u4E0D\u52A8\uFF08\u70B9\u53CC\u94FE\u53EA\u5207\u7B14\u8BB0\uFF09`,
         4e3
       );
       return;
@@ -10780,7 +10780,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     if (this.navStack.length > 0)
       this.resetNav();
     if (!silent)
-      new import_obsidian5.Notice("obmind\uFF1A\u5DF2\u53D6\u6D88\u9489\u4F4F\uFF0C\u5BFC\u56FE\u91CD\u65B0\u8DDF\u968F\u7B14\u8BB0", 3e3);
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5DF2\u53D6\u6D88\u9489\u4F4F\uFF0C\u5BFC\u56FE\u91CD\u65B0\u8DDF\u968F\u7B14\u8BB0", 3e3);
   }
   /** 工具栏上点钉住 */
   togglePin() {
@@ -10790,7 +10790,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     }
     if (!this.targetFile) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5F53\u524D\u6CA1\u6709\u53EF\u9489\u4F4F\u7684\u7B14\u8BB0");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5F53\u524D\u6CA1\u6709\u53EF\u9489\u4F4F\u7684\u7B14\u8BB0");
       return;
     }
     this.setPinned(true);
@@ -11056,7 +11056,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     }
     if (src.blockNode) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u4E0D\u80FD\u6539\u5C42\u7EA7");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u4E0D\u80FD\u6539\u5C42\u7EA7");
       return;
     }
     const out = this.editSvc.commit({
@@ -11066,7 +11066,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       value: this.editorValueOf(src)
     });
     if (out.kind === "error" || out.kind === "none") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
     }
     void this.applyPlan(file, out.op);
@@ -11089,12 +11089,12 @@ var MindmapView = class extends import_obsidian5.ItemView {
     const file = this.targetFile;
     const src = this.nodeAt(this.primaryLine);
     if (!file || !src) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u5EFA\u7B14\u8BB0\u7684\u8282\u70B9");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u5EFA\u7B14\u8BB0\u7684\u8282\u70B9");
       return;
     }
     if (!this.canCreateNoteFor(src)) {
       new import_obsidian5.Notice(
-        hasWikiLink(src.text) ? "obmind\uFF1A\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u662F\u53CC\u94FE\u4E86" : "obmind\uFF1A\u8FD9\u4E2A\u8282\u70B9\u73B0\u5728\u4E0D\u80FD\u5EFA\u7B14\u8BB0\uFF08\u591A\u884C\u8282\u70B9 / \u53D6\u4E0D\u51FA\u540D\u5B57\uFF09"
+        hasWikiLink(src.text) ? "Weaver Mindmap\uFF1A\u8FD9\u4E2A\u8282\u70B9\u5DF2\u7ECF\u662F\u53CC\u94FE\u4E86" : "Weaver Mindmap\uFF1A\u8FD9\u4E2A\u8282\u70B9\u73B0\u5728\u4E0D\u80FD\u5EFA\u7B14\u8BB0\uFF08\u591A\u884C\u8282\u70B9 / \u53D6\u4E0D\u51FA\u540D\u5B57\uFF09"
       );
       return;
     }
@@ -11122,14 +11122,14 @@ var MindmapView = class extends import_obsidian5.ItemView {
       if (out.kind === "write")
         await this.applyPlan(file, out.op);
       else if (out.kind === "error") {
-        new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+        new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
         return;
       }
     }
     this.applySelection([], -1, false);
     this.navigate(note);
     new import_obsidian5.Notice(
-      `obmind\uFF1A\u5DF2${reused ? "\u94FE\u63A5\u5230\u5DF2\u6709\u7B14\u8BB0" : "\u65B0\u5EFA\u7B14\u8BB0"}\u300C${title}\u300D` + (this.pinned ? "\uFF08\u5BFC\u56FE\u4FDD\u6301\u9489\u4F4F\uFF09" : "")
+      `Weaver Mindmap\uFF1A\u5DF2${reused ? "\u94FE\u63A5\u5230\u5DF2\u6709\u7B14\u8BB0" : "\u65B0\u5EFA\u7B14\u8BB0"}\u300C${title}\u300D` + (this.pinned ? "\uFF08\u5BFC\u56FE\u4FDD\u6301\u9489\u4F4F\uFF09" : "")
     );
   }
   /**
@@ -11160,7 +11160,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       const exist = this.app.vault.getAbstractFileByPath(path2);
       if (exist instanceof import_obsidian5.TFile)
         return exist;
-      new import_obsidian5.Notice(`obmind\uFF1A\u65B0\u5EFA\u7B14\u8BB0\u5931\u8D25\uFF1A${errText(err)}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u65B0\u5EFA\u7B14\u8BB0\u5931\u8D25\uFF1A${errText(err)}`);
       return null;
     }
   }
@@ -11173,7 +11173,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     const abs2 = /\.md$/i.test(path2) ? path2 : `${path2}.md`;
     const file = (_b = this.app.vault.getAbstractFileByPath((0, import_obsidian5.normalizePath)(abs2))) != null ? _b : this.app.metadataCache.getFirstLinkpathDest(path2, "");
     if (!(file instanceof import_obsidian5.TFile)) {
-      new import_obsidian5.Notice(`obmind\uFF1A\u627E\u4E0D\u5230\u6A21\u677F\u7B14\u8BB0\u300C${path2}\u300D\uFF0C\u8FD9\u6B21\u65B0\u5EFA\u7684\u662F\u7A7A\u767D\u7B14\u8BB0`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u627E\u4E0D\u5230\u6A21\u677F\u7B14\u8BB0\u300C${path2}\u300D\uFF0C\u8FD9\u6B21\u65B0\u5EFA\u7684\u662F\u7A7A\u767D\u7B14\u8BB0`);
       return "";
     }
     try {
@@ -11211,12 +11211,12 @@ var MindmapView = class extends import_obsidian5.ItemView {
     const mm = this.mm;
     const file = this.resolveTargetFile();
     if (!svg || !mm || !file) {
-      new import_obsidian5.Notice("obmind\uFF1A\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u5BFC\u56FE");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u5BFC\u56FE");
       return;
     }
     const box = exportViewBox(mm.state.rect, 28);
     if (!box) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5BFC\u56FE\u8FD8\u6CA1\u753B\u5B8C\uFF0C\u7A0D\u7B49\u4E00\u4E0B\u518D\u8BD5");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5BFC\u56FE\u8FD8\u6CA1\u753B\u5B8C\uFF0C\u7A0D\u7B49\u4E00\u4E0B\u518D\u8BD5");
       return;
     }
     let text;
@@ -11226,7 +11226,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
         title: file.basename
       });
     } catch (err) {
-      new import_obsidian5.Notice(`obmind\uFF1A\u5BFC\u51FA\u5931\u8D25\uFF08${errText(err)}\uFF09`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u5BFC\u51FA\u5931\u8D25\uFF08${errText(err)}\uFF09`);
       return;
     }
     const name = exportFileName(file.basename);
@@ -11238,10 +11238,10 @@ var MindmapView = class extends import_obsidian5.ItemView {
       else
         await this.app.vault.create(path2, text);
     } catch (err) {
-      new import_obsidian5.Notice(`obmind\uFF1A\u5199\u5165\u5931\u8D25\uFF08${errText(err)}\uFF09`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u5199\u5165\u5931\u8D25\uFF08${errText(err)}\uFF09`);
       return;
     }
-    new import_obsidian5.Notice(`obmind\uFF1A\u5DF2\u5BFC\u51FA ${path2}\uFF08${formatSize(text.length)}\uFF09`, 5e3);
+    new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u5DF2\u5BFC\u51FA ${path2}\uFF08${formatSize(text.length)}\uFF09`, 5e3);
   }
   /**
    * 导出图的底色。
@@ -12364,7 +12364,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     var _a, _b, _c;
     const target = forwardTarget(this.navSync());
     if (target === "none") {
-      new import_obsidian5.Notice("obmind\uFF1A\u5BFC\u56FE\u5DF2\u9489\u4F4F\uFF0C\u4E14\u8BBE\u7F6E\u4E3A\u300C\u4EC5\u5BFC\u56FE\u8DF3\u8F6C\u300D\uFF0C\u7B14\u8BB0\u7A97\u53E3\u4E0D\u4F1A\u6253\u5F00", 3e3);
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5BFC\u56FE\u5DF2\u9489\u4F4F\uFF0C\u4E14\u8BBE\u7F6E\u4E3A\u300C\u4EC5\u5BFC\u56FE\u8DF3\u8F6C\u300D\uFF0C\u7B14\u8BB0\u7A97\u53E3\u4E0D\u4F1A\u6253\u5F00", 3e3);
       return;
     }
     if (target === "current") {
@@ -13160,7 +13160,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
    */
   insertBlockAt(line, kind, lang) {
     if (line < 0) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5148\u9009\u4E2D\u4E00\u4E2A\u8282\u70B9");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5148\u9009\u4E2D\u4E00\u4E2A\u8282\u70B9");
       return;
     }
     const file = this.targetFile;
@@ -13169,12 +13169,12 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     const at = this.nodeAt(line);
     if (at == null ? void 0 : at.blockNode) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u518D\u63D2\u5757");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u518D\u63D2\u5757");
       return;
     }
     const out = this.editSvc.insertBlock({ snap, line, kind, lang });
     if (out.kind === "error") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -13185,7 +13185,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
   createNode(mode) {
     const line = this.selectedLine;
     if (line < 0) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
       return;
     }
     const file = this.targetFile;
@@ -13194,12 +13194,12 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     const at = this.nodeAt(line);
     if (at == null ? void 0 : at.blockNode) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u5EFA\u8282\u70B9");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5757\u662F\u53EA\u8BFB\u53F6\u5B50\uFF0C\u4E0D\u80FD\u5728\u5B83\u4E0B\u9762\u5EFA\u8282\u70B9");
       return;
     }
     const out = this.editSvc.create({ snap, line, mode });
     if (out.kind === "error") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -13233,14 +13233,14 @@ var MindmapView = class extends import_obsidian5.ItemView {
   async pasteAt(line) {
     const file = this.targetFile;
     if (!file) {
-      new import_obsidian5.Notice("obmind\uFF1A\u6CA1\u6709\u6253\u5F00\u7684\u7B14\u8BB0");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u6CA1\u6709\u6253\u5F00\u7684\u7B14\u8BB0");
       return;
     }
     if (this.rt.phase !== "idle")
       return;
     const text = await this.clipboard.readText();
     if (!text.trim()) {
-      new import_obsidian5.Notice("obmind\uFF1A\u526A\u8D34\u677F\u662F\u7A7A\u7684\uFF08\u6216\u6CA1\u6709\u8BFB\u53D6\u526A\u8D34\u677F\u7684\u6743\u9650\uFF09");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u526A\u8D34\u677F\u662F\u7A7A\u7684\uFF08\u6216\u6CA1\u6709\u8BFB\u53D6\u526A\u8D34\u677F\u7684\u6743\u9650\uFF09");
       return;
     }
     if (this.rt.phase !== "idle" || this.primaryLine !== line)
@@ -13250,13 +13250,13 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     const out = this.editSvc.paste({ snap, line, text });
     if (out.kind === "error") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
       return;
     if (out.notice)
-      new import_obsidian5.Notice(`obmind\uFF1A${out.notice}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.notice}`);
     if (out.focusLine !== void 0) {
       this.pendingEditLine = -1;
       this.selectedLine = out.focusLine;
@@ -13279,7 +13279,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     const out = this.editSvc.removeGroup({ snap, lines: selected });
     if (out.kind === "error") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
     }
     if (out.kind === "none")
@@ -13292,7 +13292,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       this.applySelection([], -1, false);
     void this.applyPlan(file, out.op);
     if (selected.length > 1) {
-      new import_obsidian5.Notice(`obmind\uFF1A\u5DF2\u5220\u9664 ${selected.length} \u4E2A\u8282\u70B9`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A\u5DF2\u5220\u9664 ${selected.length} \u4E2A\u8282\u70B9`);
     }
   }
   /** 双击节点进入原地编辑 */
@@ -13336,19 +13336,19 @@ var MindmapView = class extends import_obsidian5.ItemView {
       if (!dragSrc)
         continue;
       if (dragSrc.blockNode === "bound") {
-        new import_obsidian5.Notice("obmind\uFF1A\u8FD9\u4E2A\u5757\u4E0D\u80FD\u62D6\u52A8 \u2014\u2014 \u5728\u5B83\u4E0A\u9762\u52A0\u4E00\u884C <!-- obmind:block --> \u5C31\u80FD\u62D6\u4E86");
+        new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u8FD9\u4E2A\u5757\u4E0D\u80FD\u62D6\u52A8 \u2014\u2014 \u5728\u5B83\u4E0A\u9762\u52A0\u4E00\u884C <!-- obmind:block --> \u5C31\u80FD\u62D6\u4E86");
         return false;
       }
       if (dragSrc.blockNode)
         continue;
       if (dragSrc.endLine !== void 0 && dragSrc.endLine > dragSrc.line) {
-        new import_obsidian5.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u6682\u4E0D\u652F\u6301\u62D6\u52A8\uFF0C\u8BF7\u5728\u7B14\u8BB0\u91CC\u8C03\u6574\u5C42\u7EA7");
+        new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u591A\u884C\u8282\u70B9\u6682\u4E0D\u652F\u6301\u62D6\u52A8\uFF0C\u8BF7\u5728\u7B14\u8BB0\u91CC\u8C03\u6574\u5C42\u7EA7");
         return false;
       }
     }
     const out = srcLines.length === 1 ? this.editSvc.move({ snap, srcLine: srcLines[0], targetLine, mode }) : this.editSvc.moveGroup({ snap, srcLines, targetLine, mode });
     if (out.kind === "error") {
-      new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return false;
     }
     if (out.kind === "none")
@@ -13442,11 +13442,11 @@ var MindmapView = class extends import_obsidian5.ItemView {
     if (!src || ((_b = data == null ? void 0 : data.state) == null ? void 0 : _b.depth) === 0)
       return;
     if (src.blockNode) {
-      new import_obsidian5.Notice("obmind\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u8BF7\u56DE\u7B14\u8BB0\u91CC\u6539");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5757\u662F\u53EA\u8BFB\u7684\uFF0C\u8BF7\u56DE\u7B14\u8BB0\u91CC\u6539");
       return;
     }
     if (src.endLine !== void 0 && src.endLine > src.line) {
-      new import_obsidian5.Notice("obmind\uFF1A\u591A\u884C\u8282\u70B9\u8BF7\u5728\u7B14\u8BB0\u4E2D\u7F16\u8F91");
+      new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u591A\u884C\u8282\u70B9\u8BF7\u5728\u7B14\u8BB0\u4E2D\u7F16\u8F91");
       return;
     }
     const spec = (_c = this.currentSpec) != null ? _c : resolveTheme(this.plugin.settings.theme, false);
@@ -13513,7 +13513,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
         revertPreview == null ? void 0 : revertPreview();
         revertPreview = null;
         this.pendingEditLine = -1;
-        new import_obsidian5.Notice(`obmind\uFF1A${out.reason}`);
+        new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
         return;
       }
       if (out.kind === "none") {
@@ -13626,7 +13626,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     const res = await applyOp(this.app, file, op);
     if (!res.ok) {
       this.pendingEditLine = -1;
-      new import_obsidian5.Notice(`obmind\uFF1A${res.reason}`);
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${res.reason}`);
       return { ok: false };
     }
     if (remember) {
@@ -13816,7 +13816,7 @@ var MindmapPlugin = class extends import_obsidian7.Plugin {
       );
     });
     this.safely("\u6DFB\u52A0\u4FA7\u8FB9\u680F\u56FE\u6807", () => {
-      this.addRibbonIcon("network", "obmind\uFF1A\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE", () => {
+      this.addRibbonIcon("network", "Weaver Mindmap\uFF1A\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE", () => {
         void this.activateView();
       });
     });
@@ -13895,7 +13895,7 @@ var MindmapPlugin = class extends import_obsidian7.Plugin {
         const running = traceLevel() !== "off";
         setTraceLevel(running ? "off" : "events");
         new import_obsidian7.Notice(
-          running ? "obmind\uFF1A\u5DF2\u505C\u6B62\u8BB0\u5F55" : "obmind\uFF1A\u5F00\u59CB\u8BB0\u5F55 \u2014\u2014 \u590D\u73B0\u4E00\u6B21\u95EA\u70C1\uFF0C\u518D\u6267\u884C\u300C\u8BCA\u65AD\uFF1A\u4FDD\u5B58\u95EA\u70C1\u65E5\u5FD7\u300D",
+          running ? "Weaver Mindmap\uFF1A\u5DF2\u505C\u6B62\u8BB0\u5F55" : "Weaver Mindmap\uFF1A\u5F00\u59CB\u8BB0\u5F55 \u2014\u2014 \u590D\u73B0\u4E00\u6B21\u95EA\u70C1\uFF0C\u518D\u6267\u884C\u300C\u8BCA\u65AD\uFF1A\u4FDD\u5B58\u95EA\u70C1\u65E5\u5FD7\u300D",
           6e3
         );
       }
@@ -13906,10 +13906,10 @@ var MindmapPlugin = class extends import_obsidian7.Plugin {
       callback: async () => {
         try {
           const path2 = await this.saveTraceFile();
-          new import_obsidian7.Notice(`obmind\uFF1A\u65E5\u5FD7\u5DF2\u4FDD\u5B58\u5230 ${path2}`, 8e3);
+          new import_obsidian7.Notice(`Weaver Mindmap\uFF1A\u65E5\u5FD7\u5DF2\u4FDD\u5B58\u5230 ${path2}`, 8e3);
         } catch (err) {
           new import_obsidian7.Notice(
-            `obmind\uFF1A\u4FDD\u5B58\u65E5\u5FD7\u5931\u8D25 \u2014\u2014 ${err instanceof Error ? err.message : String(err)}`,
+            `Weaver Mindmap\uFF1A\u4FDD\u5B58\u65E5\u5FD7\u5931\u8D25 \u2014\u2014 ${err instanceof Error ? err.message : String(err)}`,
             1e4
           );
         }
@@ -13989,7 +13989,7 @@ var MindmapPlugin = class extends import_obsidian7.Plugin {
         return;
       }
     }
-    new import_obsidian7.Notice("obmind\uFF1A\u5148\u6253\u5F00\u601D\u7EF4\u5BFC\u56FE\uFF08\u5DE6\u4FA7\u56FE\u6807\uFF0C\u6216\u547D\u4EE4\u300C\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE\u300D\uFF09");
+    new import_obsidian7.Notice("Weaver Mindmap\uFF1A\u5148\u6253\u5F00\u601D\u7EF4\u5BFC\u56FE\uFF08\u5DE6\u4FA7\u56FE\u6807\uFF0C\u6216\u547D\u4EE4\u300C\u6253\u5F00\u5F53\u524D\u7B14\u8BB0\u601D\u7EF4\u5BFC\u56FE\u300D\uFF09");
   }
   async loadSettings() {
     const saved = await this.loadData();

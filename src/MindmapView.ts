@@ -1312,7 +1312,7 @@ export class MindmapView extends ItemView {
     if (on) {
       const name: string = this.targetFile?.basename ?? "当前笔记";
       new Notice(
-        `obmind：已钉住「${name}」，切换笔记时这张图保持不动（点双链只切笔记）`,
+        `Weaver Mindmap：已钉住「${name}」，切换笔记时这张图保持不动（点双链只切笔记）`,
         4000,
       );
       return;
@@ -1321,7 +1321,7 @@ export class MindmapView extends ItemView {
     // 解除钉住 = 重新跟随。栈里可能还停着一篇「潜入」的子笔记，
     // 不清掉的话导图会继续显示它，看起来像没解除成功。
     if (this.navStack.length > 0) this.resetNav();
-    if (!silent) new Notice("obmind：已取消钉住，导图重新跟随笔记", 3000);
+    if (!silent) new Notice("Weaver Mindmap：已取消钉住，导图重新跟随笔记", 3000);
   }
 
   /** 工具栏上点钉住 */
@@ -1332,7 +1332,7 @@ export class MindmapView extends ItemView {
       return;
     }
     if (!this.targetFile) {
-      new Notice("obmind：当前没有可钉住的笔记");
+      new Notice("Weaver Mindmap：当前没有可钉住的笔记");
       return;
     }
     this.setPinned(true);
@@ -1610,7 +1610,7 @@ export class MindmapView extends ItemView {
       return;
     }
     if (src.blockNode) {
-      new Notice("obmind：块是只读的，不能改层级");
+      new Notice("Weaver Mindmap：块是只读的，不能改层级");
       return;
     }
 
@@ -1622,7 +1622,7 @@ export class MindmapView extends ItemView {
     });
     if (out.kind === "error" || out.kind === "none") {
       // 明确点了按钮就得有反馈：没反应最难判断
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return;
     }
     void this.applyPlan(file, out.op);
@@ -1646,15 +1646,15 @@ export class MindmapView extends ItemView {
     const file = this.targetFile;
     const src = this.nodeAt(this.primaryLine);
     if (!file || !src) {
-      new Notice("obmind：先左键点一下要建笔记的节点");
+      new Notice("Weaver Mindmap：先左键点一下要建笔记的节点");
       return;
     }
     if (!this.canCreateNoteFor(src)) {
       // 按钮已经隐藏了，能走到这儿只有快捷键：说清为什么不做，别静默
       new Notice(
         hasWikiLink(src.text)
-          ? "obmind：这个节点已经是双链了"
-          : "obmind：这个节点现在不能建笔记（多行节点 / 取不出名字）",
+          ? "Weaver Mindmap：这个节点已经是双链了"
+          : "Weaver Mindmap：这个节点现在不能建笔记（多行节点 / 取不出名字）",
       );
       return;
     }
@@ -1686,7 +1686,7 @@ export class MindmapView extends ItemView {
       const out = this.editSvc.commit({ snap, src, action: "commit", value: link });
       if (out.kind === "write") await this.applyPlan(file, out.op);
       else if (out.kind === "error") {
-        new Notice(`obmind：${out.reason}`);
+        new Notice(`Weaver Mindmap：${out.reason}`);
         return;
       }
     }
@@ -1698,7 +1698,7 @@ export class MindmapView extends ItemView {
     // 不是「不许看别的笔记」。走 navigate 就自动分好叉。
     this.navigate(note);
     new Notice(
-      `obmind：已${reused ? "链接到已有笔记" : "新建笔记"}「${title}」` +
+      `Weaver Mindmap：已${reused ? "链接到已有笔记" : "新建笔记"}「${title}」` +
         (this.pinned ? "（导图保持钉住）" : ""),
     );
   }
@@ -1738,7 +1738,7 @@ export class MindmapView extends ItemView {
       // 目标确实在就直接复用，比抛一句 “File already exists” 有用
       const exist = this.app.vault.getAbstractFileByPath(path);
       if (exist instanceof TFile) return exist;
-      new Notice(`obmind：新建笔记失败：${errText(err)}`);
+      new Notice(`Weaver Mindmap：新建笔记失败：${errText(err)}`);
       return null;
     }
   }
@@ -1752,7 +1752,7 @@ export class MindmapView extends ItemView {
       this.app.vault.getAbstractFileByPath(normalizePath(abs)) ??
       this.app.metadataCache.getFirstLinkpathDest(path, "");
     if (!(file instanceof TFile)) {
-      new Notice(`obmind：找不到模板笔记「${path}」，这次新建的是空白笔记`);
+      new Notice(`Weaver Mindmap：找不到模板笔记「${path}」，这次新建的是空白笔记`);
       return "";
     }
     try {
@@ -1791,14 +1791,14 @@ export class MindmapView extends ItemView {
     const mm = this.mm;
     const file = this.resolveTargetFile();
     if (!svg || !mm || !file) {
-      new Notice("obmind：没有可导出的导图");
+      new Notice("Weaver Mindmap：没有可导出的导图");
       return;
     }
 
     // 还没 _relayout 完时 rect 是 0×0，导出来会是个空文件
     const box: ViewBox | null = exportViewBox(mm.state.rect, 28);
     if (!box) {
-      new Notice("obmind：导图还没画完，稍等一下再试");
+      new Notice("Weaver Mindmap：导图还没画完，稍等一下再试");
       return;
     }
 
@@ -1809,7 +1809,7 @@ export class MindmapView extends ItemView {
         title: file.basename,
       });
     } catch (err) {
-      new Notice(`obmind：导出失败（${errText(err)}）`);
+      new Notice(`Weaver Mindmap：导出失败（${errText(err)}）`);
       return;
     }
 
@@ -1821,10 +1821,10 @@ export class MindmapView extends ItemView {
       if (existing instanceof TFile) await this.app.vault.modify(existing, text);
       else await this.app.vault.create(path, text);
     } catch (err) {
-      new Notice(`obmind：写入失败（${errText(err)}）`);
+      new Notice(`Weaver Mindmap：写入失败（${errText(err)}）`);
       return;
     }
-    new Notice(`obmind：已导出 ${path}（${formatSize(text.length)}）`, 5000);
+    new Notice(`Weaver Mindmap：已导出 ${path}（${formatSize(text.length)}）`, 5000);
   }
 
   /**
@@ -3258,7 +3258,7 @@ export class MindmapView extends ItemView {
     if (target === "none") {
       // map-only 本来就是「不动笔记窗口」：钉住后再点链接就什么都不发生了，
       // 不说一句会像卡了。
-      new Notice("obmind：导图已钉住，且设置为「仅导图跳转」，笔记窗口不会打开", 3000);
+      new Notice("Weaver Mindmap：导图已钉住，且设置为「仅导图跳转」，笔记窗口不会打开", 3000);
       return;
     }
 
@@ -4143,7 +4143,7 @@ export class MindmapView extends ItemView {
    */
   private insertBlockAt(line: number, kind: BlockKind, lang?: string): void {
     if (line < 0) {
-      new Notice("obmind：先选中一个节点");
+      new Notice("Weaver Mindmap：先选中一个节点");
       return;
     }
     const file = this.targetFile;
@@ -4152,12 +4152,12 @@ export class MindmapView extends ItemView {
 
     const at = this.nodeAt(line);
     if (at?.blockNode) {
-      new Notice("obmind：块是只读叶子，不能在它下面再插块");
+      new Notice("Weaver Mindmap：块是只读叶子，不能在它下面再插块");
       return;
     }
     const out = this.editSvc.insertBlock({ snap, line, kind, lang });
     if (out.kind === "error") {
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return;
     }
     if (out.kind === "none") return;
@@ -4167,7 +4167,7 @@ export class MindmapView extends ItemView {
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
   private createNode(mode: "sibling" | "child"): void {    const line: number = this.selectedLine;
     if (line < 0) {
-      new Notice("obmind：先左键点一下要挂在哪个节点上");
+      new Notice("Weaver Mindmap：先左键点一下要挂在哪个节点上");
       return;
     }
     const file = this.targetFile;
@@ -4176,12 +4176,12 @@ export class MindmapView extends ItemView {
 
     const at = this.nodeAt(line);
     if (at?.blockNode) {
-      new Notice("obmind：块是只读叶子，不能在它下面建节点");
+      new Notice("Weaver Mindmap：块是只读叶子，不能在它下面建节点");
       return;
     }
     const out = this.editSvc.create({ snap, line, mode });
     if (out.kind === "error") {
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return;
     }
     if (out.kind === "none") return;
@@ -4216,14 +4216,14 @@ export class MindmapView extends ItemView {
   private async pasteAt(line: number): Promise<void> {
     const file = this.targetFile;
     if (!file) {
-      new Notice("obmind：没有打开的笔记");
+      new Notice("Weaver Mindmap：没有打开的笔记");
       return;
     }
     if (this.rt.phase !== "idle") return;
 
     const text: string = await this.clipboard.readText();
     if (!text.trim()) {
-      new Notice("obmind：剪贴板是空的（或没有读取剪贴板的权限）");
+      new Notice("Weaver Mindmap：剪贴板是空的（或没有读取剪贴板的权限）");
       return;
     }
     // 读的过程中可能已经切走：宁可什么都不做，也不要粘到「现在选中的那一行」上
@@ -4234,12 +4234,12 @@ export class MindmapView extends ItemView {
 
     const out = this.editSvc.paste({ snap, line, text });
     if (out.kind === "error") {
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return;
     }
     if (out.kind === "none") return;
 
-    if (out.notice) new Notice(`obmind：${out.notice}`);
+    if (out.notice) new Notice(`Weaver Mindmap：${out.notice}`);
     if (out.focusLine !== undefined) {
       // 粘贴后选中第一个新节点，但**不**打开编辑框
       this.pendingEditLine = -1;
@@ -4264,7 +4264,7 @@ export class MindmapView extends ItemView {
 
     const out = this.editSvc.removeGroup({ snap, lines: selected });
     if (out.kind === "error") {
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return;
     }
     if (out.kind === "none") return;
@@ -4279,7 +4279,7 @@ export class MindmapView extends ItemView {
     void this.applyPlan(file, out.op);
 
     if (selected.length > 1) {
-      new Notice(`obmind：已删除 ${selected.length} 个节点`);
+      new Notice(`Weaver Mindmap：已删除 ${selected.length} 个节点`);
     }
   }
 
@@ -4332,13 +4332,13 @@ export class MindmapView extends ItemView {
       // 裸块没有代理行，拖动会把围栏缩进到 4 格以上，整段代码变成字面量。
       // （自由块可以拖，但拖的是代理行 —— 见 frozenIn。）
       if (dragSrc.blockNode === "bound") {
-        new Notice("obmind：这个块不能拖动 —— 在它上面加一行 <!-- obmind:block --> 就能拖了");
+        new Notice("Weaver Mindmap：这个块不能拖动 —— 在它上面加一行 <!-- obmind:block --> 就能拖了");
         return false;
       }
       // 自由块天生跨多行（代理行 + 块本体），不能再按「软换行节点」拦一次
       if (dragSrc.blockNode) continue;
       if (dragSrc.endLine !== undefined && dragSrc.endLine > dragSrc.line) {
-        new Notice("obmind：多行节点暂不支持拖动，请在笔记里调整层级");
+        new Notice("Weaver Mindmap：多行节点暂不支持拖动，请在笔记里调整层级");
         return false;
       }
     }
@@ -4348,7 +4348,7 @@ export class MindmapView extends ItemView {
         ? this.editSvc.move({ snap, srcLine: srcLines[0], targetLine, mode })
         : this.editSvc.moveGroup({ snap, srcLines, targetLine, mode });
     if (out.kind === "error") {
-      new Notice(`obmind：${out.reason}`);
+      new Notice(`Weaver Mindmap：${out.reason}`);
       return false;
     }
     if (out.kind === "none") return false;
@@ -4443,14 +4443,14 @@ export class MindmapView extends ItemView {
     // 块是只读的：它的卡片是 MarkdownRenderer 渲染出来的 HTML，双击进去改字
     // 等于把一段 HTML 当正文写回笔记。要改就回笔记里改。
     if (src.blockNode) {
-      new Notice("obmind：块是只读的，请回笔记里改");
+      new Notice("Weaver Mindmap：块是只读的，请回笔记里改");
       return;
     }
 
     // Bug 2 修复：多行合并节点（软换行）在 UI 里只读，请在笔记中编辑，
     // 避免续行被单独写回、把节点拆坏。
     if (src.endLine !== undefined && src.endLine > src.line) {
-      new Notice("obmind：多行节点请在笔记中编辑");
+      new Notice("Weaver Mindmap：多行节点请在笔记中编辑");
       return;
     }
 
@@ -4549,7 +4549,7 @@ export class MindmapView extends ItemView {
         revertPreview = null;
         this.pendingEditLine = -1;
         // traceLog("edit.commit.error", { reason: out.reason });
-        new Notice(`obmind：${out.reason}`);
+        new Notice(`Weaver Mindmap：${out.reason}`);
         return;
       }
       if (out.kind === "none") {
@@ -4687,7 +4687,7 @@ export class MindmapView extends ItemView {
     const res = await applyOp(this.app, file, op);
     if (!res.ok) {
       this.pendingEditLine = -1;
-      new Notice(`obmind：${res.reason}`);
+      new Notice(`Weaver Mindmap：${res.reason}`);
       return { ok: false };
     }
     // writer 顺手把写入后的内容算出来了，直接用 —— 不再读一次文件。

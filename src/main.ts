@@ -55,7 +55,7 @@ export default class MindmapPlugin extends Plugin {
     });
 
     this.safely("添加侧边栏图标", () => {
-      this.addRibbonIcon("network", "obmind：打开当前笔记思维导图", () => {
+      this.addRibbonIcon("network", "Weaver Mindmap：打开当前笔记思维导图", () => {
         void this.activateView();
       });
     });
@@ -152,8 +152,8 @@ export default class MindmapPlugin extends Plugin {
         setTraceLevel(running ? "off" : "events");
         new Notice(
           running
-            ? "obmind：已停止记录"
-            : "obmind：开始记录 —— 复现一次闪烁，再执行「诊断：保存闪烁日志」",
+            ? "Weaver Mindmap：已停止记录"
+            : "Weaver Mindmap：开始记录 —— 复现一次闪烁，再执行「诊断：保存闪烁日志」",
           6000,
         );
       },
@@ -165,10 +165,10 @@ export default class MindmapPlugin extends Plugin {
       callback: async () => {
         try {
           const path: string = await this.saveTraceFile();
-          new Notice(`obmind：日志已保存到 ${path}`, 8000);
+          new Notice(`Weaver Mindmap：日志已保存到 ${path}`, 8000);
         } catch (err) {
           new Notice(
-            `obmind：保存日志失败 —— ${err instanceof Error ? err.message : String(err)}`,
+            `Weaver Mindmap：保存日志失败 —— ${err instanceof Error ? err.message : String(err)}`,
             10000,
           );
         }
@@ -253,7 +253,7 @@ export default class MindmapPlugin extends Plugin {
         return;
       }
     }
-    new Notice("obmind：先打开思维导图（左侧图标，或命令「打开当前笔记思维导图」）");
+    new Notice("Weaver Mindmap：先打开思维导图（左侧图标，或命令「打开当前笔记思维导图」）");
   }
 
   async loadSettings() {
