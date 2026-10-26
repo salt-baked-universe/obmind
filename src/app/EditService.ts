@@ -19,7 +19,7 @@
  */
 
 import type { DropMode, EditorAction, SrcRef, Span, WriteOp } from "../types";
-import { planCreate, subtreeEndOf, type CreateMode } from "../edit/create";
+import { planCreate, planCreateRoot, subtreeEndOf, type CreateMode } from "../edit/create";
 import { planPaste } from "../edit/paste";
 import { insertBlockPlan, type BlockKind } from "../edit/block";
 import { indentBy, parseEditorValue, rewriteNode } from "../edit/text";
@@ -252,6 +252,37 @@ export class EditService {
       lines: [plan.plan.line],
       checkLine: at,
       checkText: lines[at] ?? "",
+    };
+    return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
+  }
+
+  /**
+   * 在**根节点**下新建子节点（Tab 选中中心主题时走这条）。
+   *
+   * 根没有源行，`create` 那套「照着父行抄缩进」不成立，规则全在
+   * `planCreateRoot` 里（标题体系写 `# `，缩进体系写顶格）。
+   *
+   * 这里的唯一特殊处理是空文档：`insertAfterLine = -1` 时 `lines[-1]` 不存在，
+   * 锚点校验会崩，所以 checkLine 夹到 0 —— 空文档的 `lines[0]` 就是那个空串，
+   * `start = 0` 又把新行插在它前面，结果正好是一行干净的新节点。
+   */
+  createUnderRoot(input: { snap: EditSnapshot }): EditOutcome {
+    const plan = planCreateRoot({
+      content: input.snap.content,
+      nodes: input.snap.nodes,
+      unit: input.snap.unit,
+    });
+    if (!plan.ok) return error(plan.reason);
+
+    const at: number = plan.plan.insertAfterLine;
+    const lines: string[] = input.snap.content.split("\n");
+    const checkLine: number = Math.max(0, at);
+    const span: Span = {
+      start: at + 1,
+      end: at + 1,
+      lines: [plan.plan.line],
+      checkLine,
+      checkText: lines[checkLine] ?? "",
     };
     return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
   }

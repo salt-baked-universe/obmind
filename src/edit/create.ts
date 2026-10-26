@@ -40,7 +40,7 @@ export interface CreateInput {
 }
 
 export interface CreatePlan {
-  /** 插在第几行之后（0 基；等于 src.line 表示紧跟该节点） */
+  /** 插在第几行之后（0 基；等于 src.line 表示紧跟该节点；**-1 = 全文为空，插在最前面**） */
   insertAfterLine: number;
   /** 新行的完整文本 */
   line: string;
@@ -154,6 +154,73 @@ export function planCreate(input: CreateInput): CreateResult {
       insertAfterLine,
       focusLine,
       line: quoteOf(src) + indent + mark + text,
+    },
+  };
+}
+
+/**
+ * 根节点下新建子节点。
+ *
+ * 根节点是**文件名**，不是文档里的某一行 —— 它没有 `src`，所以 `planCreate`
+ * 那套「照抄父行的缩进/标记」在这里完全用不上。根的子级就是文档里最外层的
+ * 节点，写回去只有两种合法形态：
+ *
+ * - 文档有标题体系（存在 `#` 节点）：新行必须是一级标题 `# 新节点`，
+ *   否则它会变成某个标题下的正文，挂在错误的父节点上；
+ * - 文档没有标题（纯缩进体系）：新行必须是**顶格**正文。
+ *
+ * 位置放在全文末尾（= 根的最后一个子节点之后），和 XMind 里「Tab 在中心主题上
+ * 加分支」一致。这里不能照搬 `subtreeEndOf`：根没有行号，而且根的子树就是全文，
+ * 结果一样，但少一层对空文档的例外。
+ */
+export interface CreateRootInput {
+  /** 整篇原文 */
+  content: string;
+  /** 全篇节点，只用来判断有没有标题体系 */
+  nodes: readonly SrcRef[];
+  /** 缩进单位原文（可能是制表符） */
+  unit: string;
+  placeholder?: string;
+}
+
+/** 围栏行（``` 或 ~~~，最多缩 3 格）。只用于判断「末尾是不是还在代码块里」 */
+const FENCE_LINE = /^[ \t]{0,3}(`{3,}|~{3,})/;
+
+/** 扫到 `end` 行为止，文档是否还停在未闭合的围栏里 */
+function inOpenFence(lines: readonly string[], end: number): boolean {
+  let marker: string | null = null;
+  const last: number = Math.min(end, lines.length - 1);
+  for (let i = 0; i <= last; i++) {
+    const m: RegExpExecArray | null = FENCE_LINE.exec(lines[i]);
+    if (!m) continue;
+    if (marker === null) marker = m[1].charAt(0);
+    else if (m[1].charAt(0) === marker) marker = null;
+  }
+  return marker !== null;
+}
+
+export function planCreateRoot(input: CreateRootInput): CreateResult {
+  const text: string = input.placeholder ?? NEW_NODE_TEXT;
+  const lines: string[] = input.content.split("\n");
+
+  // 跳过末尾的空行：新节点接在最后一个有内容的行后面
+  let at: number = lines.length - 1;
+  while (at >= 0 && lines[at].trim() === "") at--;
+
+  // 末尾还停在围栏里的话，插进去的那行会被当成代码 —— 用户敲的是标题，
+  // 存下来变成一段代码，比直接拒绝更糟。
+  if (inOpenFence(lines, at)) {
+    return { ok: false, reason: "笔记末尾有个没写闭合的代码块，先补上 ``` 再新建" };
+  }
+
+  const heading: boolean = input.nodes.some((n: SrcRef) => n.heading);
+  // at < 0 = 全文都是空行：插在最前面，得到的就是第 0 行
+  return {
+    ok: true,
+    plan: {
+      insertAfterLine: at,
+      focusLine: at + 1,
+      line: heading ? `# ${text}` : `${indentOfCols(0, input.unit)}${text}`,
     },
   };
 }

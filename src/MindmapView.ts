@@ -70,7 +70,7 @@ import { NodeBar } from "./ui/nodeBar";
 import { isTypingTarget } from "./ui/keyGuard";
 import { formatStats, treeStats } from "./domain/stats";
 import { ViewRuntime } from "./app/runtime";
-import { matchAction } from "./app/actions";
+import { matchAction, ROOT_LINE } from "./app/actions";
 import type { ActionId, ActionState } from "./app/actions";
 import { systemClipboard } from "./io/clipboard";
 import type { ClipboardPort } from "./io/clipboard";
@@ -97,6 +97,7 @@ const HELP_ROWS: ReadonlyArray<readonly [string, string]> = [
   ["选中后", "画布右侧浮出操作条：新建子级 / 同级、新建笔记、插入块、编辑、提升、删除"],
   ["双击 / F2 / 空格", "原地编辑（空格不需要先用鼠标点进画布）"],
   ["Tab / Enter", "新建子级 / 新建同级"],
+  ["中心主题（根）", "点它再按 Tab 能加一条最外层分支（它没有同级、不能改字、不能删 —— 那是文件名本身）"],
   ["Ctrl/⌘+N", "按节点文字新建一篇笔记，节点变成指向它的双链（可套模板）"],
   ["Ctrl/⌘+V", "把剪贴板内容粘成选中节点的子节点（多行 = 多个同级子节点，粘完不进编辑框）"],
   ["插入块", "在选中节点下面加代码块 / 引用 / 表格，按 Obsidian 原生方式渲染，成为独立节点"],
@@ -551,12 +552,12 @@ export class MindmapView extends ItemView {
    */
   private get selectedLine(): number { return this.primaryLine; }
   private set selectedLine(v: number) {
+    const single: boolean = v >= 0 || v === ROOT_LINE;
     const same: boolean =
-      this.primaryLine === v &&
-      (v < 0 ? this.selectedLines.size === 0 : this.selectedLines.size === 1);
+      this.primaryLine === v && (single ? this.selectedLines.size === 1 : this.selectedLines.size === 0);
     if (same) return;
     this.primaryLine = v;
-    this.selectedLines = v >= 0 ? new Set([v]) : new Set();
+    this.selectedLines = single ? new Set([v]) : new Set();
     this.paintSelection();
     this.syncToolbar();
   }
@@ -1556,7 +1557,8 @@ export class MindmapView extends ItemView {
 
   private syncToolbar(): void {
     const src: SrcRef | null = this.nodeAt(this.selectedLine);
-    // 根节点就是文件名本身：改不了、删不了、也无所谓缩进
+    // 根节点就是文件名本身：改不了、删不了、也无所谓缩进 —— 但它能长孩子
+    const onRoot: boolean = this.selectedLine === ROOT_LINE;
     const onNode: boolean = src !== null && src.depth > 0;
     const onAny: boolean = src !== null;
     // 块（代码 / 公式 / 表格 / 引用）是只读叶子：文字不能改、下面不能挂节点。
@@ -1566,7 +1568,7 @@ export class MindmapView extends ItemView {
     const bar = this.nodeBar;
     if (bar) {
       bar.setEnabled("edit", onNode && !onBlock);
-      bar.setEnabled("child", onAny && !onBlock);
+      bar.setEnabled("child", onRoot || (onAny && !onBlock));
       bar.setEnabled("sibling", onAny && !onBlock);
       bar.setEnabled("outdent", onNode && !onBlock);
       bar.setEnabled("delete", onNode);
@@ -3672,7 +3674,7 @@ export class MindmapView extends ItemView {
    * 存引用等于存了个已经断掉的东西。行号在重建后仍然有效，重新挂 class 就行。
    */
   private selectNode(g: SVGGElement | null): void {
-    const line: number = g ? (this.srcOf(g)?.line ?? -1) : -1;
+    const line: number = g ? (this.srcOf(g)?.line ?? ROOT_LINE) : -1;
     this.selectedLine = line;
     this.anchorLine = line;
     // 画布拿到焦点，后面的 Tab / Enter 才有人接
@@ -3801,9 +3803,14 @@ export class MindmapView extends ItemView {
   /** 直接设定整组选中（框选结果）；additive=true 时并入现有集合。 */
   private applySelection(lines: number[], primary: number, additive: boolean): void {
     if (!additive) this.selectedLines.clear();
-    for (const l of lines) if (l >= 0) this.selectedLines.add(l);
+    // 负数只有 ROOT_LINE 一个合法身份（框选只会给出真实行号）
+    for (const l of lines) if (l >= 0 || l === ROOT_LINE) this.selectedLines.add(l);
     this.primaryLine =
-      primary >= 0 ? primary : this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+      primary >= 0 || primary === ROOT_LINE
+        ? primary
+        : this.selectedLines.size
+          ? Math.max(...this.selectedLines)
+          : -1;
     // 整组替换后，锚点跟着新的主选中走 —— 否则接着 Shift 单击会从一个
     // 早就不在选中集里的老节点开始算区间
     this.anchorLine = this.primaryLine;
@@ -3913,7 +3920,7 @@ export class MindmapView extends ItemView {
       }
       this.selectionKey = key;
       for (const g of Array.from(svg.querySelectorAll<SVGGElement>("g.markmap-node"))) {
-        const on: boolean = sel.has(this.srcOf(g)?.line ?? -1);
+        const on: boolean = sel.has(this.srcOf(g)?.line ?? ROOT_LINE);
         g.classList.toggle("obmind-selected", on);
       }
     }
@@ -3935,7 +3942,7 @@ export class MindmapView extends ItemView {
     const sel = this.selectedLines;
     for (const g of els) {
       if (!g.isConnected) continue;
-      const on: boolean = sel.has(this.srcOf(g)?.line ?? -1);
+      const on: boolean = sel.has(this.srcOf(g)?.line ?? ROOT_LINE);
       if (on === g.classList.contains("obmind-selected")) continue;
       g.classList.toggle("obmind-selected", on);
     }
@@ -3981,6 +3988,7 @@ export class MindmapView extends ItemView {
       primary: line,
       selectionSize: this.selectedLines.size,
       onBlock: at?.blockNode !== undefined,
+      onRoot: line === ROOT_LINE,
       hasFile: this.targetFile !== null,
     };
   }
@@ -4044,6 +4052,12 @@ export class MindmapView extends ItemView {
         void this.createNoteForSelected();
         return;
       case "paste":
+        // 中心主题没有对应的行，「粘到根下面」得先有行可挂：让用户按一下 Tab
+        // 建出第一条分支，粘贴就有宿主了。静默无反应比这句提示更像坏了。
+        if (this.primaryLine === ROOT_LINE) {
+          new Notice("Weaver Mindmap：中心主题是文件名，先按 Tab 建一条分支，再粘到它下面");
+          return;
+        }
         void this.pasteIntoSelected();
         return;
       // 一档 ≈ 1.2 倍：和鼠标滚轮一格的幅度接近，连按几下不会一下冲出可视区
@@ -4224,7 +4238,17 @@ export class MindmapView extends ItemView {
   }
 
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
-  private createNode(mode: "sibling" | "child"): void {    const line: number = this.selectedLine;
+  private createNode(mode: "sibling" | "child"): void {
+    const line: number = this.selectedLine;
+    if (line === ROOT_LINE) {
+      // 中心主题只有子级可言：它没有同级，也不对应文档里的任何一行
+      if (mode === "sibling") {
+        new Notice("Weaver Mindmap：中心主题是这篇笔记本身，它没有同级节点");
+        return;
+      }
+      this.createUnderRoot();
+      return;
+    }
     if (line < 0) {
       new Notice("Weaver Mindmap：先左键点一下要挂在哪个节点上");
       return;
@@ -4239,6 +4263,32 @@ export class MindmapView extends ItemView {
       return;
     }
     const out = this.editSvc.create({ snap, line, mode });
+    if (out.kind === "error") {
+      new Notice(`Weaver Mindmap：${out.reason}`);
+      return;
+    }
+    if (out.kind === "none") return;
+
+    if (out.focusLine !== undefined) {
+      this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+
+  /**
+   * 在中心主题下新建子节点（Tab）。
+   *
+   * 与 `createNode` 分开是因为**根没有源行**：写什么（`# 新节点` 还是顶格正文）、
+   * 写在哪（全文末尾）都由 `planCreateRoot` 决定，这里只负责把计划落到盘上，
+   * 并让新节点像普通新建一样立刻进编辑框。
+   */
+  private createUnderRoot(): void {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap) return;
+
+    const out = this.editSvc.createUnderRoot({ snap });
     if (out.kind === "error") {
       new Notice(`Weaver Mindmap：${out.reason}`);
       return;

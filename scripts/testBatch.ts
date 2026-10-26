@@ -6,13 +6,13 @@ import { buildTree, collectBlockNodes } from "../src/domain/syntax";
 import { collectSrc } from "../src/edit/move";
 import { moveNode, moveNodes } from "../src/edit/move";
 import { blockRange } from "../src/edit/move";
-import { subtreeEndOf } from "../src/edit/create";
+import { planCreateRoot, subtreeEndOf } from "../src/edit/create";
 import { insertBlockPlan } from "../src/edit/block";
 import { EditService } from "../src/app/EditService";
 import { planProjection, relabelTree } from "../src/app/plan";
 import { nodeBarPosition } from "../src/ui/nodeBarPosition";
 import { PASTE_MAX_NODES } from "../src/edit/paste";
-import { ACTIONS, keyOf, matchAction } from "../src/app/actions";
+import { ACTIONS, keyOf, matchAction, ROOT_LINE } from "../src/app/actions";
 import type { ActionState, KeyLike } from "../src/app/actions";
 import { looksLikeWheel, normalizeWheelPin, toPixels, WheelGesture } from "../src/render/wheel";
 import type { WheelEventLike } from "../src/render/wheel";
@@ -1176,7 +1176,16 @@ console.log("\n=== T28: 粘贴 = 把剪贴板文本变成一组子节点 ===");
 
 console.log("\n=== T29: 动作表（键位 / 相位 / 块 的判定都在纯函数里） ===");
 {
-  const base: ActionState = { phase: "idle", primary: 3, selectionSize: 1, onBlock: false, hasFile: true };
+  const base: ActionState = {
+    phase: "idle",
+    primary: 3,
+    selectionSize: 1,
+    onBlock: false,
+    onRoot: false,
+    hasFile: true,
+  };
+  /** 中心主题：伪行号 + onRoot，其余和单选一样 */
+  const root: ActionState = { ...base, primary: ROOT_LINE, onRoot: true };
   const k = (key: string, mods: Partial<KeyLike> = {}): KeyLike => ({
     key,
     ctrlKey: false,
@@ -1197,6 +1206,15 @@ console.log("\n=== T29: 动作表（键位 / 相位 / 块 的判定都在纯函�
   assert(matchAction(k("v", { ctrlKey: true }), "canvas", { ...base, phase: "dragging" }) === null, "拖动中不粘贴");
 
   assert(matchAction(k("Tab"), "canvas", base) === "newChild", "Tab 建子级");
+  // 中心主题是文件名，没有源行 —— 唯一允许的操作就是「长一个孩子」
+  assert(matchAction(k("Tab"), "canvas", root) === "newChild", "中心主题上 Tab 能建子级");
+  assert(matchAction(k("Enter"), "canvas", root) === null, "中心主题没有同级可建");
+  assert(matchAction(k("F2"), "canvas", root) === null, "中心主题不能改字（那是重命名文件）");
+  assert(matchAction(k("Delete"), "canvas", root) === null, "中心主题不能删");
+  assert(matchAction(k("Tab", { shiftKey: true }), "canvas", root) === null, "中心主题不能提升");
+  // 粘贴放行到这里只是为了给一句明确的提示（根没有可挂的行），实现在 runAction 里挡
+  assert(matchAction(k("v", { ctrlKey: true }), "canvas", root) === "paste", "中心主题上 Ctrl+V 有反馈");
+  assert(matchAction(k("Tab"), "canvas", { ...root, phase: "editing" }) === null, "编辑中不接管");
   assert(matchAction(k("Tab", { shiftKey: true }), "canvas", base) === "outdent", "Shift+Tab 提升（不和 Tab 撞）");
   assert(matchAction(k(" ", { code: "Space" }), "view", base) === "edit", "空格在视图层兜底");
   assert(matchAction(k("F2"), "canvas", base) === "edit", "F2 在画布层");
@@ -1473,6 +1491,84 @@ console.log("\n=== T30: 滚轮 / 触摸板的语义判定（render/wheel.ts） =
     idleZero.classify(wheel(0, -100), 800)?.kind === "zoom",
     "空闲零事件之后的第一格仍然是新手势（缩放）",
   );
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n=== T31: 中心主题（根）下新建子节点（edit/create.ts planCreateRoot） ===");
+{
+  const rootPlan = (content: string, placeholder?: string) => {
+    const p = parse(content);
+    return planCreateRoot({ content, nodes: p.nodes, unit: p.unit, placeholder });
+  };
+  /** 把计划真的插进去，再用同一个解析器读回来 —— 只断言文本等于什么，验不到层级 */
+  const reparse = (content: string, plan: { insertAfterLine: number; line: string; focusLine: number }) => {
+    const lines = content.split("\n");
+    lines.splice(plan.insertAfterLine + 1, 0, plan.line);
+    return parse(lines.join("\n"));
+  };
+
+  // 1. 无标题文档（= 纯缩进体系）：新行顶格，接在最后一个非空行之后。
+  //    这一条对应截图里那个 MOC —— 根是文件名，正文最外层就是它的孩子。
+  const plain = "按粒度\n  单元测试\n白盒测试\n";
+  const p1 = rootPlan(plain, "新节点");
+  assert(p1.ok === true, "无标题文档能新建");
+  if (p1.ok) {
+    assert(p1.plan.insertAfterLine === 2, `插在最后一个非空行之后：${p1.plan.insertAfterLine}`);
+    assert(p1.plan.line === "新节点", `顶格正文：${JSON.stringify(p1.plan.line)}`);
+    assert(p1.plan.focusLine === 3, `光标落在新行：${p1.plan.focusLine}`);
+    const back = reparse(plain, p1.plan);
+    const added = back.nodes.find((n) => n.line === p1.plan.focusLine);
+    assert(added?.depth === 1, `新行是根的直接子级（depth=${added?.depth}）`);
+    assert(added?.text === "新节点", `文字对得上：${JSON.stringify(added?.text)}`);
+  }
+
+  // 2. 有标题体系：必须写成一级标题。写成顶格正文的话它会落在某个标题下面，
+  //    挂到错误的父节点上 —— 用户看到的是「新建的分支不见了」。
+  const headed = "# A\ntext\n## B\n";
+  const p2 = rootPlan(headed, "分支");
+  assert(p2.ok && p2.plan.line === "# 分支", `标题体系写一级标题：${JSON.stringify(p2.ok ? p2.plan.line : p2)}`);
+  if (p2.ok) {
+    const back = reparse(headed, p2.plan);
+    const added = back.nodes.find((n) => n.line === p2.plan.focusLine);
+    assert(added?.depth === 1, `# 新标题挂在根下（depth=${added?.depth}）`);
+    assert(added?.heading === true, "认得出它是标题节点");
+  }
+
+  // 3. 空文档 / 全是空行：插在最前面。insertAfterLine 是 -1，
+  //    EditService 必须把锚点夹到 0，否则 writer 会去 getLine(-1) 直接抛。
+  const p3 = rootPlan("", "第一行");
+  assert(p3.ok && p3.plan.insertAfterLine === -1 && p3.plan.focusLine === 0, `空文档 → at=-1：${JSON.stringify(p3)}`);
+  const p3b = rootPlan("\n\n", "第一行");
+  assert(p3b.ok && p3b.plan.insertAfterLine === -1, "只有空行也当空文档");
+
+  // 4. 末尾停在未闭合的围栏里：拒绝。插进去那行会被当成代码，比拒绝更糟。
+  const p4 = rootPlan("a\n```js\nconst x = 1\n", "新节点");
+  assert(p4.ok === false, "末尾未闭合代码块 → 拒绝");
+
+  // 5. 围栏闭合了就正常插在它后面
+  const p5 = rootPlan("a\n```js\nconst x = 1\n```\n", "新节点");
+  // 闭合围栏的最后一行本身就是内容（第 3 行），新节点接在它后面
+  assert(p5.ok && p5.plan.insertAfterLine === 3, `闭合围栏之后：${p5.ok ? p5.plan.insertAfterLine : "fail"}`);
+
+  // 6. frontmatter 不能被当成正文（截图上那个 MOC 就有 11 行属性）
+  const p6 = rootPlan("---\nid: 1\n---\n正文\n", "新节点");
+  assert(p6.ok && p6.plan.insertAfterLine === 3, `frontmatter 之后：${p6.ok ? p6.plan.insertAfterLine : "fail"}`);
+
+  // 7. 制表符缩进的笔记也写顶格（不能沿用子节点的缩进）
+  const p7 = rootPlan("a\n\tb\n", "新节点");
+  assert(p7.ok && p7.plan.line === "新节点", `制表符笔记也顶格：${p7.ok ? JSON.stringify(p7.plan.line) : "fail"}`);
+
+  // 8. service 层：空文档的 span 必须能过 writer 的锚点校验
+  const svc = new EditService();
+  const emptyOut = svc.createUnderRoot({ snap: { content: "", nodes: [], step: 2, unit: "" } });
+  assert(emptyOut.kind === "write", "空文档产出写入计划");
+  if (emptyOut.kind === "write" && emptyOut.op.kind === "span") {
+    assert(emptyOut.op.span.checkLine === 0, `空文档锚点夹到 0：${emptyOut.op.span.checkLine}`);
+    assert(emptyOut.op.span.start === 0 && emptyOut.op.span.end === 0, "插在最前面");
+    assert(emptyOut.op.span.checkText === "", "锚点原文是空串（空文件的第 0 行就是空串）");
+    assert(emptyOut.op.span.lines[0] === "新节点", "写的就是新节点");
+    assert(emptyOut.focusLine === 0, "光标落到第 0 行");
+  }
 }
 
 console.log(`\n========== ${failed === 0 ? "ALL PASS" : failed + " FAILED"} ==========`);if (failed > 0) process.exit(1);

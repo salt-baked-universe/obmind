@@ -59,6 +59,18 @@ export type ActionId =
  */
 export type ActionScope = "canvas" | "view";
 
+/**
+ * 「中心主题」的伪行号。
+ *
+ * 根节点是**笔记文件名**，文档里没有这一行 —— 它没有 `src`，拿不到行号。
+ * 但它是可以选中的（用户想点在它上面按 Tab 加一条分支），而选中态记的是源行号，
+ * 所以给它一个负数身份：所有要求 `primary >= 0` 的动作（改字、删除、缩进、
+ * 加同级、粘贴）都会自然把它排除，只有「新建子级」显式认它。
+ *
+ * 为什么不是 0：0 是合法行号，frontmatter 的 `---` 就在第 0 行。
+ */
+export const ROOT_LINE = -2;
+
 /** 动作执行时的只读状态快照。视图每次按键现算，动作不持有任何状态 */
 export interface ActionState {
   phase: Phase;
@@ -68,6 +80,15 @@ export interface ActionState {
   selectionSize: number;
   /** 主选中是块（只读叶子：能删、能拖，不能改字、不能在它下面建节点） */
   onBlock: boolean;
+  /**
+   * 主选中是**中心主题**（= 笔记文件名，没有源行）。
+   *
+   * 它能做的只有「新建子级」一件事：改字等于重命名文件、删除等于删掉整篇、
+   * 加同级无处可加、缩进没有意义。所以这里不用一个 `primary >= 0` 混过去 ——
+   * 根的行号是负数，所有要求 `primary >= 0` 的动作已经天然被挡，
+   * 只有 `newChild` 显式放行。
+   */
+  onRoot: boolean;
   /** 有没有可写的目标笔记 */
   hasFile: boolean;
 }
@@ -91,6 +112,14 @@ export interface ActionDef {
 const pick = (s: ActionState): boolean => s.primary >= 0;
 /** 「选中的是普通节点」——块只读，改字 / 建子级 / 粘贴都得挡 */
 const writable = (s: ActionState): boolean => s.primary >= 0 && !s.onBlock;
+/**
+ * 「能在它下面挂一个子节点」：普通节点，或中心主题本身。
+ *
+ * 中心主题是唯一没有源行却能长孩子的东西 —— 它的孩子就是文档最外层节点。
+ * 粘贴也放行到这里，但 `runAction` 里对根只给一句提示不真干活：那条路要按行
+ * 剥前缀再算缩进，根没有「父行」可参照，静默无反应比拒绝更像 bug。
+ */
+const childable = (s: ActionState): boolean => s.onRoot || (s.primary >= 0 && !s.onBlock);
 
 /**
  * 全部动作。
@@ -105,7 +134,7 @@ export const ACTIONS: readonly ActionDef[] = [
   { id: "redo", keys: ["mod+shift+z", "mod+y"], scopes: ["canvas"] },
 
   // 结构操作
-  { id: "newChild", keys: ["tab"], scopes: ["canvas"], when: writable },
+  { id: "newChild", keys: ["tab"], scopes: ["canvas"], when: childable },
   { id: "newSibling", keys: ["enter"], scopes: ["canvas"], when: writable },
   { id: "outdent", keys: ["shift+tab"], scopes: ["canvas"], when: pick },
   { id: "remove", keys: ["delete", "backspace"], scopes: ["canvas"], when: pick },
@@ -131,7 +160,7 @@ export const ACTIONS: readonly ActionDef[] = [
    * 和 `newSibling` 的区别不只是键位：它**不自动进编辑框**，因为内容已经是
    * 用户想要的文字（XMind 里粘贴完就是成品主题，再弹一个全选的输入框只会挡路）。
    */
-  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable },
+  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: childable },
 
   /**
    * 缩放与归位。三个键位都按**物理键位**注册：Shift+= 送来的 key 是 `+`、

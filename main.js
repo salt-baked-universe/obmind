@@ -8510,6 +8510,41 @@ function planCreate(input) {
     }
   };
 }
+var FENCE_LINE = /^[ \t]{0,3}(`{3,}|~{3,})/;
+function inOpenFence(lines2, end) {
+  let marker = null;
+  const last = Math.min(end, lines2.length - 1);
+  for (let i = 0; i <= last; i++) {
+    const m = FENCE_LINE.exec(lines2[i]);
+    if (!m)
+      continue;
+    if (marker === null)
+      marker = m[1].charAt(0);
+    else if (m[1].charAt(0) === marker)
+      marker = null;
+  }
+  return marker !== null;
+}
+function planCreateRoot(input) {
+  var _a;
+  const text = (_a = input.placeholder) != null ? _a : NEW_NODE_TEXT;
+  const lines2 = input.content.split("\n");
+  let at = lines2.length - 1;
+  while (at >= 0 && lines2[at].trim() === "")
+    at--;
+  if (inOpenFence(lines2, at)) {
+    return { ok: false, reason: "\u7B14\u8BB0\u672B\u5C3E\u6709\u4E2A\u6CA1\u5199\u95ED\u5408\u7684\u4EE3\u7801\u5757\uFF0C\u5148\u8865\u4E0A ``` \u518D\u65B0\u5EFA" };
+  }
+  const heading = input.nodes.some((n) => n.heading);
+  return {
+    ok: true,
+    plan: {
+      insertAfterLine: at,
+      focusLine: at + 1,
+      line: heading ? `# ${text}` : `${indentOfCols(0, input.unit)}${text}`
+    }
+  };
+}
 
 // src/edit/paste.ts
 var PASTE_MAX_NODES = 200;
@@ -8677,6 +8712,37 @@ var EditService = class {
       lines: [plan.plan.line],
       checkLine: at,
       checkText: (_a = lines2[at]) != null ? _a : ""
+    };
+    return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
+  }
+  /**
+   * 在**根节点**下新建子节点（Tab 选中中心主题时走这条）。
+   *
+   * 根没有源行，`create` 那套「照着父行抄缩进」不成立，规则全在
+   * `planCreateRoot` 里（标题体系写 `# `，缩进体系写顶格）。
+   *
+   * 这里的唯一特殊处理是空文档：`insertAfterLine = -1` 时 `lines[-1]` 不存在，
+   * 锚点校验会崩，所以 checkLine 夹到 0 —— 空文档的 `lines[0]` 就是那个空串，
+   * `start = 0` 又把新行插在它前面，结果正好是一行干净的新节点。
+   */
+  createUnderRoot(input) {
+    var _a;
+    const plan = planCreateRoot({
+      content: input.snap.content,
+      nodes: input.snap.nodes,
+      unit: input.snap.unit
+    });
+    if (!plan.ok)
+      return error(plan.reason);
+    const at = plan.plan.insertAfterLine;
+    const lines2 = input.snap.content.split("\n");
+    const checkLine = Math.max(0, at);
+    const span = {
+      start: at + 1,
+      end: at + 1,
+      lines: [plan.plan.line],
+      checkLine,
+      checkText: (_a = lines2[checkLine]) != null ? _a : ""
     };
     return { kind: "write", op: { kind: "span", span }, focusLine: plan.plan.focusLine };
   }
@@ -9538,14 +9604,16 @@ var ViewRuntime = class {
 };
 
 // src/app/actions.ts
+var ROOT_LINE = -2;
 var pick = (s) => s.primary >= 0;
 var writable = (s) => s.primary >= 0 && !s.onBlock;
+var childable = (s) => s.onRoot || s.primary >= 0 && !s.onBlock;
 var ACTIONS = [
   // 撤销 / 重做：只在画布持有焦点时接管，否则会和编辑器里的撤销打架
   { id: "undo", keys: ["mod+z"], scopes: ["canvas"] },
   { id: "redo", keys: ["mod+shift+z", "mod+y"], scopes: ["canvas"] },
   // 结构操作
-  { id: "newChild", keys: ["tab"], scopes: ["canvas"], when: writable },
+  { id: "newChild", keys: ["tab"], scopes: ["canvas"], when: childable },
   { id: "newSibling", keys: ["enter"], scopes: ["canvas"], when: writable },
   { id: "outdent", keys: ["shift+tab"], scopes: ["canvas"], when: pick },
   { id: "remove", keys: ["delete", "backspace"], scopes: ["canvas"], when: pick },
@@ -9566,7 +9634,7 @@ var ACTIONS = [
    * 和 `newSibling` 的区别不只是键位：它**不自动进编辑框**，因为内容已经是
    * 用户想要的文字（XMind 里粘贴完就是成品主题，再弹一个全选的输入框只会挡路）。
    */
-  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: writable },
+  { id: "paste", keys: ["mod+v"], scopes: ["canvas", "view"], when: childable },
   /**
    * 缩放与归位。三个键位都按**物理键位**注册：Shift+= 送来的 key 是 `+`、
    * Shift+- 是 `_`，但用户按的是同一个键，不该因为按住 Shift 就变成另一个动作
@@ -9965,6 +10033,7 @@ var HELP_ROWS = [
   ["\u9009\u4E2D\u540E", "\u753B\u5E03\u53F3\u4FA7\u6D6E\u51FA\u64CD\u4F5C\u6761\uFF1A\u65B0\u5EFA\u5B50\u7EA7 / \u540C\u7EA7\u3001\u65B0\u5EFA\u7B14\u8BB0\u3001\u63D2\u5165\u5757\u3001\u7F16\u8F91\u3001\u63D0\u5347\u3001\u5220\u9664"],
   ["\u53CC\u51FB / F2 / \u7A7A\u683C", "\u539F\u5730\u7F16\u8F91\uFF08\u7A7A\u683C\u4E0D\u9700\u8981\u5148\u7528\u9F20\u6807\u70B9\u8FDB\u753B\u5E03\uFF09"],
   ["Tab / Enter", "\u65B0\u5EFA\u5B50\u7EA7 / \u65B0\u5EFA\u540C\u7EA7"],
+  ["\u4E2D\u5FC3\u4E3B\u9898\uFF08\u6839\uFF09", "\u70B9\u5B83\u518D\u6309 Tab \u80FD\u52A0\u4E00\u6761\u6700\u5916\u5C42\u5206\u652F\uFF08\u5B83\u6CA1\u6709\u540C\u7EA7\u3001\u4E0D\u80FD\u6539\u5B57\u3001\u4E0D\u80FD\u5220 \u2014\u2014 \u90A3\u662F\u6587\u4EF6\u540D\u672C\u8EAB\uFF09"],
   ["Ctrl/\u2318+N", "\u6309\u8282\u70B9\u6587\u5B57\u65B0\u5EFA\u4E00\u7BC7\u7B14\u8BB0\uFF0C\u8282\u70B9\u53D8\u6210\u6307\u5411\u5B83\u7684\u53CC\u94FE\uFF08\u53EF\u5957\u6A21\u677F\uFF09"],
   ["Ctrl/\u2318+V", "\u628A\u526A\u8D34\u677F\u5185\u5BB9\u7C98\u6210\u9009\u4E2D\u8282\u70B9\u7684\u5B50\u8282\u70B9\uFF08\u591A\u884C = \u591A\u4E2A\u540C\u7EA7\u5B50\u8282\u70B9\uFF0C\u7C98\u5B8C\u4E0D\u8FDB\u7F16\u8F91\u6846\uFF09"],
   ["\u63D2\u5165\u5757", "\u5728\u9009\u4E2D\u8282\u70B9\u4E0B\u9762\u52A0\u4EE3\u7801\u5757 / \u5F15\u7528 / \u8868\u683C\uFF0C\u6309 Obsidian \u539F\u751F\u65B9\u5F0F\u6E32\u67D3\uFF0C\u6210\u4E3A\u72EC\u7ACB\u8282\u70B9"],
@@ -10348,11 +10417,12 @@ var MindmapView = class extends import_obsidian5.ItemView {
     return this.primaryLine;
   }
   set selectedLine(v2) {
-    const same = this.primaryLine === v2 && (v2 < 0 ? this.selectedLines.size === 0 : this.selectedLines.size === 1);
+    const single = v2 >= 0 || v2 === ROOT_LINE;
+    const same = this.primaryLine === v2 && (single ? this.selectedLines.size === 1 : this.selectedLines.size === 0);
     if (same)
       return;
     this.primaryLine = v2;
-    this.selectedLines = v2 >= 0 ? /* @__PURE__ */ new Set([v2]) : /* @__PURE__ */ new Set();
+    this.selectedLines = single ? /* @__PURE__ */ new Set([v2]) : /* @__PURE__ */ new Set();
     this.paintSelection();
     this.syncToolbar();
   }
@@ -11024,13 +11094,14 @@ var MindmapView = class extends import_obsidian5.ItemView {
   }
   syncToolbar() {
     const src = this.nodeAt(this.selectedLine);
+    const onRoot = this.selectedLine === ROOT_LINE;
     const onNode = src !== null && src.depth > 0;
     const onAny = src !== null;
     const onBlock = (src == null ? void 0 : src.blockNode) !== void 0;
     const bar = this.nodeBar;
     if (bar) {
       bar.setEnabled("edit", onNode && !onBlock);
-      bar.setEnabled("child", onAny && !onBlock);
+      bar.setEnabled("child", onRoot || onAny && !onBlock);
       bar.setEnabled("sibling", onAny && !onBlock);
       bar.setEnabled("outdent", onNode && !onBlock);
       bar.setEnabled("delete", onNode);
@@ -12721,7 +12792,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
    */
   selectNode(g) {
     var _a, _b, _c;
-    const line = g ? (_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1 : -1;
+    const line = g ? (_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : ROOT_LINE : -1;
     this.selectedLine = line;
     this.anchorLine = line;
     (_c = this.canvasEl) == null ? void 0 : _c.focus({ preventScroll: true });
@@ -12848,9 +12919,9 @@ var MindmapView = class extends import_obsidian5.ItemView {
     if (!additive)
       this.selectedLines.clear();
     for (const l of lines2)
-      if (l >= 0)
+      if (l >= 0 || l === ROOT_LINE)
         this.selectedLines.add(l);
-    this.primaryLine = primary >= 0 ? primary : this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
+    this.primaryLine = primary >= 0 || primary === ROOT_LINE ? primary : this.selectedLines.size ? Math.max(...this.selectedLines) : -1;
     this.anchorLine = this.primaryLine;
     this.paintSelection();
     this.syncToolbar();
@@ -12952,7 +13023,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       }
       this.selectionKey = key;
       for (const g of Array.from(svg.querySelectorAll("g.markmap-node"))) {
-        const on = sel.has((_c = (_b = this.srcOf(g)) == null ? void 0 : _b.line) != null ? _c : -1);
+        const on = sel.has((_c = (_b = this.srcOf(g)) == null ? void 0 : _b.line) != null ? _c : ROOT_LINE);
         g.classList.toggle("obmind-selected", on);
       }
     }
@@ -12974,7 +13045,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
     for (const g of els) {
       if (!g.isConnected)
         continue;
-      const on = sel.has((_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : -1);
+      const on = sel.has((_b = (_a = this.srcOf(g)) == null ? void 0 : _a.line) != null ? _b : ROOT_LINE);
       if (on === g.classList.contains("obmind-selected"))
         continue;
       g.classList.toggle("obmind-selected", on);
@@ -13020,6 +13091,7 @@ var MindmapView = class extends import_obsidian5.ItemView {
       primary: line,
       selectionSize: this.selectedLines.size,
       onBlock: (at == null ? void 0 : at.blockNode) !== void 0,
+      onRoot: line === ROOT_LINE,
       hasFile: this.targetFile !== null
     };
   }
@@ -13083,6 +13155,10 @@ var MindmapView = class extends import_obsidian5.ItemView {
         void this.createNoteForSelected();
         return;
       case "paste":
+        if (this.primaryLine === ROOT_LINE) {
+          new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u4E2D\u5FC3\u4E3B\u9898\u662F\u6587\u4EF6\u540D\uFF0C\u5148\u6309 Tab \u5EFA\u4E00\u6761\u5206\u652F\uFF0C\u518D\u7C98\u5230\u5B83\u4E0B\u9762");
+          return;
+        }
         void this.pasteIntoSelected();
         return;
       case "zoomIn":
@@ -13258,6 +13334,14 @@ var MindmapView = class extends import_obsidian5.ItemView {
   /** 在选中节点上新建同级 / 子级，写完立刻把编辑框落到新行上 */
   createNode(mode) {
     const line = this.selectedLine;
+    if (line === ROOT_LINE) {
+      if (mode === "sibling") {
+        new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u4E2D\u5FC3\u4E3B\u9898\u662F\u8FD9\u7BC7\u7B14\u8BB0\u672C\u8EAB\uFF0C\u5B83\u6CA1\u6709\u540C\u7EA7\u8282\u70B9");
+        return;
+      }
+      this.createUnderRoot();
+      return;
+    }
     if (line < 0) {
       new import_obsidian5.Notice("Weaver Mindmap\uFF1A\u5148\u5DE6\u952E\u70B9\u4E00\u4E0B\u8981\u6302\u5728\u54EA\u4E2A\u8282\u70B9\u4E0A");
       return;
@@ -13272,6 +13356,31 @@ var MindmapView = class extends import_obsidian5.ItemView {
       return;
     }
     const out = this.editSvc.create({ snap, line, mode });
+    if (out.kind === "error") {
+      new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
+      return;
+    }
+    if (out.kind === "none")
+      return;
+    if (out.focusLine !== void 0) {
+      this.pendingEditLine = out.focusLine;
+      this.selectedLine = out.focusLine;
+    }
+    void this.applyPlan(file, out.op);
+  }
+  /**
+   * 在中心主题下新建子节点（Tab）。
+   *
+   * 与 `createNode` 分开是因为**根没有源行**：写什么（`# 新节点` 还是顶格正文）、
+   * 写在哪（全文末尾）都由 `planCreateRoot` 决定，这里只负责把计划落到盘上，
+   * 并让新节点像普通新建一样立刻进编辑框。
+   */
+  createUnderRoot() {
+    const file = this.targetFile;
+    const snap = this.editSnapshot();
+    if (!file || !snap)
+      return;
+    const out = this.editSvc.createUnderRoot({ snap });
     if (out.kind === "error") {
       new import_obsidian5.Notice(`Weaver Mindmap\uFF1A${out.reason}`);
       return;
